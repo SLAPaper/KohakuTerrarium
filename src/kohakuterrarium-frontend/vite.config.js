@@ -6,9 +6,13 @@ import Components from "unplugin-vue-components/vite"
 import { VueRouterAutoImports } from "unplugin-vue-router"
 import { ElementPlusResolver } from "unplugin-vue-components/resolvers"
 import UnoCSS from "unocss/vite"
+import { resolve, dirname } from "node:path"
 import { fileURLToPath, URL } from "node:url"
 
+const __dirname = dirname(fileURLToPath(import.meta.url))
+
 export default defineConfig({
+  root: __dirname,
   plugins: [
     VueRouter({
       routesFolder: "src/pages",
@@ -45,7 +49,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: "../kohakuterrarium/web_dist",
+    outDir: resolve(__dirname, "../kohakuterrarium/web_dist"),
     emptyOutDir: true,
     rollupOptions: {
       output: {
