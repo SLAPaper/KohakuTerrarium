@@ -63,6 +63,25 @@ async def test_budget_alarm_injects_and_drains_alarms_next_turn():
 
 
 @pytest.mark.asyncio
+async def test_budget_alarm_preserves_leading_system_messages():
+    plugin = BudgetPlugin(options={"turn_budget": [1, 2]})
+    await plugin.on_load(PluginContext())
+
+    await plugin.pre_llm_call([])
+    await plugin.post_llm_call([], "", {})
+    messages = await plugin.pre_llm_call(
+        [
+            {"role": "system", "content": "system prompt"},
+            {"role": "user", "content": "next"},
+        ]
+    )
+
+    assert messages is not None
+    assert [message["role"] for message in messages] == ["system", "user", "user"]
+    assert "[budget soft]" in messages[1]["content"]
+
+
+@pytest.mark.asyncio
 async def test_budget_gate_blocks_tool_and_subagent_after_hard_wall():
     plugin = BudgetPlugin(options={"turn_budget": [1, 2]})
     await plugin.on_load(PluginContext())

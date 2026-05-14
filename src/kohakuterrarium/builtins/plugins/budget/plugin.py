@@ -159,7 +159,7 @@ class BudgetPlugin(BasePlugin):
             for axis_name, state in self._pending
         ]
         self._pending.clear()
-        return injected + list(messages)
+        return _insert_after_system_messages(messages, injected)
 
     async def post_llm_call(
         self,
@@ -209,6 +209,18 @@ def _build_budget_set(opts: dict[str, Any]) -> BudgetSet | None:
     if turn is None and walltime is None and tool_call is None:
         return None
     return BudgetSet(turn=turn, walltime=walltime, tool_call=tool_call)
+
+
+def _insert_after_system_messages(
+    messages: list[dict], injected: list[dict]
+) -> list[dict]:
+    """Preserve leading system messages when injecting budget alarms."""
+    insert_at = 0
+    for msg in messages:
+        if msg.get("role") != "system":
+            break
+        insert_at += 1
+    return list(messages[:insert_at]) + injected + list(messages[insert_at:])
 
 
 def _axis_from_option(name: str, value: Any) -> BudgetAxis | None:
