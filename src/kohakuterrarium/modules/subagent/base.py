@@ -354,6 +354,10 @@ class SubAgent:
         output = await self._run_post_llm_plugins(messages, output)
         return tool_calls, output
 
+    def _last_assistant_extra_fields(self) -> dict[str, Any]:
+        """Return provider-specific fields captured from the last assistant turn."""
+        return getattr(self.llm, "last_assistant_extra_fields", {}) or {}
+
     async def _run_native_turn(
         self, messages: list[dict], tool_schemas: Any
     ) -> tuple[list[ToolCallEvent], list[str]]:
@@ -374,6 +378,7 @@ class SubAgent:
         native_calls = (
             self.llm.last_tool_calls if hasattr(self.llm, "last_tool_calls") else []
         )
+        extra_fields = self._last_assistant_extra_fields()
 
         if native_calls:
             tool_calls_data = []
@@ -401,9 +406,14 @@ class SubAgent:
                 "assistant",
                 assistant_content or "",
                 tool_calls=tool_calls_data,
+                extra_fields=extra_fields,
             )
         else:
-            self.conversation.append("assistant", assistant_content)
+            self.conversation.append(
+                "assistant",
+                assistant_content,
+                extra_fields=extra_fields,
+            )
 
         self._log_turn_preview(assistant_content)
         self._accumulate_tokens()
@@ -434,7 +444,11 @@ class SubAgent:
             elif isinstance(event, TextEvent):
                 output_parts.append(event.text)
 
-        self.conversation.append("assistant", assistant_content)
+        self.conversation.append(
+            "assistant",
+            assistant_content,
+            extra_fields=self._last_assistant_extra_fields(),
+        )
         self._log_turn_preview(assistant_content)
         self._accumulate_tokens()
         return tool_calls, output_parts

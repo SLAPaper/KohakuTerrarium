@@ -10,6 +10,8 @@ the next turn.
 import pytest
 
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.registry import Registry
+from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.llm.message import AssistantMessage, Message
 from kohakuterrarium.llm.openai import (
     OpenAIProvider,
@@ -17,6 +19,8 @@ from kohakuterrarium.llm.openai import (
     _pack_reasoning_fields,
 )
 from kohakuterrarium.llm.openai_helpers import normalize_stateful_assistant_fields
+from kohakuterrarium.modules.subagent.base import SubAgent
+from kohakuterrarium.modules.subagent.config import SubAgentConfig
 
 # ───────────────────────────── Message shape ─────────────────────────────
 
@@ -153,6 +157,103 @@ def test_provider_exposes_captured_extra_fields():
 def test_provider_extra_fields_default_empty_without_capture():
     p = OpenAIProvider(api_key="x", model="m")
     assert p.last_assistant_extra_fields == {}
+
+
+class _ReasoningLLM:
+    def __init__(
+        self,
+        responses: list[str],
+        extras: list[dict],
+        native_calls: list[list[NativeToolCall]] | None = None,
+    ):
+        self.responses = responses
+        self.extras = extras
+        self.native_calls = native_calls or [[] for _ in responses]
+        self.call_log: list[list[dict]] = []
+        self.call_count = 0
+        self.model = "test-model"
+        self._last_tool_calls: list[NativeToolCall] = []
+        self._last_assistant_extra_fields: dict = {}
+        self._last_usage: dict[str, int] = {}
+
+    async def chat(self, messages: list[dict], **kwargs):
+        index = self.call_count
+        self.call_count += 1
+        self.call_log.append([dict(message) for message in messages])
+        response = self.responses[index]
+        if response:
+            yield response
+        self._last_tool_calls = self.native_calls[index]
+        self._last_assistant_extra_fields = self.extras[index]
+
+    @property
+    def last_tool_calls(self) -> list[NativeToolCall]:
+        return self._last_tool_calls
+
+    @property
+    def last_assistant_extra_fields(self) -> dict:
+        return self._last_assistant_extra_fields
+
+    @property
+    def last_usage(self) -> dict[str, int]:
+        return self._last_usage
+
+
+def _make_subagent(llm, tool_format: str | None = "bracket") -> SubAgent:
+    return SubAgent(
+        config=SubAgentConfig(
+            name="worker",
+            system_prompt="You are a worker.",
+        ),
+        parent_registry=Registry(),
+        llm=llm,
+        tool_format=tool_format,
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_text_turn_preserves_reasoning_extra_fields():
+    llm = _ReasoningLLM(
+        responses=["done"],
+        extras=[{"reasoning_content": "worker hidden state"}],
+    )
+    subagent = _make_subagent(llm)
+
+    await subagent._run_text_turn([{"role": "user", "content": "task"}])
+
+    assistant = subagent.conversation.to_messages()[-1]
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "done"
+    assert assistant["reasoning_content"] == "worker hidden state"
+
+
+@pytest.mark.asyncio
+async def test_subagent_native_turn_preserves_reasoning_extra_fields_with_tool_calls():
+    native_call = NativeToolCall(
+        id="call_1",
+        name="echo",
+        arguments='{"text": "hi"}',
+    )
+    llm = _ReasoningLLM(
+        responses=[""],
+        extras=[{"reasoning_content": "native hidden state"}],
+        native_calls=[[native_call]],
+    )
+    subagent = _make_subagent(llm, tool_format="native")
+
+    tool_calls, output = await subagent._run_native_turn(
+        [{"role": "user", "content": "task"}],
+        tool_schemas=[],
+    )
+    subagent.conversation.append("tool", "ok", tool_call_id="call_1")
+
+    assistant = subagent.conversation.to_messages()[0]
+    assert output == []
+    assert tool_calls[0].name == "echo"
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == ""
+    assert assistant["tool_calls"][0]["id"] == "call_1"
+    assert assistant["reasoning_content"] == "native hidden state"
 
 
 # ───────────────────────────── End-to-end smoke ─────────────────────────
