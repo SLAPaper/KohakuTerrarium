@@ -46,7 +46,7 @@ The last two years produced a striking number of agent products: Claude Code, Co
 
 KohakuTerrarium's job is to put that substrate in one place so the next agent shape costs a config file and a few custom modules, not a new repo.
 
-The core abstraction is the **creature**: a standalone agent with its own controller, tools, sub-agents, triggers, memory, and I/O. Creatures are hosted by a **Terrarium** engine: a graph runtime for channels, lifecycle, output wiring, hot-plug, and the topology + session bookkeeping that follows graph changes. A **Studio** layer sits above that for catalog, identity, active sessions, persistence, live traces, and web/desktop/API management. Everything is Python, so agents can be embedded inside tools, triggers, plugins, and outputs of other agents.
+The core abstraction is the **creature**: a standalone agent with its own controller, tools, sub-agents, triggers, memory, and I/O. Creatures are hosted by a **Terrarium** engine: a graph runtime for channels, lifecycle, output wiring, hot-plug, and the topology + session bookkeeping that follows graph changes. A **Studio** layer sits above that for catalog, identity, active sessions, persistence, live traces, and web/desktop/API management. Optionally, a **Laboratory** transport layer can split host and engine across machines — Studio + Terrarium stay unchanged, with a WebSocket-based network hop slotted in between. Everything is Python, so agents can be embedded inside tools, triggers, plugins, and outputs of other agents.
 
 For out-of-the-box creatures you can try today, see [**kt-biome**](https://github.com/Kohaku-Lab/kt-biome) — the showcase pack of useful agents and plugins built on top of the framework.
 
@@ -86,6 +86,8 @@ A terrarium composes multiple creatures horizontally through channels, lifecycle
 - **Useful OOTB creatures via [`kt-biome`](https://github.com/Kohaku-Lab/kt-biome).** Start by running strong default agents; customise or inherit from them later.
 
 ## Quick start
+
+> **Recommended Python version**: 3.12 or newer. CI validates 3.12+ only; 3.10 and 3.11 still install and run (`requires-python = ">=3.10"`) but are supported best-effort — older asyncio + SQLite-daemon-thread interaction is slower and the integration suite occasionally times out on those runtimes.
 
 ### 1. Install KohakuTerrarium
 
@@ -181,6 +183,13 @@ kt app
 - [Why KohakuTerrarium](docs/en/concepts/foundations/why-kohakuterrarium.md)
 - [What is an agent](docs/en/concepts/foundations/what-is-an-agent.md)
 
+### I want to deploy it
+
+- [Deployment — Docker](docs/en/guides/deployment-docker.md) — AIO, host + workers, distributed compose recipes
+- [Deployment — systemd](docs/en/guides/deployment-systemd.md) — `kt service install` + hardened units
+- [Deployment — reverse proxy](docs/en/guides/deployment-reverse-proxy.md) — nginx / Cloudflare Tunnel + TLS
+- [Laboratory](docs/en/guides/laboratory.md) — multi-node lab-host / lab-client model
+
 ### I want to work on the framework itself
 
 - [Development home](docs/en/dev/README.md)
@@ -228,6 +237,12 @@ User / API / Desktop
 +----------------------+
         |
         v
++----------------------+     optional: only in multi-node mode
+| Laboratory (Lab)     |  WebSocket transport + custom envelope,
+|                      |  spans the host across N worker machines
++----------------------+     transparent to Studio + Terrarium
+        |
+        v
 +----------------------+     no LLM; owns structure
 | Terrarium Engine     |  creature graph, topology, channels,
 |                      |  hot-plug, output wiring, session
@@ -247,6 +262,7 @@ Sub-agents inside each creature
 ```
 
 - **Studio** is the management framework used by the web dashboard, desktop app, and HTTP API. It owns catalog views, identity/settings, active sessions, persistence, attach/resume, editors, and live traces. It does not reason.
+- **Laboratory (Lab)** is the optional network layer between Studio and Terrarium. In single-machine mode it is not even imported. In `--mode lab-host` it lets one host coordinate creatures on N worker machines via WebSocket: Studio still calls one `TerrariumService`, Terrarium still ships local channel sends, but a `MultiNodeTerrariumService` routes per-creature ops to the right worker and a session-event tee mirrors every worker's session file back to the host. See [Laboratory concept](docs/en/concepts/laboratory.md) and the [Laboratory guide](docs/en/guides/laboratory.md).
 - **Terrarium** is the runtime engine that hosts every running creature in the process. A standalone agent is a one-creature graph; a multi-creature team is a connected graph. The engine runs no LLM and has no reasoning loop, but it owns *structure*: which creatures share a connected component, which channels exist, where each turn-end output is delivered, which session store backs which graph, and the auto-merge / auto-split bookkeeping that follows topology changes.
 - **Privileged node** is a creature inside a graph that has been granted the `group_*` tools (graph editor: spawn / remove creatures, draw / delete channels, start / stop members). The recipe `root:` keyword promotes one node to privileged + applies the standard user-facing wiring (`report_to_root` channel, listen on every channel). Privilege can also be granted inline (`privileged: true`) or imperatively (`is_privileged=True`).
 - **Creature** owns reasoning: controller, tools, triggers, sub-agents, plugins, memory, I/O, prompts, and private state. Creatures do not need to know whether they are alone or part of a graph.
@@ -389,6 +405,35 @@ See [HTTP API](docs/en/reference/http.md), [Serving guide](docs/en/guides/servin
 
 `kt app` launches the web UI inside a native desktop window (requires `pywebview`).
 
+### Deployment (Docker / systemd / multi-node)
+
+Three first-party Docker images on GHCR — pick the shape:
+
+```bash
+# AIO: lab-host + an embedded worker in one container
+docker run -d -p 8001:8001 -v kt:/home/kt/.kohakuterrarium \
+  ghcr.io/kohaku-lab/kohakuterrarium:1.5.0
+
+# Host + workers (different boxes): two images, same shared token
+docker run -d -p 8001:8001 -p 8100:8100 \
+  -e KT_HOST_TOKEN=$TOKEN ghcr.io/kohaku-lab/kohakuterrarium-host:1.5.0
+docker run -d -e KT_HOST_URL=ws://host:8100 -e KT_HOST_TOKEN=$TOKEN \
+  -e KT_CLIENT_NAME=worker-a ghcr.io/kohaku-lab/kohakuterrarium-client:1.5.0
+```
+
+systemd alternative — install a hardened native service in one command:
+
+```bash
+sudo kt service install --all                              # AIO unit
+sudo kt service install --host                             # host unit
+sudo kt service install --client --name worker-a --host-url ws://… --host-token …
+sudo systemctl enable --now kohakuterrarium-host kohakuterrarium-client@worker-a
+```
+
+Ready-to-use compose files under `examples/deployment/` (AIO, host + workers, distributed) and an nginx template for TLS termination. `/healthz` + `/readyz` endpoints drive Docker `HEALTHCHECK` and reverse-proxy active health.
+
+See [Deployment — Docker](docs/en/guides/deployment-docker.md), [Deployment — systemd](docs/en/guides/deployment-systemd.md), [Deployment — reverse proxy](docs/en/guides/deployment-reverse-proxy.md).
+
 ## Sessions, memory, and resume
 
 Sessions save to `~/.kohakuterrarium/sessions/` unless disabled.
@@ -478,7 +523,7 @@ Full docs live in [`docs/`](docs/en/README.md).
 [First Creature](docs/en/tutorials/first-creature.md) · [First Terrarium](docs/en/tutorials/first-terrarium.md) · [First Python Embedding](docs/en/tutorials/first-python-embedding.md) · [First Custom Tool](docs/en/tutorials/first-custom-tool.md) · [First Plugin](docs/en/tutorials/first-plugin.md)
 
 ### Guides
-[Getting Started](docs/en/guides/getting-started.md) · [Creatures](docs/en/guides/creatures.md) · [Terrariums](docs/en/guides/terrariums.md) · [Sessions](docs/en/guides/sessions.md) · [Memory](docs/en/guides/memory.md) · [Configuration](docs/en/guides/configuration.md) · [Programmatic Usage](docs/en/guides/programmatic-usage.md) · [Composition](docs/en/guides/composition.md) · [Custom Modules](docs/en/guides/custom-modules.md) · [Plugins](docs/en/guides/plugins.md) · [MCP](docs/en/guides/mcp.md) · [Packages](docs/en/guides/packages.md) · [Serving](docs/en/guides/serving.md) · [Examples](docs/en/guides/examples.md)
+[Getting Started](docs/en/guides/getting-started.md) · [Creatures](docs/en/guides/creatures.md) · [Terrariums](docs/en/guides/terrariums.md) · [Sessions](docs/en/guides/sessions.md) · [Memory](docs/en/guides/memory.md) · [Configuration](docs/en/guides/configuration.md) · [Programmatic Usage](docs/en/guides/programmatic-usage.md) · [Composition](docs/en/guides/composition.md) · [Custom Modules](docs/en/guides/custom-modules.md) · [Plugins](docs/en/guides/plugins.md) · [MCP](docs/en/guides/mcp.md) · [Packages](docs/en/guides/packages.md) · [Serving](docs/en/guides/serving.md) · [Laboratory](docs/en/guides/laboratory.md) · [Deployment — Docker](docs/en/guides/deployment-docker.md) · [Deployment — systemd](docs/en/guides/deployment-systemd.md) · [Deployment — reverse proxy](docs/en/guides/deployment-reverse-proxy.md) · [Examples](docs/en/guides/examples.md)
 
 ### Concepts
 [Glossary](docs/en/concepts/glossary.md) · [Why KohakuTerrarium](docs/en/concepts/foundations/why-kohakuterrarium.md) · [What is an agent](docs/en/concepts/foundations/what-is-an-agent.md) · [Composing an agent](docs/en/concepts/foundations/composing-an-agent.md) · [Modules](docs/en/concepts/modules/README.md) · [Agent as a Python object](docs/en/concepts/python-native/agent-as-python-object.md) · [Composition algebra](docs/en/concepts/python-native/composition-algebra.md) · [Multi-agent](docs/en/concepts/multi-agent/README.md) · [Patterns](docs/en/concepts/patterns.md) · [Boundaries](docs/en/concepts/boundaries.md)
@@ -524,7 +569,7 @@ Unlike monolithic frameworks, KohakuTerrarium keeps responsibilities separated: 
 ### Installation & Setup
 
 **What Python version is required?**
-Python 3.10 or higher. Install via `pip install kohakuterrarium`.
+Python 3.10 or higher. Install via `pip install kohakuterrarium`. **Python 3.12+ is recommended** — that's what CI validates and what the agent runtime is tuned for. 3.10 and 3.11 are supported on a best-effort basis (everything installs and runs, but the asyncio + SQLite-daemon-thread interaction on those older runtimes is slower and occasionally fights the per-test timeouts in the integration suite).
 
 **Which LLM providers are supported?**
 Codex OAuth, OpenAI/OpenRouter-style providers, native Anthropic, Google Gemini, local OpenAI-compatible servers (Ollama, vLLM), and other OpenAI-compatible cloud providers. Configure with `kt login`, `kt config llm add`, `kt config provider add`, or provider API keys.

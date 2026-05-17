@@ -11,10 +11,17 @@ workers.
 import argparse
 
 import kohakuterrarium.studio  # noqa: F401 — registers terrarium.group_hooks
+from kohakuterrarium.cli._aliases import (
+    add_client_alias,
+    add_host_alias,
+    dispatch_client_alias,
+    dispatch_host_alias,
+)
 from kohakuterrarium.cli.auth import login_cli
 from kohakuterrarium.cli.config import add_config_subparser, config_cli
 from kohakuterrarium.cli.extension import extension_info_cli, extension_list_cli
 from kohakuterrarium.cli.identity_mcp import list_for_agent_cli as mcp_list_cli
+from kohakuterrarium.cli.lab_client import add_lab_client_subparser, lab_client_cli
 from kohakuterrarium.cli.memory import embedding_cli, search_cli
 from kohakuterrarium.cli.model import model_cli
 from kohakuterrarium.cli.packages import (
@@ -27,7 +34,9 @@ from kohakuterrarium.cli.packages import (
 )
 from kohakuterrarium.cli.resume import resume_cli
 from kohakuterrarium.cli.run import run_agent_cli
+from kohakuterrarium.cli.self_update import add_self_update_subparser, self_update_cli
 from kohakuterrarium.cli.serve import add_serve_subparser, serve_cli
+from kohakuterrarium.cli.service import add_service_subparser, service_cli
 from kohakuterrarium.cli.version import format_version_report
 from kohakuterrarium.packages.resolve import resolve_package_path
 from kohakuterrarium.serving.web import run_desktop_app, run_web_server
@@ -355,6 +364,24 @@ def _build_parser() -> argparse.ArgumentParser:
     # Serve command group
     add_serve_subparser(subparsers)
 
+    # Lab worker command (foreground)
+    add_lab_client_subparser(subparsers)
+
+    # ── 1.5 distribution-infra aliases ────────────────────────────
+    # `kt host`   == `kt serve start --mode lab-host --foreground …`
+    # `kt client` == `kt lab-client …`
+    # These match the deployment-doc nomenclature (host / client) so
+    # operator instructions, systemd unit names, and Docker image
+    # names all read the same as the commands you actually type.
+    add_host_alias(subparsers)
+    add_client_alias(subparsers)
+
+    # ``kt service`` — systemd unit install / uninstall / status / edit
+    add_service_subparser(subparsers)
+
+    # ``kt self-update`` — wrapper-aware framework update with pip fallback
+    add_self_update_subparser(subparsers)
+
     internal_serve_parser = subparsers.add_parser(
         "__run-server", help=argparse.SUPPRESS
     )
@@ -367,6 +394,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default="INFO",
     )
     internal_serve_parser.add_argument("--state-path", default=None)
+    internal_serve_parser.add_argument(
+        "--mode",
+        choices=["standalone", "lab-host"],
+        default="standalone",
+    )
+    internal_serve_parser.add_argument("--lab-bind", default=None)
+    internal_serve_parser.add_argument("--lab-token", default=None)
 
     return parser
 
@@ -484,8 +518,16 @@ COMMANDS: dict[str, callable] = {
             dev=args.dev,
             log_level=args.log_level,
             state_path=args.state_path,
+            mode=getattr(args, "mode", "standalone"),
+            lab_bind=getattr(args, "lab_bind", None),
+            lab_token=getattr(args, "lab_token", None),
         )
     ),
+    "lab-client": lab_client_cli,
+    "host": dispatch_host_alias,
+    "client": dispatch_client_alias,
+    "service": service_cli,
+    "self-update": self_update_cli,
     "extension": _dispatch_extension,
     "mcp": _dispatch_mcp,
 }

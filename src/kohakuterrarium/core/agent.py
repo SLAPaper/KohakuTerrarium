@@ -213,8 +213,7 @@ class Agent(
 
         Sub-agents that inherit share this counter. The parent
         controller also consumes one slot per turn in
-        ``AgentHandlersMixin._check_termination`` — see Cluster 6.1 in
-        ``plans/harness/extension-point-decisions.md``.
+        ``AgentHandlersMixin._check_termination``.
         """
         cap = getattr(self.config, "max_iterations", None)
         if not cap or cap <= 0:
@@ -258,6 +257,10 @@ class Agent(
         """Start all agent modules."""
         logger.info("Starting agent", agent_name=self.config.name)
 
+        # Stash the running loop so cross-thread schedulers (TUI promote)
+        # can ``call_soon_threadsafe`` on it without ``get_event_loop()``
+        # (which raises in sync contexts on Python 3.14+).
+        self._loop = asyncio.get_running_loop()
         self._configure_tui_tabs()
 
         await self.input.start()
@@ -624,17 +627,20 @@ class Agent(
         # Thread-safe promotion: asyncio.Event.set() must run on the
         # event loop thread. TUI calls this from Textual's thread.
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
             # Already on the event loop (API handler) — promote directly
             if not handle.promote():
                 return False
         except RuntimeError:
-            # Not on an event loop (TUI thread) — schedule on the agent's loop
-            try:
-                loop = asyncio.get_event_loop()
-                loop.call_soon_threadsafe(handle.promote)
-            except RuntimeError:
-                return False
+            # TUI thread — schedule on the loop captured at ``start()``.
+            # ``asyncio.get_event_loop()`` is unsafe on Python 3.14+.
+            loop = getattr(self, "_loop", None)
+            if loop is None or loop.is_closed():
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    return False
+            loop.call_soon_threadsafe(handle.promote)
 
         self.output_router.notify_activity(
             "task_promoted",
