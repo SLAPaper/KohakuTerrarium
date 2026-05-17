@@ -63,6 +63,32 @@ describe("chat store — interrupted task handling", () => {
     expect(pendingJobs).toEqual({})
   })
 
+  it("replays successful subagent_result as done instead of running", () => {
+    const chat = useChatStore()
+    chat.messagesByTab = { main: [] }
+
+    const messages = []
+    const events = [
+      { type: "processing_start" },
+      { type: "subagent_call", name: "explore", job_id: "agent_explore_1", task: "find auth" },
+      {
+        type: "subagent_result",
+        name: "explore",
+        job_id: "agent_explore_1",
+        output: "Found auth module.",
+      },
+      { type: "processing_end" },
+    ]
+
+    const { messages: replayed, pendingJobs } = _replayEvents(messages, events)
+
+    const tool = replayed[0].parts[0]
+    expect(tool.kind).toBe("subagent")
+    expect(tool.status).toBe("done")
+    expect(tool.result).toBe("Found auth module.")
+    expect(pendingJobs).toEqual({})
+  })
+
   it("background subagent without subagent_result rebuilds as running, not interrupted", () => {
     // Background sub-agents finish AFTER the controller turn that spawned
     // them — the event stream is allowed to end with subagent_call but no

@@ -488,6 +488,7 @@ export function _replayEvents(messages, events, branchView = null) {
       tc.resultMeta = payload.resultMeta
       if (opts?.interrupted || opts?.finalState === "interrupted") tc.status = "interrupted"
       else if (opts?.error) tc.status = "error"
+      else tc.status = "done"
       if (opts?.tools_used) tc.tools_used = opts.tools_used
       if (opts?.turns != null) tc.turns = opts.turns
       if (opts?.duration != null) tc.duration = opts.duration
