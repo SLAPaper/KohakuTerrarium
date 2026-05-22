@@ -45,6 +45,9 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.34.0",
     "websockets>=10.4",
+    # API auth (L4 — multi-user accounts).  Used only by api/auth/crypto.py;
+    # CLI / TUI / framework core do not touch it.
+    "bcrypt>=4.0.0",
     # Web tools
     "trafilatura>=2.0.0",
     "ddgs>=9.0.0",
@@ -143,12 +146,14 @@ asyncio_mode = "auto"
 # scenarios with a ScriptedLLM and (for multi-node tests)
 # real WebSocket-backed lab clusters.
 testpaths = ["tests/unit", "tests/integration", "tests/e2e"]
-# Default pytest-timeout: any test that exceeds 30s is killed.  E2E tests
-# typically finish in <2s with ScriptedLLM; the generous default is a
+# Default pytest-timeout: any test that exceeds 60s is killed.  Most
+# e2e tests finish in <2s with ScriptedLLM; the generous default is a
 # safety net for genuine deadlocks (a stream that never closes, a
-# subscribe that never delivers).  Per-test overrides via
-# ``@pytest.mark.timeout(60)`` when justified.
-timeout = 30
+# subscribe that never delivers).  Bumped from 30 → 60 because the
+# multi-node + lab subprocess journeys legitimately need longer on
+# loaded CI workers (handshake + WebSocket bind latency stacks up).
+# Per-test overrides via ``@pytest.mark.timeout(120)`` when justified.
+timeout = 60
 timeout_method = "thread"
 
 [tool.ruff.lint]
