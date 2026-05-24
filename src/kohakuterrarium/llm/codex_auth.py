@@ -279,8 +279,18 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
-async def _browser_flow() -> CodexTokens:
-    """OAuth PKCE flow with browser redirect to localhost."""
+async def _browser_flow(open_browser: bool = True) -> CodexTokens:
+    """OAuth PKCE flow with browser redirect to localhost.
+
+    The HTTP callback server on ``127.0.0.1:REDIRECT_PORT`` always
+    starts; ``open_browser=False`` only suppresses the local
+    ``webbrowser.open()`` call.  A user who manually clicks the
+    printed auth URL still completes via the browser-redirect path.
+    The SSE / WebView modal route passes ``open_browser=False`` —
+    auto-popping a system browser on the server's machine is
+    redundant (web UI = same machine) and on Android Chaquopy
+    blocks the event loop hunting for a non-existent browser.
+    """
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(32)
     auth_url = _build_auth_url(code_challenge, state)
@@ -302,10 +312,11 @@ async def _browser_flow() -> CodexTokens:
     thread = Thread(target=_serve_once, daemon=True)
     thread.start()
 
-    print("[Browser] Opening authentication URL:")
+    print("[Browser] Authentication URL:")
     print(auth_url)
     print()
-    webbrowser.open(auth_url)
+    if open_browser:
+        webbrowser.open(auth_url)
 
     try:
         await asyncio.wait_for(received.wait(), timeout=300)
@@ -328,15 +339,22 @@ async def _browser_flow() -> CodexTokens:
 # =========================================================================
 
 
-async def _device_code_flow() -> CodexTokens:
-    """OAuth device code flow for headless environments.
+async def _device_code_flow(
+    on_device_code: "callable | None" = None,
+) -> CodexTokens:
+    """OAuth device code flow for headless / WebView environments.
 
-    Uses OpenAI's Codex-specific device auth endpoints:
-    1. POST /api/accounts/deviceauth/usercode -> get device_auth_id + user_code
-    2. User visits /codex/device and enters user_code
-    3. Poll /api/accounts/deviceauth/token until user completes auth
-    4. Server returns authorization_code + PKCE codes
-    5. Exchange at /oauth/token for access + refresh tokens
+    Polling matches codex-rs verbatim: 2xx = success, 403/404 = keep
+    polling, anything else = abort.  The earlier 400/428 + error-
+    JSON-parsing branch was a superset that occasionally tripped on
+    transient errors and bailed the modal early.
+
+    Success body: ``{authorization_code, code_verifier, code_challenge}``;
+    exchanged at ``/oauth/token`` with the device-specific redirect_uri.
+
+    ``on_device_code(verification_url, user_code, expires_in)`` is
+    invoked as soon as the user-code is obtained, before any poll,
+    so the SSE route can push it to the modal.
     """
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -362,31 +380,47 @@ async def _device_code_flow() -> CodexTokens:
     print()
     print("Waiting for authentication (either method)...")
 
+    # Push the user code + URL to any subscribed event sink (SSE /
+    # WebSocket modal) so the frontend can show them immediately
+    # instead of waiting for the entire poll-and-exchange to finish.
+    if on_device_code is not None:
+        try:
+            res = on_device_code(DEVICE_VERIFY_URL, user_code, expires_in)
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception as exc:
+            logger.warning(
+                "on_device_code callback raised",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+
     deadline = time.time() + expires_in
     async with httpx.AsyncClient(timeout=30) as client:
         while time.time() < deadline:
-            await asyncio.sleep(interval)
-            resp = await client.post(
-                DEVICE_TOKEN_URL,
-                json={
-                    "device_auth_id": device_auth_id,
-                    "user_code": user_code,
-                },
-            )
+            try:
+                resp = await client.post(
+                    DEVICE_TOKEN_URL,
+                    json={
+                        "device_auth_id": device_auth_id,
+                        "user_code": user_code,
+                    },
+                )
+            except (httpx.NetworkError, httpx.TimeoutException) as exc:
+                # Transient blip — treat same as a pending poll.
+                logger.debug("Device-code poll transient error", error=str(exc))
+                await asyncio.sleep(interval)
+                continue
 
             if resp.status_code == 200:
                 token_data = resp.json()
-                # Server returns authorization_code + PKCE codes
                 auth_code = token_data.get("authorization_code", "")
                 code_verifier = token_data.get("code_verifier", "")
-
                 if auth_code and code_verifier:
-                    # Exchange using device-specific redirect_uri
                     return await _exchange_code(
                         auth_code, code_verifier, DEVICE_REDIRECT_URI
                     )
-
-                # Some responses may return tokens directly
+                # Direct-token shape (legacy / OIDC fallback path).
                 if "access_token" in token_data:
                     tokens = CodexTokens(
                         access_token=token_data["access_token"],
@@ -397,35 +431,34 @@ async def _device_code_flow() -> CodexTokens:
                     tokens.save()
                     logger.info("Device code login successful")
                     return tokens
+                # 200 with no usable fields — log + treat as pending.
+                logger.debug(
+                    "Device-code poll returned 200 with no auth code; will retry"
+                )
+                await asyncio.sleep(interval)
+                continue
 
-            # Handle pending/error responses
-            if resp.status_code in (403, 400, 428):
-                try:
-                    error_data = resp.json()
-                    raw_error = error_data.get("error", "")
-                    # error field may be a string or a dict {"message": ..., "type": ...}
-                    if isinstance(raw_error, dict):
-                        error = raw_error.get("code", raw_error.get("type", "unknown"))
-                        error_msg = raw_error.get("message", str(raw_error))
-                    else:
-                        error = raw_error
-                        error_msg = error
-                except Exception as e:
-                    logger.debug("Failed to parse error response JSON", error=str(e))
-                    continue
-                if error in (
-                    "authorization_pending",
-                    "pending",
-                    "deviceauth_authorization_unknown",  # user hasn't completed yet
-                ):
-                    continue
-                if error == "slow_down":
-                    interval += 5  # slow down
-                    continue
-                if error in ("expired_token", "access_denied"):
-                    raise RuntimeError(f"Device code auth failed: {error}")
-                # Any other unrecognised error is fatal — don't loop until timeout
-                raise RuntimeError(f"Device code auth error: {error_msg}")
+            # codex-rs treats 403 + 404 identically: "user hasn't
+            # entered the code yet, keep polling."  No JSON parse,
+            # no error matching — the simpler invariant survives the
+            # widest range of OpenAI server-side response shapes.
+            if resp.status_code in (403, 404):
+                await asyncio.sleep(interval)
+                continue
+
+            # 429 — back off and keep polling.
+            if resp.status_code == 429:
+                interval = min(interval + 5, 30)
+                await asyncio.sleep(interval)
+                continue
+
+            # Anything else (4xx that isn't 403/404/429, 5xx) is
+            # fatal.  We surface the body so the modal can show
+            # something useful instead of an opaque hang.
+            body = resp.text[:200]
+            raise RuntimeError(
+                f"Device code poll failed: HTTP {resp.status_code} {body}"
+            )
 
     raise RuntimeError("Device code auth timed out")
 
@@ -479,20 +512,27 @@ async def _exchange_code(
 # =========================================================================
 
 
-async def oauth_login() -> CodexTokens:
-    """
-    Authenticate with OpenAI Codex OAuth.
+async def oauth_login(
+    on_device_code: "callable | None" = None,
+    open_browser: bool = True,
+) -> CodexTokens:
+    """Authenticate with OpenAI Codex OAuth.
 
-    Runs BOTH flows simultaneously - browser redirect AND device code.
-    Whichever completes first wins. This handles all environments:
-    - Local machine: browser opens, redirect catches it
-    - SSH/headless: user visits URL on another device, enters code
-    - Remote desktop: either flow may work
-    - Windows reserved port: browser fails fast, device code continues
+    Runs BOTH flows in parallel (browser-redirect + device-code)
+    and returns whichever completes first.  Either flow may be
+    unusable in any given environment, so the dual race covers all
+    cases — codex-rs ships the same shape.
+
+    ``on_device_code`` is forwarded to the device-code branch; pass
+    ``None`` (default) for the print-only behaviour.
+
+    ``open_browser=False`` suppresses the local ``webbrowser.open()``
+    call but the browser-redirect HTTP server still listens.  Modal
+    callers pass ``False``; CLI keeps ``True``.
     """
-    # Start both flows as concurrent tasks
-    browser_task = asyncio.create_task(_browser_flow_safe())
-    device_task = asyncio.create_task(_device_code_flow())
+    # Start both flows as concurrent tasks.
+    browser_task = asyncio.create_task(_browser_flow_safe(open_browser=open_browser))
+    device_task = asyncio.create_task(_device_code_flow(on_device_code=on_device_code))
 
     tasks = {browser_task, device_task}
     last_error: Exception | None = None
@@ -518,10 +558,10 @@ async def oauth_login() -> CodexTokens:
     raise RuntimeError(f"All authentication flows failed: {last_error}")
 
 
-async def _browser_flow_safe() -> CodexTokens:
+async def _browser_flow_safe(open_browser: bool = True) -> CodexTokens:
     """Browser flow that doesn't crash if port is busy or browser fails."""
     try:
-        return await _browser_flow()
+        return await _browser_flow(open_browser=open_browser)
     except OSError as e:
         # Port already in use / permission denied (e.g. Windows reserved ports)
         logger.debug("Browser flow unavailable", error=str(e))
