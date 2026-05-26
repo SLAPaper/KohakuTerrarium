@@ -116,6 +116,7 @@ class AgentInitMixin:
         init_tools(self.config, self.registry, self._loader)
         self._drop_unsupported_provider_native_tools()
         self._auto_inject_provider_native_tools()
+        self._ensure_mcp_tools_registered()
 
     def _drop_unsupported_provider_native_tools(self) -> None:
         """Remove user-wired provider-native tools the provider can't serve.
@@ -425,6 +426,29 @@ class AgentInitMixin:
         self.registry.register_tool(tool)
         if getattr(self, "executor", None) is not None:
             self.executor.register_tool(tool)
+
+    def _ensure_mcp_tools_registered(self) -> None:
+        """Auto-register MCP meta-tools (mcp_list, mcp_call, etc.).
+
+        These builtin tools should be available whenever the agent has MCP
+        servers — whether from creature config or from the global registry.
+        Without auto-registration, creatures must manually list all four
+        under ``tools:``, which is error-prone and defeats the purpose of
+        the global registry.
+
+        The tools are only injected if they aren't already in the registry
+        (a creature may still override them explicitly).
+        """
+        mcp_tool_names = ("mcp_list", "mcp_call", "mcp_connect", "mcp_disconnect")
+        for name in mcp_tool_names:
+            if self.registry.get_tool(name) is not None:
+                continue  # Already registered (creature explicitly listed it)
+            tool = get_builtin_tool(name)
+            if tool is None:
+                continue
+            self.registry.register_tool(tool)
+            if getattr(self, "executor", None) is not None:
+                self.executor.register_tool(tool)
 
     async def _try_slash_command_text(self, text: str) -> Any | None:
         """Run the configured slash dispatcher for programmatic inputs."""

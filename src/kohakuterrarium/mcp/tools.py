@@ -16,15 +16,20 @@ logger = get_logger(__name__)
 
 
 def _get_mcp_manager(context: Any) -> MCPClientManager:
-    """Extract MCP manager from tool context."""
+    """Extract or lazily create MCP manager from tool context.
+
+    If the agent has no ``_mcp_manager`` (because no MCP servers were
+    configured at startup), a new ``MCPClientManager`` is created and
+    attached so that ``mcp_connect`` can establish connections at
+    runtime.
+    """
     if context and hasattr(context, "agent") and context.agent:
         mgr = getattr(context.agent, "_mcp_manager", None)
-        if mgr:
-            return mgr
-    raise RuntimeError(
-        "MCP is not available. No MCP manager found on the agent. "
-        "Configure mcp_servers in creature config to enable MCP."
-    )
+        if mgr is None:
+            mgr = MCPClientManager()
+            context.agent._mcp_manager = mgr
+        return mgr
+    raise RuntimeError("MCP is not available — no agent context.")
 
 
 @register_builtin("mcp_list")
