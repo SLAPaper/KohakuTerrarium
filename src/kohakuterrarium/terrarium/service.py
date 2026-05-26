@@ -30,9 +30,13 @@ DTOs vs live objects:
   inside Phase 0 before W1 migration).
 """
 
+import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+_logger = logging.getLogger(__name__)
 
 from kohakuterrarium.core.channel import ChannelMessage as _ChannelMessage
 from kohakuterrarium.terrarium.creature_host import Creature
@@ -773,9 +777,15 @@ class LocalTerrariumService:
         branch_view: dict[int, int] | None = None,
     ) -> dict[str, Any]:
         agent = self._agent(creature_id)
-        await agent.regenerate_last_response(
+        content = await agent.prepare_regenerate(
             turn_index=turn_index, branch_view=branch_view
         )
+        if content is not None:
+            # Fire-and-forget: the LLM rerun streams via the existing
+            # WebSocket StreamOutput; the HTTP endpoint returns
+            # immediately so the frontend is not blocked by a 30 s
+            # axios timeout.
+            asyncio.create_task(self._safe_rerun(agent, content))
         return {"status": "regenerating"}
 
     async def edit_message(
@@ -789,13 +799,29 @@ class LocalTerrariumService:
         branch_view: dict[int, int] | None = None,
     ) -> bool:
         agent = self._agent(creature_id)
-        return await agent.edit_and_rerun(
+        edited = await agent.prepare_edit(
             msg_idx,
             content,
             turn_index=turn_index,
             user_position=user_position,
             branch_view=branch_view,
         )
+        if edited:
+            # Fire-and-forget: see ``regenerate`` above.
+            asyncio.create_task(self._safe_rerun(agent, content))
+        return edited
+
+    @staticmethod
+    async def _safe_rerun(agent: Any, new_user_content: Any) -> None:
+        """Run the LLM rerun in a background task.
+
+        Catches and logs exceptions so a failure in the background
+        processing loop does not crash the event loop.
+        """
+        try:
+            await agent._rerun_from_last(new_user_content=new_user_content)
+        except Exception:
+            _logger.exception("Background rerun failed")
 
     async def rewind(self, creature_id: str, msg_idx: int) -> None:
         await self._agent(creature_id).rewind_to(msg_idx)

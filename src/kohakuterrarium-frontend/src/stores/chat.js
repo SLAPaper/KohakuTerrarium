@@ -2300,7 +2300,8 @@ const _chatStoreOptions = {
         // targets that branch's tail).
         const branchView = this.branchViewByTab[tab] || null
         await agentAPI.regenerate(sid, cid, { turnIndex, branchView })
-        await this._resyncHistory(tab)
+        // WS events (processing_start -> text chunks -> idle/processing_end)
+        // rebuild messages and trigger _scheduleBranchResync automatically.
       } catch (e) {
         console.warn("Failed to regenerate:", e)
         this._scheduleBranchResync(tab)
@@ -2401,8 +2402,9 @@ const _chatStoreOptions = {
             expectedBranchByTurn: { [turnIndex]: editResponse.branch_id },
           })
         }
-        const resynced = await this._resyncHistory(tab)
-        return resynced !== false
+        // WS events (processing_start -> text chunks -> idle/processing_end)
+        // rebuild messages and trigger _scheduleBranchResync automatically.
+        return true
       } catch (e) {
         delete this._branchResyncPendingByTab[tab]
         if (previousMessages && tab) this.messagesByTab[tab] = previousMessages
@@ -2429,8 +2431,9 @@ const _chatStoreOptions = {
     },
 
     /** Re-fetch conversation history from the backend and rebuild the
-     *  local message list. Called after edit/regenerate/rewind so the
-     *  frontend matches the backend's truncated conversation.
+     *  local message list.  Called by ``_scheduleBranchResync`` after
+     *  WS ``processing_end`` / ``idle`` events so the branch navigator
+     *  settles on the right value after an edit, regen, or rewind.
      *
      *  Robustness: ALWAYS rebuild messages from whatever events the
      *  backend has at the moment of the call, even when the expected
