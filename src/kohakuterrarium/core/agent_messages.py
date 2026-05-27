@@ -21,28 +21,37 @@ logger = get_logger(__name__)
 class AgentMessagesMixin:
     """Message edit / regenerate / rewind operations."""
 
-    async def prepare_regenerate(
+    async def regenerate_last_response(
         self,
         *,
         turn_index: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> str | None:
-        """Prepare to regenerate -- fast phase only (no LLM call).
+    ) -> None:
+        """Regenerate an assistant response.
 
-        Returns the user-message content to pass to
-        ``_rerun_from_last(new_user_content=...)``, or ``None`` if
-        regeneration is not possible.  For a pure tail regen the
-        returned content is ``""`` (empty string) so the downstream
-        ``_rerun_from_last`` treats it as a non-edit regen.
+        With ``turn_index=None`` (default): re-runs the conversation
+        tail's last turn. With ``turn_index`` set: re-runs that
+        specific turn (creates a new branch under the current
+        viewing subtree). The latter is the path "click retry on an
+        old assistant message" — without a turn_index parameter the
+        backend always defaults to the tail and the click silently
+        targets the wrong message.
 
-        Split from ``regenerate_last_response`` so the HTTP endpoint
-        can return immediately while the LLM rerun proceeds as a
-        background task.
+        ``branch_view`` lets a caller retry on a NON-LATEST branch.
+        Without it the agent's in-memory conversation reflects the
+        last run (latest subtree) and a retry on an older branch
+        would target the wrong message. Frontend passes the user's
+        current ``branchViewByTab`` selection through.
+
+        Uses current model/settings — which may differ from when the
+        original response was generated. Opens a new ``branch_id`` for
+        the resolved ``turn_index`` so the original branch is preserved
+        and addressable via the ``<x/N>`` navigator.
         """
         if turn_index is not None:
             # Resolve the user_message content for this turn at the
             # selected branch in our subtree, then route through
-            # prepare_edit with that same content -- semantically
+            # edit_and_rerun with that same content — semantically
             # "edit to identical content," which opens a new branch
             # at the requested turn just like a tail regen would for
             # the last turn.
@@ -54,7 +63,7 @@ class AgentMessagesMixin:
                     "Cannot find user_message for turn",
                     turn=turn_index,
                 )
-                return None
+                return
             user_position = self._user_position_for_turn_index(
                 turn_index, branch_view=branch_view
             )
@@ -63,26 +72,26 @@ class AgentMessagesMixin:
                     "Cannot resolve user_position for turn",
                     turn=turn_index,
                 )
-                return None
-            edited = await self.prepare_edit(
+                return
+            await self.edit_and_rerun(
                 message_idx=-1,
                 new_content=prev_content,
                 turn_index=turn_index,
                 user_position=user_position,
                 branch_view=branch_view,
             )
-            return prev_content if edited else None
+            return
 
         conv = self.controller.conversation
         last_user = conv.find_last_user_index()
         if last_user < 0:
             logger.warning("No user message to regenerate from")
-            return None
+            return
         removed = conv.truncate_from(last_user + 1)
         # Open a new branch of the current turn.
         self._branch_id = self._max_branch_id_for_turn(self._turn_index) + 1
         logger.info(
-            "Regenerating (prepare phase)",
+            "Regenerating",
             dropped=len(removed),
             turn_index=self._turn_index,
             branch_id=self._branch_id,
@@ -90,12 +99,12 @@ class AgentMessagesMixin:
         # Emit fresh user_input + user_message events for the new
         # branch so replay (and the resume display surfaces that
         # group by ``user_input``) see a self-contained branch.
-        # Pure regen mirrors the previous branch's wording -- the
+        # Pure regen mirrors the previous branch's wording — the
         # in-memory conversation already has the original user
         # message; the controller does NOT re-append on rerun.
         prev_content = self._previous_branch_user_content()
         if self.session_store is not None and prev_content is not None:
-            # Pure regen keeps the existing parent path -- we are
+            # Pure regen keeps the existing parent path — we are
             # opening a sibling branch of the SAME turn, so the path
             # of prior turns is unchanged.
             ppath = [tuple(p) for p in getattr(self, "_parent_branch_path", [])]
@@ -115,28 +124,9 @@ class AgentMessagesMixin:
                 branch_id=self._branch_id,
                 parent_branch_path=ppath,
             )
-        # Return empty string for tail regen (signals non-edit rerun).
-        return prev_content or ""
+        await self._rerun_from_last()
 
-    async def regenerate_last_response(
-        self,
-        *,
-        turn_index: int | None = None,
-        branch_view: dict[int, int] | None = None,
-    ) -> None:
-        """Regenerate an assistant response (blocking).
-
-        Backward-compatible wrapper: ``prepare_regenerate`` + LLM
-        rerun.  New callers should prefer ``prepare_regenerate`` +
-        fire-and-forget ``_rerun_from_last``.
-        """
-        content = await self.prepare_regenerate(
-            turn_index=turn_index, branch_view=branch_view
-        )
-        if content is not None:
-            await self._rerun_from_last(new_user_content=content)
-
-    async def prepare_edit(
+    async def edit_and_rerun(
         self,
         message_idx: int,
         new_content: str,
@@ -145,17 +135,18 @@ class AgentMessagesMixin:
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
     ) -> bool:
-        """Edit a user message -- fast phase only (no LLM call).
+        """Replace a user message and re-run from there.
 
-        Truncates the conversation, computes the new branch, and writes
-        ``user_input`` / ``user_message`` events.  Returns ``True`` on
-        success; the caller must then trigger
-        ``_rerun_from_last(new_user_content=new_content)``.
+        ``message_idx`` remains the raw in-memory conversation index for
+        CLI/back-compat callers. Frontend callers should pass a stable
+        ``turn_index`` or visible ``user_position`` so system/tool
+        messages cannot shift the target.
 
-        Split from ``edit_and_rerun`` so the HTTP endpoint can return
-        immediately after validation while the LLM rerun proceeds as a
-        background task, avoiding axios timeout on long-running LLM
-        calls.
+        ``branch_view`` lets a caller edit on a NON-LATEST branch.
+        When provided, the agent's in-memory conversation is replayed
+        from events under the chosen view BEFORE the edit, so the
+        truncation target resolves correctly even when the user has
+        switched to an older subtree in the UI.
         """
         # Reload conversation under the chosen subtree FIRST so the
         # in-memory message list reflects what the user sees in the UI.
@@ -192,7 +183,7 @@ class AgentMessagesMixin:
         )
         # Drop the old user message + everything after from the
         # in-memory conversation. Do NOT append the new user message
-        # here -- the rerun trigger carries it; the controller appends
+        # here — the rerun trigger carries it; the controller appends
         # it via ``_build_turn_context``.
         conv.truncate_from(resolved_idx)
         # Resolve the turn_index of the edited user message and bump
@@ -219,7 +210,7 @@ class AgentMessagesMixin:
             else max(self._branch_id, 1) + 1
         )
         logger.info(
-            "Edited (prepare phase)",
+            "Edited and re-running",
             index=resolved_idx,
             turn_index=self._turn_index,
             branch_id=self._branch_id,
@@ -232,7 +223,7 @@ class AgentMessagesMixin:
         # parent_branch_path computed already, which the handler
         # cannot replicate without re-reading the event log).
         # Edit+rerun on an EARLIER turn drops every later-turn entry
-        # from the parent path -- those follow-ups belong to a previous
+        # from the parent path — those follow-ups belong to a previous
         # subtree and the new edit forks from this point.
         cur_path = list(getattr(self, "_parent_branch_path", []))
         cur_path = [(t, b) for (t, b) in cur_path if t < self._turn_index]
@@ -255,34 +246,8 @@ class AgentMessagesMixin:
                 branch_id=self._branch_id,
                 parent_branch_path=ppath,
             )
+        await self._rerun_from_last(new_user_content=new_content)
         return True
-
-    async def edit_and_rerun(
-        self,
-        message_idx: int,
-        new_content: str,
-        *,
-        turn_index: int | None = None,
-        user_position: int | None = None,
-        branch_view: dict[int, int] | None = None,
-    ) -> bool:
-        """Replace a user message and re-run from there (blocking).
-
-        Backward-compatible wrapper: ``prepare_edit`` + LLM rerun.
-        New callers should prefer ``prepare_edit`` + fire-and-forget
-        ``_rerun_from_last`` to avoid holding the HTTP response open
-        for the entire LLM processing loop.
-        """
-        edited = await self.prepare_edit(
-            message_idx,
-            new_content,
-            turn_index=turn_index,
-            user_position=user_position,
-            branch_view=branch_view,
-        )
-        if edited:
-            await self._rerun_from_last(new_user_content=new_content)
-        return edited
 
     async def rewind_to(self, message_idx: int) -> None:
         """Drop messages from ``message_idx`` onward without re-running."""
