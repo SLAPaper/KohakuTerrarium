@@ -67,13 +67,31 @@ def _shell_override_env(shell_type: str) -> str | None:
 
 
 def _resolve_shell_executable(shell_type: str) -> str | None:
-    # Mobile profile (Android): the bundled busybox provides
-    # ``sh``-compatible behaviour for bash/sh/zsh requests.  We
-    # check this FIRST so an operator-supplied override env still
-    # wins for testing, but the default path on Android is the
-    # bundled sandbox (Android has no /bin and no PATH lookups
-    # produce useful results).
+    # Mobile profile (Android): every device since Android 1.0 ships
+    # ``/system/bin/sh`` (mksh — MirBSD Korn shell) plus toybox-backed
+    # ``/system/bin/{ls,grep,cat,find,…}``.  ``/system`` is mounted
+    # with the ``exec`` flag (unlike ``/data``) and the binaries are
+    # world-executable, so an app's subprocess can spawn them
+    # without any of the W^X / SELinux / PIE complications that
+    # block bundled busybox in the app's data dir.
+    #
+    # mksh is POSIX-compliant — every plain shell command the agent
+    # emits works; only bash-only extensions (``[[``, ``(( ))``,
+    # arrays, ``$'…'``) would break, and those are uncommon in tool
+    # use.  ``bash`` / ``sh`` / ``zsh`` requests all land on mksh
+    # here because none of those have stock-Android binaries either.
+    #
+    # The bundled-sandbox fallback below is kept for desktops that
+    # opt into the mobile profile for testing (and for any future
+    # APK that ships a proper PIE+bionic busybox).  Order:
+    #
+    #   1. ``/system/bin/sh`` (Android stock)
+    #   2. bundled ``sandbox_binary("sh")`` (when present)
+    #   3. operator override env / PATH lookup (desktop path)
     if is_mobile_profile() and shell_type in {"bash", "sh", "zsh"}:
+        system_sh = Path("/system/bin/sh")
+        if system_sh.is_file():
+            return str(system_sh)
         bundled = sandbox_binary("sh")
         if bundled is not None:
             return str(bundled)
@@ -99,17 +117,39 @@ def _build_shell_argv(shell_type: str, resolved_exe: str, command: str) -> list[
     invocation is ``busybox sh -c <command>`` (multicall dispatch
     via the applet name).  Everywhere else we use the per-shell
     prefix args from ``_SHELL_SPECS``.
+
+    When the bundled binary is shipped as a native library
+    (``libbusybox.so``) — required on Android because data-dir
+    binaries fail ``execve()`` due to W^X / noexec policy —
+    ``argv[0]`` still reads ``busybox`` so the multicall dispatcher
+    finds the ``sh`` applet; the caller is expected to invoke
+    ``subprocess.Popen`` with ``executable=`` set to the real
+    ``libbusybox.so`` path (see :func:`_is_bundled_busybox`).
     """
     if (
         is_mobile_profile()
         and shell_type in {"bash", "sh", "zsh"}
-        and Path(resolved_exe).name == "busybox"
+        and _is_bundled_busybox(resolved_exe)
     ):
         bundled = bundled_sh_command(command)
         if bundled is not None:
             return bundled
     prefix_args = _SHELL_SPECS[shell_type][1]
     return [resolved_exe, *prefix_args, command]
+
+
+def _is_bundled_busybox(resolved_exe: str | None) -> bool:
+    """``True`` when ``resolved_exe`` is the sandbox-provided busybox.
+
+    Matches both bundled-name layouts: ``busybox`` (legacy / dev
+    sideload) and ``libbusybox.so`` (Android native-library
+    layout).  Callers gate the argv[0]-override + ``executable=``
+    Popen path on this.
+    """
+    if not resolved_exe:
+        return False
+    name = Path(resolved_exe).name
+    return name == "busybox" or name == "libbusybox.so"
 
 
 def _create_output_file() -> tuple[Path, Any]:
@@ -204,6 +244,56 @@ def _subprocess_runner(context: Any) -> Any:
     if isinstance(services, dict):
         return services.get("subprocess_runner")
     return None
+
+
+# Sentinel returned by :func:`_run_busybox_blocking` to signal a
+# timeout — the caller maps this back to the ``ToolResult`` timeout
+# error branch.  Negative values are safe because every legitimate
+# Linux exit code is in ``[0, 255]``.
+_BUSYBOX_TIMEOUT_SENTINEL = -2
+
+
+def _run_busybox_blocking(
+    *,
+    argv: list[str],
+    executable: str,
+    kwargs: dict[str, Any],
+    timeout: float | None,
+) -> int:
+    """Run ``argv`` via ``subprocess.Popen`` with ``executable=``
+    set, returning the exit code (or :data:`_BUSYBOX_TIMEOUT_SENTINEL`
+    on timeout).
+
+    Used on the Android mobile profile to invoke
+    ``libbusybox.so`` while keeping ``argv[0]="busybox"`` —
+    asyncio's ``create_subprocess_exec`` can't separate the two,
+    so we sit on a thread and let the event loop schedule
+    something else while this blocks.  ``terminate`` on timeout
+    follows the same start-new-session pattern as the async
+    path: kill the whole process group so a misbehaving applet
+    that forked children doesn't survive.
+    """
+    process = subprocess.Popen(
+        argv,
+        executable=executable,
+        **kwargs,
+    )
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if sys.platform != "win32":
+                os.killpg(os.getpgid(process.pid), 9)
+            else:
+                process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return _BUSYBOX_TIMEOUT_SENTINEL
+    return process.returncode or 0
 
 
 @register_builtin("bash")
@@ -305,19 +395,28 @@ class ShellTool(BaseTool):
         env = os.environ.copy()
         if self.config.env:
             env.update(self.config.env)
-        # Mobile profile: prepend the bundled sandbox bin dir to
-        # PATH so busybox sh can find its own applets via
-        # ``argv[0] = ls`` lookups when scripts shell out (busybox
-        # checks PATH after its internal applet table, which only
-        # matches when the symlink/binary literally exists).
-        # Without this, ``bash -c "ls"`` from inside our wrapped
-        # busybox would say "ls: not found" because Android has
-        # no /bin/ls.
+        # Mobile profile: Android has no ``/bin`` and no ``/usr/bin``,
+        # but ``/system/bin`` + ``/system/xbin`` carry the stock
+        # toybox-backed coreutils (``ls``, ``cat``, ``grep``,
+        # ``find``, ``sed``, ``awk``, ``date``, ``head``, ``tail``,
+        # …) plus the mksh shell and a few platform tools (``am``,
+        # ``pm``, ``logcat``).  Prepend both so ``sh -c "ls -la"``
+        # and the like resolve without needing a bundled busybox.
+        # The bundled sandbox bin dir is added LAST as a fallback
+        # for any applet toybox lacks (or for non-Android mobile-
+        # profile sideloads).
         if is_mobile_profile():
+            android_path_parts = []
+            for system_path in ("/system/bin", "/system/xbin"):
+                if Path(system_path).is_dir():
+                    android_path_parts.append(system_path)
             bin_dir = sandbox_bin_dir()
             if bin_dir is not None:
-                env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}".rstrip(
-                    os.pathsep
+                android_path_parts.append(str(bin_dir))
+            if android_path_parts:
+                existing = env.get("PATH", "")
+                env["PATH"] = os.pathsep.join(android_path_parts) + (
+                    os.pathsep + existing if existing else ""
                 )
 
         # Set working directory: context (agent-aware) > tool config > process cwd
@@ -366,36 +465,76 @@ class ShellTool(BaseTool):
                 else:
                     popen_kwargs["start_new_session"] = True
 
-                process = await asyncio.create_subprocess_exec(
-                    *full_command,
-                    **popen_kwargs,
-                )
-
-                if output_handle is not None:
-                    output_handle.close()
-                    output_handle = None
-
-                try:
-                    await asyncio.wait_for(
-                        process.wait(), timeout=_wait_timeout(timeout)
+                # Mobile / bundled-busybox path: asyncio's
+                # ``create_subprocess_exec`` uses the first arg as
+                # BOTH the executable path AND argv[0] — no way to
+                # split them.  busybox's multicall dispatch needs
+                # argv[0] to be the applet name (``busybox`` or
+                # ``sh``) but the on-disk file is named
+                # ``libbusybox.so`` (the only filename Android's
+                # PackageManager copies into the W^X-exempt
+                # ``nativeLibraryDir``).  Fall back to a synchronous
+                # ``subprocess.Popen`` with ``executable=`` set, run
+                # on a thread so we don't block the event loop.
+                if _is_bundled_busybox(resolved_exe):
+                    exit_code = await asyncio.to_thread(
+                        _run_busybox_blocking,
+                        argv=full_command,
+                        executable=resolved_exe,
+                        kwargs=popen_kwargs,
+                        timeout=_wait_timeout(timeout),
                     )
-                except asyncio.TimeoutError:
-                    await terminate_process_tree(process)
+                    if output_handle is not None:
+                        output_handle.close()
+                        output_handle = None
+                    if exit_code == _BUSYBOX_TIMEOUT_SENTINEL:
+                        output = _read_output_file(output_path)
+                        return ToolResult(
+                            output=output,
+                            error=(
+                                f"Command timed out after "
+                                f"{_format_timeout(timeout)}"
+                            ),
+                            exit_code=-1,
+                            metadata=_shell_metadata(
+                                output_path, shell_type, resolved_exe, env, timeout
+                            ),
+                        )
                     output = _read_output_file(output_path)
-                    return ToolResult(
-                        output=output,
-                        error=f"Command timed out after {_format_timeout(timeout)}",
-                        exit_code=-1,
-                        metadata=_shell_metadata(
-                            output_path, shell_type, resolved_exe, env, timeout
-                        ),
+                else:
+                    process = await asyncio.create_subprocess_exec(
+                        *full_command,
+                        **popen_kwargs,
                     )
-                except asyncio.CancelledError:
-                    await terminate_process_tree(process)
-                    raise
 
-                output = _read_output_file(output_path)
-                exit_code = process.returncode or 0
+                    if output_handle is not None:
+                        output_handle.close()
+                        output_handle = None
+
+                    try:
+                        await asyncio.wait_for(
+                            process.wait(), timeout=_wait_timeout(timeout)
+                        )
+                    except asyncio.TimeoutError:
+                        await terminate_process_tree(process)
+                        output = _read_output_file(output_path)
+                        return ToolResult(
+                            output=output,
+                            error=(
+                                f"Command timed out after "
+                                f"{_format_timeout(timeout)}"
+                            ),
+                            exit_code=-1,
+                            metadata=_shell_metadata(
+                                output_path, shell_type, resolved_exe, env, timeout
+                            ),
+                        )
+                    except asyncio.CancelledError:
+                        await terminate_process_tree(process)
+                        raise
+
+                    output = _read_output_file(output_path)
+                    exit_code = process.returncode or 0
 
             logger.debug(
                 "Command completed",
@@ -444,116 +583,3 @@ class ShellTool(BaseTool):
 
 # Backward-compatible alias
 BashTool = ShellTool
-
-
-@register_builtin("python")
-class PythonTool(BaseTool):
-    """Tool for executing Python code in a subprocess."""
-
-    needs_context = True
-
-    @property
-    def tool_name(self) -> str:
-        return "python"
-
-    @property
-    def description(self) -> str:
-        return "Execute Python code and return output"
-
-    @property
-    def execution_mode(self) -> ExecutionMode:
-        return ExecutionMode.DIRECT
-
-    def get_parameters_schema(self) -> dict:
-        return {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Python code to execute"},
-                "timeout": {
-                    "type": "number",
-                    "description": "Maximum execution time in seconds (0 = no timeout).",
-                },
-            },
-            "required": ["code"],
-        }
-
-    async def _execute(self, args: dict[str, Any], **kwargs: Any) -> ToolResult:
-        """Execute Python code."""
-        context = kwargs.get("context")
-        code = args.get("code", "")
-        if not code:
-            return ToolResult(error="No code provided")
-        timeout, timeout_error = _resolve_timeout_arg(args, self.config.timeout)
-        if timeout_error is not None:
-            return ToolResult(error=timeout_error)
-
-        logger.debug("Executing Python code", code_length=len(code))
-
-        python_cmd = [sys.executable, "-c", code]
-        if context and getattr(context, "working_dir", None):
-            cwd = str(context.working_dir)
-        else:
-            cwd = self.config.working_dir or os.getcwd()
-
-        try:
-            runner = _subprocess_runner(context)
-            if runner is not None and hasattr(runner, "run_subprocess_exec"):
-                result = await runner.run_subprocess_exec(
-                    python_cmd,
-                    cwd=cwd,
-                    timeout=_wait_timeout(timeout),
-                    max_output_bytes=self.config.max_output or None,
-                )
-                output = (result.get("stdout", b"") + result.get("stderr", b"")).decode(
-                    "utf-8", errors="replace"
-                )
-                exit_code = int(result.get("returncode") or 0)
-                if result.get("timed_out"):
-                    return ToolResult(
-                        error=(
-                            "Python execution timed out after "
-                            f"{_format_timeout(timeout)}"
-                        ),
-                        exit_code=-1,
-                        metadata={"timeout": timeout},
-                    )
-            else:
-                process = await asyncio.create_subprocess_exec(
-                    *python_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=cwd,
-                )
-
-                try:
-                    stdout, _ = await asyncio.wait_for(
-                        process.communicate(),
-                        timeout=_wait_timeout(timeout),
-                    )
-                except asyncio.TimeoutError:
-                    process.kill()
-                    await process.wait()
-                    return ToolResult(
-                        error=(
-                            "Python execution timed out after "
-                            f"{_format_timeout(timeout)}"
-                        ),
-                        exit_code=-1,
-                        metadata={"timeout": timeout},
-                    )
-
-                output = stdout.decode("utf-8", errors="replace") if stdout else ""
-                exit_code = process.returncode or 0
-
-            return ToolResult(
-                output=output,
-                exit_code=exit_code,
-                error=(
-                    None if exit_code == 0 else f"Python exited with code {exit_code}"
-                ),
-                metadata={"timeout": timeout},
-            )
-
-        except Exception as e:
-            logger.error("Python execution failed", error=str(e))
-            return ToolResult(error=str(e))

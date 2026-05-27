@@ -532,13 +532,14 @@ class TestPatchAndroidRequirements:
             " ; platform_machine == 'x86_64'"
         ) in text
 
-    def test_rewrites_primp_with_abi3_tag(self, tmp_path, postcreate, monkeypatch):
-        # primp ships as ABI3 — the URL filename must use an abi3
-        # tag, NOT ``cp313-cp313``.  v1.3.0's source-tree Cargo
-        # pins ``pyo3/abi3-py310`` so our cross-built wheel emits
-        # ``cp310-abi3`` (PyPI's manylinux releases use cp38-abi3,
-        # but that's a different Cargo features set on a separate
-        # CI path).  Verified against the v2026.05.24 release.
+    def test_drops_primp_and_ddgs_on_android(self, tmp_path, postcreate, monkeypatch):
+        # primp's Rust runtime hard-crashes the Android process on
+        # first call (tokio/rustls SIGSEGV that no Python exception
+        # can catch) even after the abi3 dlopen fix.  Both ``primp``
+        # and ``ddgs`` (which hard-requires primp per its PyPI
+        # metadata) are stripped from the Android requirements;
+        # ``web_search.py`` falls through to a pure-httpx DDG-HTML
+        # scrape that needs no native code.
         gen = _build_fake_generated(tmp_path)
         fake_repo = tmp_path / "fake_repo"
         fake_repo.mkdir()
@@ -550,16 +551,16 @@ class TestPatchAndroidRequirements:
         monkeypatch.setattr(postcreate, "REPO_ROOT", fake_repo)
         postcreate.patch_android_requirements(gen)
         text = (gen / "requirements.txt").read_text(encoding="utf-8")
-        assert "primp>=1.2.3" not in text
-        assert "primp-1.3.0-cp310-abi3-android_24_arm64_v8a.whl" in text
-        assert "primp-1.3.0-cp310-abi3-android_24_x86_64.whl" in text
-        # No mismatched python/abi tags should appear on primp lines.
-        primp_lines = [line for line in text.splitlines() if "primp-1.3.0" in line]
-        for line in primp_lines:
-            assert "cp313-cp313" not in line
-            assert "cp38-abi3" not in line
-        # ddgs shell preserved (pure-Python).
-        assert "ddgs>=9.0.0" in text
+        # Both are stripped entirely.
+        assert "primp" not in text
+        assert "ddgs" not in text
+        # And no abi3 / cp313 wheel URL refs for either survive (the
+        # earlier dev tried to URL-ref primp's cp313 wheel; we no
+        # longer ship that path).
+        assert "primp-1.3.0" not in text
+        # kohakuvault URL-ref still emitted (sanity check the rest of
+        # the rewriter still runs).
+        assert "kohakuvault-0.8.5" in text
 
     def test_new_url_refs_all_idempotent(self, tmp_path, postcreate, monkeypatch):
         # All four URL-ref packages together — re-run produces

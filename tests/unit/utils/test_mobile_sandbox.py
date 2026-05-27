@@ -117,20 +117,125 @@ class TestSandboxBinary:
         assert mobile_sandbox.sandbox_binary("sh") is None
 
 
+class TestDefaultWorkdir:
+    def test_off_mobile_returns_cwd(self, monkeypatch, tmp_path):
+        # Without ``KT_PROFILE=mobile`` we keep the historical
+        # ``Path.cwd()`` behaviour — desktop operators launched
+        # ``kt run`` from a directory and expect that directory to
+        # be the agent's workspace.
+        monkeypatch.chdir(tmp_path)
+        assert mobile_sandbox.default_workdir() == Path(tmp_path).resolve()
+
+    def test_mobile_returns_config_work_subdir(self, monkeypatch, tmp_path):
+        # On mobile, ``cwd`` is ``/`` (Briefcase boots Python there)
+        # and unwritable.  The helper redirects to
+        # ``<KT_CONFIG_DIR>/work/`` which Java guarantees is writable.
+        monkeypatch.setenv("KT_PROFILE", "mobile")
+        monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path))
+        out = mobile_sandbox.default_workdir()
+        assert out == tmp_path / "work"
+        # And the helper creates it so callers can write immediately.
+        assert out.is_dir()
+
+    def test_mobile_creates_workdir_lazily(self, monkeypatch, tmp_path):
+        # The dir doesn't exist before the first call.
+        monkeypatch.setenv("KT_PROFILE", "mobile")
+        monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path))
+        target = tmp_path / "work"
+        assert not target.exists()
+        mobile_sandbox.default_workdir()
+        assert target.is_dir()
+
+    def test_mobile_without_config_dir_falls_back(self, monkeypatch, tmp_path):
+        # Defensive: mobile profile is set but Java forgot to populate
+        # ``KT_CONFIG_DIR``.  Falls back to ``Path.cwd()`` rather than
+        # raising — the executor's downstream consumer at least sees
+        # a Path object.
+        monkeypatch.setenv("KT_PROFILE", "mobile")
+        monkeypatch.chdir(tmp_path)
+        assert mobile_sandbox.default_workdir() == Path(tmp_path).resolve()
+
+    def test_mobile_mkdir_failure_falls_back(self, monkeypatch, tmp_path):
+        # If ``<config>/work`` can't be created (e.g. permission
+        # flap), the helper logs + falls back to cwd so the caller
+        # never gets a path it can't use.
+        monkeypatch.setenv("KT_PROFILE", "mobile")
+        monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path))
+
+        original_mkdir = Path.mkdir
+
+        def _boom(self, *args, **kwargs):
+            if self == tmp_path / "work":
+                raise OSError("mkdir refused")
+            return original_mkdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "mkdir", _boom)
+        monkeypatch.chdir(tmp_path)
+        out = mobile_sandbox.default_workdir()
+        # Fell back to cwd.
+        assert out == Path(tmp_path).resolve()
+
+
 class TestBundledShCommand:
     def test_returns_argv_when_busybox_present(self, monkeypatch, tmp_path):
         monkeypatch.setenv("KT_SANDBOX_BIN_DIR", str(tmp_path))
         (tmp_path / "busybox").write_bytes(b"#!fake\n")
         argv = mobile_sandbox.bundled_sh_command("echo hi")
         assert argv is not None
-        # Shape: ``[<bin>/busybox, "sh", "-c", "echo hi"]``
-        assert len(argv) == 4
-        assert argv[0].endswith("busybox")
-        assert argv[1:] == ["sh", "-c", "echo hi"]
+        # New shape: argv[0] is the LITERAL string "busybox" — not a
+        # path.  The caller passes the actual executable path via
+        # ``subprocess.Popen(executable=…)`` from
+        # :func:`bundled_sh_exe`.  This split is required on Android
+        # where the on-disk file is ``libbusybox.so`` but busybox's
+        # multicall dispatcher needs ``argv[0]="busybox"`` to find
+        # its own applet table.
+        assert argv == ["busybox", "sh", "-c", "echo hi"]
 
     def test_returns_none_without_busybox(self, monkeypatch, tmp_path):
         monkeypatch.setenv("KT_SANDBOX_BIN_DIR", str(tmp_path))
         assert mobile_sandbox.bundled_sh_command("echo hi") is None
+
+
+class TestBundledShExe:
+    def test_returns_path_when_busybox_present(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("KT_SANDBOX_BIN_DIR", str(tmp_path))
+        (tmp_path / "busybox").write_bytes(b"#!fake\n")
+        exe = mobile_sandbox.bundled_sh_exe()
+        assert exe == tmp_path / "busybox"
+
+    def test_prefers_libbusybox_so_when_both_present(self, monkeypatch, tmp_path):
+        # Native-library layout (Android) wins over the legacy
+        # ``busybox`` name when both are populated — the
+        # ``libbusybox.so`` form is the only one that survives
+        # Android's W^X policy because PackageManager extracts it
+        # into the execute-allowed nativeLibraryDir.
+        monkeypatch.setenv("KT_SANDBOX_BIN_DIR", str(tmp_path))
+        (tmp_path / "libbusybox.so").write_bytes(b"#!fake-native-lib\n")
+        (tmp_path / "busybox").write_bytes(b"#!fake-legacy\n")
+        assert mobile_sandbox.bundled_sh_exe() == tmp_path / "libbusybox.so"
+
+    def test_falls_back_to_legacy_busybox(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("KT_SANDBOX_BIN_DIR", str(tmp_path))
+        (tmp_path / "busybox").write_bytes(b"#!fake\n")
+        assert mobile_sandbox.bundled_sh_exe() == tmp_path / "busybox"
+
+    def test_returns_none_when_neither_present(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("KT_SANDBOX_BIN_DIR", str(tmp_path))
+        assert mobile_sandbox.bundled_sh_exe() is None
+
+
+class TestSandboxBinaryNativeLibLayout:
+    def test_resolves_libbusybox_so_for_every_applet(self, monkeypatch, tmp_path):
+        # Pin that every shell-applet short name finds the bundled
+        # ``libbusybox.so`` — busybox dispatches via argv[0] at
+        # runtime so the same multicall file backs every name.
+        monkeypatch.setenv("KT_SANDBOX_BIN_DIR", str(tmp_path))
+        (tmp_path / "libbusybox.so").write_bytes(b"#!fake-native-lib\n")
+        for name in ("sh", "bash", "grep", "find", "sed", "awk", "curl"):
+            resolved = mobile_sandbox.sandbox_binary(name)
+            assert resolved == tmp_path / "libbusybox.so", (
+                f"{name!r} should resolve to bundled libbusybox.so; " f"got {resolved}"
+            )
 
 
 class TestEnsureExtracted:
