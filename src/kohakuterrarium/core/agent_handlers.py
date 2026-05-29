@@ -4,6 +4,7 @@ import asyncio
 import importlib
 from typing import Any
 
+from kohakuterrarium.core.agent_mid_turn import AgentMidTurnMixin
 from kohakuterrarium.core.agent_pre_dispatch import (
     run_pre_subagent_dispatch,
     run_pre_tool_dispatch,
@@ -92,7 +93,7 @@ def _coalesce_user_contents(contents: list[Any]) -> Any:
     return parts
 
 
-class AgentHandlersMixin(AgentToolsMixin):
+class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin):
     """Mixin providing event handling and tool execution for the Agent class.
 
     Contains the core event processing loop, tool startup, result collection,
