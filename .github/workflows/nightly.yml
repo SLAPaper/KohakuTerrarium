@@ -19,7 +19,9 @@ jobs:
     outputs:
       version: ${{ steps.compute.outputs.version }}
       build_id: ${{ steps.compute.outputs.build_id }}
-      tag: ${{ steps.compute.outputs.tag }}
+      sha: ${{ steps.compute.outputs.sha }}
+      release_tag: ${{ steps.compute.outputs.release_tag }}
+      date_tag: ${{ steps.compute.outputs.date_tag }}
       date: ${{ steps.compute.outputs.date }}
     steps:
       - uses: actions/checkout@v4
@@ -37,17 +39,41 @@ jobs:
           {
             echo "version=${version}"
             echo "build_id=${ts}-${sha}"
-            echo "tag=nightly-${date}"
+            echo "sha=${sha}"
+            echo "release_tag=nightly-${sha}"
+            echo "date_tag=nightly-${date}"
             echo "date=${date}"
           } >> "$GITHUB_OUTPUT"
           echo "nightly version=${version}"
+
+  dedupe:
+    needs: [version]
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Skip duplicate commit builds
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          release_tag="${{ needs.version.outputs.release_tag }}"
+          if gh release view "${release_tag}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Nightly already exists for commit tag ${release_tag}; skipping."
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "No nightly release for ${release_tag}; continuing."
+          fi
 
   # Per-platform release-tree tarballs the launcher consumes.
   # Briefcase ships cp313 on Win/macOS, so cp313 is the only abi any
   # user-facing path actually downloads. Linux x64 cp313 is kept for
   # advanced users running the launcher on their own Linux Python.
   build-release-tree:
-    needs: [version]
+    needs: [version, dedupe]
+    if: needs.dedupe.outputs.should_build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -116,7 +142,8 @@ jobs:
   # wheel is universal (pure Python ≥3.10) so one cell covers all
   # pip users.
   build-wheel:
-    needs: [version]
+    needs: [version, dedupe]
+    if: needs.dedupe.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,7 +184,8 @@ jobs:
   # changes AND so a fresh user can install the nightly directly
   # (no "install stable then switch channels" detour).
   build-desktop:
-    needs: [version, build-release-tree]
+    needs: [version, dedupe, build-release-tree]
+    if: needs.dedupe.outputs.should_build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -246,7 +274,8 @@ jobs:
           path: artifacts/
 
   publish:
-    needs: [version, build-release-tree, build-wheel, build-desktop]
+    needs: [version, dedupe, build-release-tree, build-wheel, build-desktop]
+    if: needs.dedupe.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -284,23 +313,28 @@ jobs:
           echo "--- release-assets/ ---"
           ls -la release-assets/
 
-      - name: Create dated nightly release
+      - name: Create nightly release and date tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
-          tag="${{ needs.version.outputs.tag }}"
+          release_tag="${{ needs.version.outputs.release_tag }}"
+          date_tag="${{ needs.version.outputs.date_tag }}"
           date="${{ needs.version.outputs.date }}"
-          if ! gh release view "${tag}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release create "${tag}" \
+          if ! gh release view "${release_tag}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${release_tag}" \
               --title "Nightly ${date}" \
               --notes "Automatic nightly build. Channel: nightly. Version: ${{ needs.version.outputs.version }}." \
               --prerelease \
               -R "${GITHUB_REPOSITORY}"
           fi
           for f in release-assets/*; do
-            [ -f "$f" ] && gh release upload "${tag}" "$f" --clobber -R "${GITHUB_REPOSITORY}"
+            [ -f "$f" ] && gh release upload "${release_tag}" "$f" --clobber -R "${GITHUB_REPOSITORY}"
           done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "${date_tag}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${date_tag}" --force
 
       - name: Fetch previous nightly manifest
         shell: bash
@@ -311,7 +345,7 @@ jobs:
       - name: Build channel manifest
         shell: bash
         run: |
-          tag="${{ needs.version.outputs.tag }}"
+          tag="${{ needs.version.outputs.release_tag }}"
           python scripts/publish_manifest.py \
             --channel nightly \
             --release-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}" \
