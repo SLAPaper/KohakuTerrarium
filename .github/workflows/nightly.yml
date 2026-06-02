@@ -77,7 +77,7 @@ jobs:
           python scripts/nightly_gate.py \
             --manifest previous-nightly.json \
             --commit-sha "${{ needs.version.outputs.commit_sha }}" \
-            --force-rebuild "${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild || false }}" \
+            --force-rebuild "${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild == true || false }}" \
             --github-output "$GITHUB_OUTPUT"
 
   skipped:

@@ -65,11 +65,19 @@ def _commit_sha_matches(value: str, commit: str, short: str) -> bool:
     candidate = value.strip().lower()
     if not candidate:
         return False
-    return candidate == commit or candidate == short or commit.startswith(candidate)
+    return (
+        candidate == commit
+        or candidate == short
+        or (len(candidate) >= 7 and commit.startswith(candidate))
+    )
 
 
 def _find_matching_release(manifest: dict, commit_sha: str) -> tuple[str, dict] | None:
     commit = commit_sha.lower()
+    try:
+        _ = int(commit, 16)
+    except ValueError:
+        return None
     short = commit[:7]
     releases = manifest.get("releases") or []
     if not isinstance(releases, list):
