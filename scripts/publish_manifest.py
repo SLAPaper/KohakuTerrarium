@@ -82,8 +82,9 @@ def _group_into_release(sidecars: list[dict], prefix: str, notes: str | None) ->
         raise SystemExit(f"sidecars span multiple versions: {versions}")
     version = next(iter(versions))
     build_ids = {s.get("build_id") for s in sidecars}
-    build_id = sorted(b for b in build_ids if b)[-1] if build_ids else ""
-    commit_shas = {s.get("commit_sha") for s in sidecars if s.get("commit_sha")}
+    valid_build_ids = sorted(b for b in build_ids if b)
+    build_id = valid_build_ids[-1] if valid_build_ids else ""
+    commit_shas = sorted({s.get("commit_sha") for s in sidecars if s.get("commit_sha")})
     if len(commit_shas) > 1:
         raise SystemExit(f"sidecars span multiple commit SHAs: {commit_shas}")
     artifacts: list[dict] = []
