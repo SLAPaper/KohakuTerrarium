@@ -312,6 +312,34 @@ jobs:
       - name: Create briefcase project
         run: briefcase create
 
+      - name: Pre-download RCEdit for Windows build
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $cacheDir = python -c "from platformdirs import PlatformDirs; print(PlatformDirs(appname='briefcase', appauthor='BeeWare').user_cache_path)"
+          $toolsDir = Join-Path $cacheDir "tools"
+          New-Item -ItemType Directory -Force -Path $toolsDir | Out-Null
+          $outFile = Join-Path $toolsDir "rcedit-x64.exe"
+
+          if (Test-Path -LiteralPath $outFile) {
+            Write-Host "rcedit already present at: $outFile"
+            exit 0
+          }
+
+          $uri = "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe"
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Write-Host "Downloading rcedit (attempt $i/3) to: $outFile"
+              Invoke-WebRequest -Uri $uri -OutFile $outFile -TimeoutSec 120
+              Write-Host "Downloaded: $((Get-Item $outFile).Length) bytes"
+              break
+            } catch {
+              Remove-Item -LiteralPath $outFile -ErrorAction SilentlyContinue
+              if ($i -eq 3) { throw }
+              Start-Sleep -Seconds (5 * $i)
+            }
+          }
+
       - name: Build briefcase app
         run: briefcase build
 
