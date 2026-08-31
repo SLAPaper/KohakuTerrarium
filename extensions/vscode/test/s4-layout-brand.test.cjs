@@ -28,7 +28,7 @@ test('flat layout reserves transcript scrolling for chat and keeps only composer
   assert.match(css, /\.chat-region\s*\{[^}]*flex:\s*1[^}]*min-height:\s*0[^}]*overflow:\s*hidden/s)
   assert.match(css, /\.composer-region\s*\{[^}]*border-top:/s)
   assert.match(css, /\.session-list\s*\{[^}]*overflow-y:\s*auto/s)
-  assert.match(css, /\.composer-shell\s*\{[^}]*border-radius:/s)
+  assert.match(css, /\.kt-conversation-host \.kt-chat-composer__shell\s*\{[^}]*border-color:/s)
   assert.doesNotMatch(css, /\.(?:session-region|session-row)\s*\{[^}]*(?:border-radius|box-shadow):/s)
   assert.match(css, /@media \(max-width:/)
   assert.match(css, /vscode-contrastBorder/)

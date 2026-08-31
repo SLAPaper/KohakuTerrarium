@@ -53,6 +53,30 @@ test('Dashboard and VS Code consume one host-neutral transcript section', () => 
   assert.doesNotMatch(webview, /`\$\{error\.value\} \$\{chat\.wsStatus\}`/)
 })
 
+test('VS Code uses the exact public shared composer without a private input or separate turn stop', () => {
+  const webview = read(path.join(root, 'src', 'webview', 'index.js'))
+
+  assert.match(
+    webview,
+    /import\s*\{[^}]*\bChatComposer\b[^}]*\}\s*from ['"]@kohakuterrarium\/chat-ui['"]/s,
+  )
+  assert.match(webview, /h\(ChatComposer,\s*\{/)
+  assert.doesNotMatch(webview, /h\(['"]input['"],\s*\{[^}]*aria-label:\s*['"]Message['"]/s)
+  assert.doesNotMatch(webview, /Stop Turn|stop-turn/)
+  assert.match(webview, /processing:\s*!!chat\.processingByTab\[tab\.value\]/)
+  assert.match(webview, /onInterrupt:\s*\(\)\s*=>\s*chat\.interrupt\(tab\.value\)/)
+  assert.match(webview, /showContextActions:\s*false/)
+})
+
+test('VS Code composer remains text-only at boundary 8', () => {
+  const webview = read(path.join(root, 'src', 'webview', 'index.js'))
+
+  assert.match(webview, /managedSubmit:\s*true/)
+  assert.match(webview, /showAttachmentActions:\s*false/)
+  assert.doesNotMatch(webview, /\bbuildMessageParts\b|onUpdate:attachments/)
+  assert.match(webview, /scroll\.forceFollow\(\)[\s\S]*chat\.send\(content\)[\s\S]*draft\.value = ''/)
+})
+
 test('VS Code binds transcript viewport callbacks to the rendered conversation identity', () => {
   const webview = read(path.join(root, 'src', 'webview', 'index.js'))
 

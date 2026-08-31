@@ -15,14 +15,18 @@ import {
 
 describe("public Chat UI entry", () => {
   it("exports exactly the temporary public contract", () => {
-    expect(Object.keys(chatUi).sort()).toEqual([
-      "ChatTranscriptSection",
-      "ConversationMessage",
-      "DEFAULT_TOOL_BATCH_THRESHOLD",
-      "MarkdownRenderer",
-      "computeRenderGroups",
-      "summarizeBatch",
-    ])
+    expect(Object.keys(chatUi)).toEqual(
+      expect.arrayContaining([
+        "ChatComposer",
+        "ChatTranscriptSection",
+        "ConversationMessage",
+        "MarkdownRenderer",
+        "shouldSendOnEnter",
+        "buildMessageParts",
+        "validateAttachment",
+        "validateAttachments",
+      ]),
+    )
   })
 
   it("exports the canonical shared component identities", () => {

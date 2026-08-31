@@ -8,7 +8,7 @@
 * { box-sizing: border-box; }
 html, body, #app { width: 100%; height: 100%; min-width: 0; overflow: hidden; }
 body { margin: 0; }
-button, input { font: inherit; }
+button, input, textarea { font: inherit; }
 h1, p { margin: 0; }
 
 .kt-conversation-host {
@@ -50,7 +50,7 @@ h1 { overflow: hidden; font-size: 14px; line-height: 1.2; text-overflow: ellipsi
 .session-disclosure[aria-expanded='true'] .action-icon--chevron { transform: rotate(180deg); }
 .session-summary, .row-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-actions { display: flex; flex: none; }
-.session-actions button, .stop-turn, .stop-session, .composer-shell button { display: inline-flex; align-items: center; justify-content: center; color: var(--vscode-foreground); background: transparent; border: 0; padding: 5px; }
+.session-actions button, .stop-session { display: inline-flex; align-items: center; justify-content: center; color: var(--vscode-foreground); background: transparent; border: 0; padding: 5px; }
 .action-icon { width: 16px; height: 16px; flex: none; fill: currentColor; transition: transform 120ms ease; }
 .session-list { max-height: min(38vh, 280px); overflow-x: hidden; overflow-y: auto; border-top: 1px solid var(--vscode-panel-border); }
 .session-group { min-width: 0; }
@@ -69,12 +69,16 @@ button.session-row:hover { background: var(--vscode-list-hoverBackground); }
 .kt-conversation-host .kt-transcript-viewport { overflow-x: hidden; padding-inline: .5rem; }
 .kt-conversation-host .kt-conversation-message--assistant { width: 100%; max-width: none; }
 .composer-region { flex: none; min-width: 0; border-top: 1px solid var(--vscode-panel-border); padding: 8px; }
-.composer-shell { display: flex; min-width: 0; overflow: hidden; background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 8px; }
-.composer-shell input { min-width: 0; flex: 1; color: var(--vscode-input-foreground); background: transparent; border: 0; outline: 0; padding: 8px; }
 .composer-placeholder { color: var(--vscode-descriptionForeground); font-size: 12px; padding: 4px; }
-.stop-turn { gap: 5px; color: var(--vscode-errorForeground); margin-bottom: 4px; }
+.kt-conversation-host .kt-chat-composer { color: var(--vscode-input-foreground); }
+.kt-conversation-host .kt-chat-composer__shell { background: var(--vscode-input-background); border-color: var(--vscode-input-border, var(--vscode-panel-border)); }
+.kt-conversation-host .kt-chat-composer__shell.is-active { border-color: var(--vscode-focusBorder); }
+.kt-conversation-host .kt-chat-composer__shell textarea { color: var(--vscode-input-foreground); background: transparent; border: 0; outline: 0; }
+.kt-conversation-host .kt-chat-composer__shell textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
+.kt-conversation-host .kt-chat-composer__chip { color: var(--vscode-badge-foreground); background: var(--vscode-badge-background); border-color: var(--vscode-panel-border); }
+.kt-conversation-host .kt-chat-composer__primary { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border-radius: 4px; }
 
-button:focus-visible, input:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -2px; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: -2px; }
 button:disabled { opacity: .55; }
 .kt-conversation-host .md-content a { color: var(--vscode-textLink-foreground); }
 .kt-conversation-host .md-content code:not(.katex-fallback) { background: var(--vscode-textPreformat-background); }

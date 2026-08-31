@@ -1,4 +1,5 @@
 import {
+  ChatComposer,
   ChatTranscriptSection,
   ConversationMessage,
   MarkdownRenderer,
@@ -268,9 +269,9 @@ const App = {
       }
     }
 
-    function send() {
-      const content = draft.value.trim()
-      if (!content || !currentSession.value) return
+    function send({ text = draft.value } = {}) {
+      const content = text.trim()
+      if (!content || !currentSession.value?.target) return
       scroll.forceFollow()
       chat.send(content)
       draft.value = ''
@@ -464,14 +465,27 @@ const App = {
           }),
         ]),
         h('section', { class: 'composer-region', 'aria-label': 'Message composer' }, [
-          currentSession.value && chat.processingByTab[tab.value]
-            ? actionButton('Stop Turn', 'stop', { class: 'stop-turn', onClick: () => chat.interrupt(tab.value), text: 'Stop Turn' })
-            : null,
           currentSession.value?.target
-            ? h('form', { class: 'composer-shell', onSubmit: (event) => { event.preventDefault(); send() } }, [
-                h('input', { value: draft.value, 'aria-label': 'Message', placeholder: 'Send to selected Creature', onInput: (event) => (draft.value = event.target.value) }),
-                h('button', { type: 'submit', title: 'Send', 'aria-label': 'Send' }, [icon('send')]),
-              ])
+            ? h(ChatComposer, {
+                modelValue: draft.value,
+                processing: !!chat.processingByTab[tab.value],
+                disabled: !currentSession.value?.target,
+                managedSubmit: true,
+                showContextActions: false,
+                showAttachmentActions: false,
+                placeholder: 'Send to selected Creature',
+                labels: {
+                  attachFile: 'Attach file',
+                  attachImage: 'Attach image',
+                  message: 'Message',
+                  removeAttachment: 'Remove {name}',
+                  send: 'Send',
+                  stop: 'Stop generation',
+                },
+                'onUpdate:modelValue': (value) => (draft.value = value),
+                onSubmit: send,
+                onInterrupt: () => chat.interrupt(tab.value),
+              })
             : h('p', { class: 'composer-placeholder' }, 'Select a Session to start chatting'),
         ]),
       ])

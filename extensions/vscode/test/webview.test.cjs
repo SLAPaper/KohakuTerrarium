@@ -14,7 +14,7 @@ test('webview build uses the shared transcript boundary without later UI depende
   assert.match(source, /ChatTranscriptSection|ConversationMessage|useChatStore/)
   assert.match(source, /from ['"]@kohakuterrarium\/chat-ui['"]/)
   assert.match(source, /MarkdownRenderer/)
-  assert.doesNotMatch(source, /Composer/)
+  assert.match(source, /ChatComposer/)
 })
 
 test('BridgeWebSocket forwards opaque frames without parsing them', () => {
@@ -30,8 +30,9 @@ test('webview renderer preserves Session lifecycle controls around the shared tr
 
   assert.match(source, /ChatTranscriptSection/)
   assert.match(source, /const chat = useChatStore\(\)/)
-  for (const label of ['New Session', 'Sessions', 'Stop Session', 'Stop Turn']) assert.match(source, new RegExp(label))
+  for (const label of ['New Session', 'Sessions', 'Stop Session', 'Stop generation']) assert.match(source, new RegExp(label))
+  assert.doesNotMatch(source, /Stop Turn/)
   for (const stale of ['New Task', 'Open Tasks', 'Detach', 'task.']) {
-    assert.doesNotMatch(source, new RegExp(stale.replace('.', '\\.')))
+    assert.doesNotMatch(source, new RegExp(stale.replace('.', '\.')))
   }
 })
