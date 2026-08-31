@@ -45,6 +45,13 @@ test('captured send retains WebSocket signature and resolves only its correlated
   await captured.confirmation
 })
 
+test('capturing a send fails when the chat store emits no socket frame', () => {
+  assert.throws(
+    () => BridgeWebSocket.captureSend(() => undefined, { requireConfirmation: true }),
+    /did not reach the Host/,
+  )
+})
+
 test('correlated failure, close, timeout, and disposal reject pending confirmation', async () => {
   BridgeWebSocket.post = () => {}
   const socket = new BridgeWebSocket('ws://bridge')

@@ -50,14 +50,18 @@ export class BridgeWebSocket {
     this.pendingSends.clear()
   }
 
-  static captureSend(callback) {
+  static captureSend(callback, { requireConfirmation = false } = {}) {
     const previous = this.capture
     const confirmations = []
     this.capture = confirmations
     try {
       const value = callback()
       if (confirmations.length > 1) throw Error('Chat submit generated multiple WebSocket frames')
-      return { value, confirmation: confirmations[0] || null }
+      const confirmation = confirmations[0] || null
+      if (requireConfirmation && confirmation == null) {
+        throw Error('Chat message did not reach the Host. Press Refresh Sessions and try again.')
+      }
+      return { value, confirmation }
     } finally {
       this.capture = previous
     }

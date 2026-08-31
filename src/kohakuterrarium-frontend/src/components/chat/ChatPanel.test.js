@@ -1,6 +1,6 @@
 import { flushPromises, mount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
-import { ElMessageBox } from "element-plus"
+import { ElMessage, ElMessageBox } from "element-plus"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import ChatPanel from "./ChatPanel.vue"
@@ -21,6 +21,103 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+})
+
+describe("ChatPanel transcript attachment drops", () => {
+  function mountPanel({ groupId = null } = {}) {
+    const chat = useChatStore("graph_drop")
+    chat._instanceId = "graph_drop"
+    chat._instanceGraphId = "graph_drop"
+    chat.activeTab = "kohaku"
+    chat.tabs = ["kohaku"]
+    chat.messagesByTab = { kohaku: [] }
+    if (groupId) {
+      chat.groups = { [groupId]: { id: groupId, tabs: ["kohaku"], activeTab: "kohaku" } }
+      chat.focusedGroupId = groupId
+    }
+    return mount(ChatPanel, {
+      props: {
+        instance: {
+          id: "graph_drop",
+          graph_id: "graph_drop",
+          creatures: [{ name: "kohaku", status: "idle" }],
+        },
+        groupId,
+      },
+      global: {
+        provide: { chatStore: chat },
+        stubs: { ChatMessage: true, ModelSwitcher: true, SiteChip: true, StatusDot: true },
+      },
+    })
+  }
+
+  function dragEvent(files, types = ["Files"]) {
+    return { dataTransfer: { files, types }, preventDefault: vi.fn(), stopPropagation: vi.fn() }
+  }
+
+  it.each([
+    ["standalone", null],
+    ["grouped", "group_1"],
+  ])("attaches a file dropped on the %s transcript once", async (_label, groupId) => {
+    const wrapper = mountPanel({ groupId })
+    const bubble = wrapper.findComponent({ name: "ChatTranscriptSection" }).element.parentElement
+    const dropped = new File(["notes"], "notes.txt", { type: "text/plain" })
+    const drop = dragEvent([dropped])
+
+    bubble.dispatchEvent(
+      Object.assign(new Event("drop", { bubbles: true, cancelable: true }), drop),
+    )
+    await flushPromises()
+
+    expect(drop.preventDefault).toHaveBeenCalledOnce()
+    expect(drop.stopPropagation).toHaveBeenCalledOnce()
+    expect(wrapper.findAll(".kt-chat-composer__chip")).toHaveLength(1)
+    expect(wrapper.text()).toContain("notes.txt")
+  })
+
+  it("preserves attachment validation for transcript drops", async () => {
+    const wrapper = mountPanel()
+    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
+    const bubble = wrapper.findComponent({ name: "ChatTranscriptSection" }).element.parentElement
+    const dropped = { name: "huge.bin", type: "application/octet-stream", size: 100 * 1024 * 1024 }
+
+    bubble.dispatchEvent(
+      Object.assign(new Event("drop", { bubbles: true, cancelable: true }), dragEvent([dropped])),
+    )
+    await flushPromises()
+
+    expect(wrapper.findAll(".kt-chat-composer__chip")).toHaveLength(0)
+    expect(error).toHaveBeenCalledOnce()
+  })
+
+  it("does not double-add a file dropped directly on the composer", async () => {
+    const wrapper = mountPanel()
+    const dropped = new File(["notes"], "notes.txt", { type: "text/plain" })
+
+    await wrapper.findComponent({ name: "ChatComposer" }).trigger("drop", {
+      dataTransfer: { files: [dropped], types: ["Files"] },
+    })
+    await flushPromises()
+
+    expect(wrapper.findAll(".kt-chat-composer__chip")).toHaveLength(1)
+  })
+
+  it("preserves grouped tab drops", async () => {
+    const wrapper = mountPanel({ groupId: "group_1" })
+    const bubble = wrapper.findComponent({ name: "ChatTranscriptSection" }).element.parentElement
+    const drop = dragEvent([], ["application/x-kt-tab"])
+    const onBubbleDrop = vi.spyOn(wrapper.vm.tabDrag, "onBubbleDrop")
+
+    bubble.dispatchEvent(
+      Object.assign(new Event("drop", { bubbles: true, cancelable: true }), drop),
+    )
+    await flushPromises()
+
+    expect(onBubbleDrop).toHaveBeenCalledOnce()
+    expect(drop.preventDefault).toHaveBeenCalled()
+    expect(drop.stopPropagation).toHaveBeenCalledOnce()
+    expect(wrapper.findAll(".kt-chat-composer__chip")).toHaveLength(0)
+  })
 })
 
 describe("ChatPanel scroll scheduling", () => {

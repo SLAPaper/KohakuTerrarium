@@ -101,11 +101,13 @@ test('VS Code composer uses managed attachment conversion and preserves state un
   assert.match(webview, /managedSubmit:\s*true/)
   assert.match(webview, /attachments:\s*attachments\.value/)
   assert.match(webview, /onUpdate:attachments/)
-  assert.match(webview, /BridgeWebSocket\.captureSend\(\(\) => chat\.send\(content\)\)/)
+  assert.match(webview, /BridgeWebSocket\.captureSend\(\(\) => chat\.send\(content\), \{ requireConfirmation: true \}\)/)
   assert.match(webview, /const outcome = await sent\.value/)
   assert.match(webview, /if \(sent\.confirmation != null\) await sent\.confirmation/)
   assert.doesNotMatch(webview, /outcome\.(?:accepted|queued)/)
   assert.match(webview, /if \(conversationOwnership\.isCurrent\(submittedOwner\)\)[\s\S]*scroll\.forceFollow\(\)/)
+  assert.match(webview, /disabled:[\s\S]*chat\.wsStatus !== ['"]open['"]/)
+  assert.match(webview, /function submitReply[\s\S]*chat\.wsStatus !== ['"]open['"][\s\S]*error\.value/)
 })
 
 test('VS Code binds transcript viewport callbacks to the rendered conversation identity', () => {

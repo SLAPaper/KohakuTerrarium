@@ -26,7 +26,7 @@ export function createSessionShell({ api, chat }) {
       creatureId: selected.id,
     })
     chat.unbindFromInstance()
-    chat.initForInstance(instance, { initialTab: selected.name })
+    chat.initForInstance(instance, { initialTab: selected.name, autoReconnect: false })
     return {
       session,
       instance,
@@ -53,7 +53,7 @@ export function createSessionShell({ api, chat }) {
       }
       const instance = chatInstance(session)
       chat.unbindFromInstance()
-      chat.initForInstance(instance, { initialTab: creature.name })
+      chat.initForInstance(instance, { initialTab: creature.name, autoReconnect: false })
       return {
         session,
         instance,

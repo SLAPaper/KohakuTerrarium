@@ -38,6 +38,63 @@ describe("chat store — websocket ownership", () => {
     return sockets
   }
 
+  it("can disable reconnects for an explicit-refresh host", () => {
+    vi.useFakeTimers()
+    const values = new Map()
+    vi.stubGlobal("localStorage", {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, String(value)),
+      removeItem: (key) => values.delete(key),
+    })
+    try {
+      const sockets = installFakeWebSocket()
+      const chat = useChatStore()
+      chat.initForInstance(
+        {
+          id: "explicit-refresh",
+          graph_id: "explicit-refresh",
+          session_id: "explicit-refresh",
+          type: "creature",
+          creatures: [{ name: "kohaku" }],
+          channels: [],
+        },
+        { autoReconnect: false },
+      )
+      sockets[0].onclose()
+      vi.runAllTimers()
+
+      expect(sockets).toHaveLength(1)
+      expect(chat._reconnectTimer).toBeNull()
+      expect(chat.wsStatus).toBe("closed")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps reconnecting by default for Dashboard hosts", () => {
+    vi.useFakeTimers()
+    try {
+      const sockets = installFakeWebSocket()
+      const chat = useChatStore()
+      const reconnect = vi.fn()
+
+      chat._openWs({
+        generation: chat._instanceGeneration,
+        url: "ws://dashboard",
+        onOpen: vi.fn(),
+        reconnect,
+      })
+      sockets[0].onclose()
+      vi.advanceTimersByTime(500)
+
+      expect(reconnect).toHaveBeenCalledOnce()
+      expect(chat._reconnectTimer).toBeNull()
+      expect(chat.wsStatus).toBe("reconnecting")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("stores the socket raw, closes the previous owner, and rejects all stale callbacks", () => {
     const sockets = installFakeWebSocket()
     const chat = useChatStore()
@@ -939,6 +996,19 @@ describe("chat store — slash commands", () => {
     getHistory.mockRestore()
   })
 
+  it("does not append normal text when the websocket is unavailable", async () => {
+    const chat = useChatStore()
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "kohaku"
+    chat.messagesByTab = { kohaku: [] }
+    chat._ws = { readyState: WebSocket.CLOSED, send: vi.fn() }
+
+    await expect(chat.send([{ type: "text", text: "hello" }])).rejects.toThrow(/not connected/i)
+
+    expect(chat._ws.send).not.toHaveBeenCalled()
+    expect(chat.messagesByTab.kohaku).toEqual([])
+  })
+
   it("continues sending normal text over the websocket", async () => {
     const chat = useChatStore()
     chat._instanceGraphId = "graph_1"
@@ -1087,12 +1157,38 @@ describe("chat store — queued message edit/cancel (UXI-08a)", () => {
 })
 
 describe("chat store — UI reply routing (UXI-09)", () => {
+  it("submitUIReply leaves the prompt unresolved when the socket is unavailable", () => {
+    const chat = useChatStore()
+    const prompt = { role: "ui_event", eventId: "e1", replied: false }
+    chat.messagesByTab = { worker: [prompt] }
+    chat._ws = { readyState: WebSocket.CLOSED, send: vi.fn() }
+
+    expect(chat.submitUIReply("worker", "e1", "submit", { text: "hi" })).toBe(false)
+    expect(prompt).toEqual({ role: "ui_event", eventId: "e1", replied: false })
+    expect(chat._ws.send).not.toHaveBeenCalled()
+  })
+
+  it("submitUIReply restores the prompt when the socket closes during send", () => {
+    const chat = useChatStore()
+    const prompt = { role: "ui_event", eventId: "e1", replied: false }
+    chat.messagesByTab = { worker: [prompt] }
+    chat._ws = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn(() => {
+        throw Error("closed")
+      }),
+    }
+
+    expect(chat.submitUIReply("worker", "e1", "submit", { text: "hi" })).toBe(false)
+    expect(prompt).toEqual({ role: "ui_event", eventId: "e1", replied: false })
+  })
+
   it("submitUIReply routes to the prompt's creature via target", () => {
     const chat = useChatStore()
     chat.messagesByTab = { worker: [{ role: "ui_event", eventId: "e1", replied: false }] }
     const wsSend = vi.fn()
     chat._ws = { readyState: WebSocket.OPEN, send: wsSend }
-    chat.submitUIReply("worker", "e1", "submit", { text: "hi" })
+    expect(chat.submitUIReply("worker", "e1", "submit", { text: "hi" })).toBe(true)
     expect(JSON.parse(wsSend.mock.calls[0][0])).toMatchObject({
       type: "ui_reply",
       target: "worker",

@@ -25,7 +25,7 @@ test('session shell selects by stable Creature id and unbinds only after Host su
   }
   const chat = {
     unbindFromInstance: () => calls.push('unbind'),
-    initForInstance: (_instance, options) => calls.push(['init', options.initialTab]),
+    initForInstance: (_instance, options) => calls.push(['init', options.initialTab, options.autoReconnect]),
   }
   const api = {
     select: async (selection) => {
@@ -40,7 +40,7 @@ test('session shell selects by stable Creature id and unbinds only after Host su
   assert.deepEqual(calls, [
     ['select', { session: 'graph-one', creatureId: 'creature-b' }],
     'unbind',
-    ['init', 'same-name'],
+    ['init', 'same-name', false],
   ])
   assert.equal(attached.targetCreatureId, 'creature-b')
 })
@@ -129,7 +129,7 @@ test('restore consumes a Host-reconciled stable selection without selecting agai
     api: { select: async () => { throw Error('must not select again') } },
     chat: {
       unbindFromInstance: () => calls.push('unbind'),
-      initForInstance: (_instance, options) => calls.push(['init', options.initialTab]),
+      initForInstance: (_instance, options) => calls.push(['init', options.initialTab, options.autoReconnect]),
     },
   })
 
@@ -139,7 +139,7 @@ test('restore consumes a Host-reconciled stable selection without selecting agai
     targetCreatureId: 'creature-b',
   })
 
-  assert.deepEqual(calls, ['unbind', ['init', 'renamed']])
+  assert.deepEqual(calls, ['unbind', ['init', 'renamed', false]])
   assert.equal(restored.targetCreatureId, 'creature-b')
 })
 

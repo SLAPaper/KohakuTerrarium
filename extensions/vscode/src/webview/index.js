@@ -348,7 +348,7 @@ const App = {
             ? await buildMessageParts(submittedText, submitted)
             : submittedText
           assertCurrent()
-          const sent = BridgeWebSocket.captureSend(() => chat.send(content))
+          const sent = BridgeWebSocket.captureSend(() => chat.send(content), { requireConfirmation: true })
           const outcome = await sent.value
           if (sent.confirmation != null) await sent.confirmation
           return outcome
@@ -406,6 +406,10 @@ const App = {
     }
 
     function submitReply(message, actionId, values) {
+      if (chat.wsStatus !== 'open') {
+        error.value = 'Chat is disconnected. Press Refresh Sessions and try again.'
+        return
+      }
       chat.submitUIReply(tab.value, message.eventId, actionId, values)
     }
 
@@ -603,6 +607,7 @@ const App = {
                 processing: !!chat.processingByTab[tab.value],
                 disabled:
                   !currentSession.value?.target ||
+                  chat.wsStatus !== 'open' ||
                   isComposerSubmitDisabled(submitBusy.value, !!chat.processingByTab[tab.value]),
                 contextActionsDisabled:
                   busy.value ||

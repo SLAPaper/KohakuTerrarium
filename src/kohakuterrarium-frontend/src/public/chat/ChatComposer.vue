@@ -216,5 +216,5 @@ watch(
   () => props.modelValue,
   () => nextTick(resize),
 )
-defineExpose({ textarea, focus, resize, resetHeight, openFile, openImage })
+defineExpose({ textarea, focus, resize, resetHeight, openFile, openImage, addFiles })
 </script>

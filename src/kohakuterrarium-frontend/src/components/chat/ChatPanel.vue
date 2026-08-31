@@ -48,7 +48,7 @@
       <div class="flex-1 border-b border-b-warm-200 dark:border-b-warm-700" />
     </div>
 
-    <div ref="bubbleEl" class="flex-1 mx-4 mb-4 bg-white dark:bg-warm-900 rounded-b-xl rounded-tr-xl border border-warm-200 dark:border-warm-700 border-t-0 overflow-hidden flex flex-col shadow-sm relative" :class="{ 'ring-2 ring-iolite/40 ring-inset': dragOver }" @dragover.prevent="onBubbleDragOver" @drop="onBubbleDrop">
+    <div ref="bubbleEl" class="flex-1 mx-4 mb-4 bg-white dark:bg-warm-900 rounded-b-xl rounded-tr-xl border border-warm-200 dark:border-warm-700 border-t-0 overflow-hidden flex flex-col shadow-sm relative" :class="{ 'ring-2 ring-iolite/40 ring-inset': dragOver }" @dragenter="onBubbleDragEnter" @dragleave="onBubbleDragLeave" @dragover="onBubbleDragOver" @drop="onBubbleDrop">
       <template v-if="props.groupId && tabDragHoverEdge">
         <div v-if="tabDragHoverEdge === 'left'" class="absolute inset-y-0 left-0 w-1/4 bg-iolite/15 dark:bg-iolite-light/12 border-r-2 border-iolite/50 pointer-events-none z-20" />
         <div v-if="tabDragHoverEdge === 'right'" class="absolute inset-y-0 right-0 w-1/4 bg-iolite/15 dark:bg-iolite-light/12 border-l-2 border-iolite/50 pointer-events-none z-20" />
@@ -157,6 +157,7 @@ const bubbleEl = ref(null)
 const attachments = ref([])
 const queueExpanded = ref(false)
 const dragOver = ref(false)
+let fileDragDepth = 0
 
 const viewGroup = computed(() => (props.groupId ? chat.groups?.[props.groupId] || null : null))
 const viewTabs = computed(() => (viewGroup.value ? viewGroup.value.tabs : chat.tabs))
@@ -226,8 +227,25 @@ function onTabStripDrop(ev, dstIndex) {
   if (!props.groupId) return
   tabDrag.onTabStripDrop(ev, props.groupId, dstIndex)
 }
+function hasDraggedFiles(ev) {
+  return Array.from(ev.dataTransfer?.types || []).includes("Files")
+}
+function onBubbleDragEnter(ev) {
+  if (props.readOnly || !hasDraggedFiles(ev)) return
+  ev.preventDefault()
+  fileDragDepth += 1
+  dragOver.value = true
+}
+function onBubbleDragLeave(ev) {
+  if (hasDraggedFiles(ev)) {
+    fileDragDepth = Math.max(0, fileDragDepth - 1)
+    if (!fileDragDepth) dragOver.value = false
+  }
+  if (props.groupId) tabDrag.onBubbleDragLeave(ev, props.groupId)
+}
 function onBubbleDragOver(ev) {
-  if (props.groupId) tabDrag.onBubbleDragOver(ev, props.groupId)
+  if (!props.readOnly && hasDraggedFiles(ev)) ev.preventDefault()
+  else if (props.groupId) tabDrag.onBubbleDragOver(ev, props.groupId)
 }
 
 const activeQueue = computed(() => {
@@ -584,6 +602,14 @@ watch(inputText, () => {
 })
 
 function onBubbleDrop(e) {
+  fileDragDepth = 0
+  dragOver.value = false
+  if (!props.readOnly && hasDraggedFiles(e)) {
+    e.preventDefault()
+    e.stopPropagation()
+    composerEl.value?.addFiles(e.dataTransfer?.files || [], undefined, "drop")
+    return
+  }
   if (!props.groupId || !Array.from(e.dataTransfer?.types || []).includes("application/x-kt-tab")) return
   e.preventDefault()
   e.stopPropagation()
