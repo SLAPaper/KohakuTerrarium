@@ -1,11 +1,84 @@
 import { createPinia, setActivePinia } from "pinia"
 import { computed, isReactive, toRaw } from "vue"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { _parseSlashCommand, _replayEvents, useChatStore } from "./chat.js"
 
 beforeEach(() => {
   setActivePinia(createPinia())
+})
+
+describe("chat store — websocket ownership", () => {
+  const OriginalWebSocket = globalThis.WebSocket
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    if (OriginalWebSocket === undefined) delete globalThis.WebSocket
+    else globalThis.WebSocket = OriginalWebSocket
+  })
+
+  function installFakeWebSocket() {
+    const sockets = []
+    class FakeWebSocket {
+      static CONNECTING = 0
+      static OPEN = 1
+      static CLOSING = 2
+      static CLOSED = 3
+
+      constructor(url) {
+        this.url = url
+        this.readyState = FakeWebSocket.CONNECTING
+        this.close = vi.fn(() => {
+          this.readyState = FakeWebSocket.CLOSED
+        })
+        sockets.push(this)
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+    return sockets
+  }
+
+  it("stores the socket raw, closes the previous owner, and rejects all stale callbacks", () => {
+    const sockets = installFakeWebSocket()
+    const chat = useChatStore()
+    const firstOpen = vi.fn()
+    const firstReconnect = vi.fn()
+    const onMessage = vi.spyOn(chat, "_onMessage")
+    const failOperation = vi.spyOn(chat, "_failBranchOperation")
+
+    chat._historyLoaded = true
+    chat.branchOperationByTab = { kohaku: { type: "regenerate" } }
+    chat._openWs({
+      generation: chat._instanceGeneration,
+      url: "ws://first",
+      onOpen: firstOpen,
+      reconnect: firstReconnect,
+    })
+    const first = sockets[0]
+    expect(chat._ws).toBe(first)
+    expect(isReactive(chat._ws)).toBe(false)
+
+    chat._openWs({
+      generation: chat._instanceGeneration,
+      url: "ws://second",
+      onOpen: vi.fn(),
+      reconnect: vi.fn(),
+    })
+    const second = sockets[1]
+    expect(first.close).toHaveBeenCalledOnce()
+
+    first.onopen()
+    first.onmessage({ data: JSON.stringify({ type: "attention_required" }) })
+    first.onerror(new Event("error"))
+    first.onclose()
+
+    expect(firstOpen).not.toHaveBeenCalled()
+    expect(onMessage).not.toHaveBeenCalled()
+    expect(failOperation).not.toHaveBeenCalled()
+    expect(firstReconnect).not.toHaveBeenCalled()
+    expect(chat._reconnectTimer).toBeNull()
+    expect(chat._ws).toBe(second)
+  })
 })
 
 describe("chat store — slash commands", () => {
@@ -2426,6 +2499,37 @@ describe("chat store — multimodal edit + branch resync", () => {
 
     rebuildSpy.mockRestore()
     getHistory.mockRestore()
+  })
+})
+
+describe("chat store — public instance lifecycle", () => {
+  it("unbinds transport and timers and remains reusable", () => {
+    const chat = useChatStore()
+    const close = vi.fn()
+    const stop = vi.fn()
+    const beforeGeneration = chat._instanceGeneration
+
+    chat._instanceId = "runtime-1"
+    chat.tabs = ["alpha"]
+    chat.activeTab = "alpha"
+    chat._reconnectTimer = setTimeout(() => {}, 60_000)
+    chat._ws = { close, onopen: vi.fn(), onmessage: vi.fn(), onclose: vi.fn(), onerror: vi.fn() }
+    chat._jobTimer = { stop }
+
+    chat.unbindFromInstance()
+
+    expect(close).toHaveBeenCalledOnce()
+    expect(stop).toHaveBeenCalledOnce()
+    expect(chat._reconnectTimer).toBeNull()
+    expect(chat._ws).toBeNull()
+    expect(chat.wsStatus).toBe("closed")
+    expect(chat._instanceGeneration).toBeGreaterThan(beforeGeneration)
+    expect(chat._instanceId).toBeNull()
+    expect(chat.tabs).toEqual([])
+
+    chat.unbindFromInstance()
+    expect(close).toHaveBeenCalledOnce()
+    expect(stop).toHaveBeenCalledOnce()
   })
 })
 

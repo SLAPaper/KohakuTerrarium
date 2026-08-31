@@ -1,0 +1,86 @@
+:root {
+  color-scheme: light dark;
+  font-family: var(--vscode-font-family);
+  color: var(--vscode-foreground);
+  background: var(--vscode-sideBar-background);
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+h1,
+h2,
+p,
+pre {
+  margin: 0;
+}
+
+h1 {
+  font-size: 18px;
+}
+
+h2 {
+  font-size: 14px;
+}
+
+button,
+input,
+select {
+  box-sizing: border-box;
+  width: 100%;
+  margin-top: 4px;
+  padding: 6px;
+}
+
+button {
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  border: 1px solid var(--vscode-button-border, transparent);
+}
+
+input,
+select {
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+}
+
+.sessionrail,
+.selection,
+.message {
+  border-bottom: 1px solid var(--vscode-panel-border);
+  padding-bottom: 8px;
+}
+
+.session {
+  padding-top: 6px;
+}
+
+.message pre,
+.tool pre {
+  margin-top: 6px;
+  white-space: pre-wrap;
+}
+
+.tool {
+  border-left: 3px solid var(--vscode-charts-yellow);
+  margin-top: 6px;
+  padding-left: 6px;
+}
+
+.status {
+  min-height: 1em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.interactive,
+.composer {
+  margin-top: 6px;
+}

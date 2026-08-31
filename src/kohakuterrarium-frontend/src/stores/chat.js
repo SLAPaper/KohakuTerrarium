@@ -2561,8 +2561,10 @@ const _chatStoreOptions = {
         this._reconnectTimer = null
       }
 
-      const ws = new WebSocket(url)
+      const previousWs = this._ws
+      const ws = markRaw(new WebSocket(url))
       this._ws = ws
+      if (previousWs && previousWs !== ws) previousWs.close()
       this.wsStatus = "reconnecting"
 
       ws.onopen = () => {
@@ -2610,6 +2612,7 @@ const _chatStoreOptions = {
         }, delay)
       }
       ws.onerror = () => {
+        if (generation !== this._instanceGeneration || ws !== this._ws) return
         // onclose fires after this; reconnect is scheduled there.
         for (const tab of Object.keys(this.branchOperationByTab)) {
           this._failBranchOperation(tab, "Connection lost before the operation completed.")
@@ -5147,22 +5150,14 @@ const _chatStoreOptions = {
     },
 
     /**
-     * Wipe the chat store back to a neutral, disconnected state.
+     * Unbind the store from its current live or saved instance.
      *
-     * Used when leaving a surface that borrowed the chat store (most
-     * importantly the SessionHistoryViewer, which writes saved-session
-     * data into ``messagesByTab``/``tabs``/``_instanceId``). Without
-     * this, navigating from the session viewer back to a running
-     * ``/instances/<id>`` page renders the previous session's content
-     * for the brief window between mount and the async
-     * ``initForInstance`` call — and ``_saveTabs``/``_restoreTabs``
-     * keys can hit the wrong instance bucket because ``_instanceId``
-     * still points at ``session:<name>``.
-     *
-     * Does NOT open a websocket; pair it with ``initForInstance`` if
-     * you want to attach to a new live instance afterwards.
+     * Closes transport and timers, invalidates in-flight callbacks, and
+     * returns all instance-scoped view state to a neutral baseline. Does
+     * not open a websocket; pair it with ``initForInstance`` to bind a
+     * new live instance afterwards.
      */
-    resetForRouteSwitch() {
+    unbindFromInstance() {
       this._cleanup()
       this._instanceGeneration++
       this._instanceId = null
@@ -5212,6 +5207,11 @@ const _chatStoreOptions = {
       this._rootSourceName = null
       const statusStore = useStatusStore(scopeOfStoreId(this.$id))
       statusStore.reset()
+    },
+
+    /** Clear instance state when leaving a route-owned chat surface. */
+    resetForRouteSwitch() {
+      this.unbindFromInstance()
     },
 
     _cleanup() {

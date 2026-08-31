@@ -1,0 +1,81 @@
+{
+  "name": "kohakuterrarium-vscode",
+  "displayName": "KohakuTerrarium",
+  "description": "Build and operate KohakuTerrarium agents from VS Code.",
+  "version": "0.0.1",
+  "publisher": "kohaku-lab",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kohaku-Lab/KohakuTerrarium"
+  },
+  "type": "commonjs",
+  "main": "./dist/extension.cjs",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onView:kohakuterrarium.chat",
+    "onCommand:kohakuterrarium.configure",
+    "onCommand:kohakuterrarium.useAutomaticDiscovery"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "kohakuterrarium.configure",
+        "title": "KohakuTerrarium: Configure Local Connection Override"
+      },
+      {
+        "command": "kohakuterrarium.useAutomaticDiscovery",
+        "title": "KohakuTerrarium: Use Automatic Local Discovery"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kohakuterrarium",
+          "title": "KohakuTerrarium",
+          "icon": "media/kohakuterrarium.svg"
+        }
+      ]
+    },
+    "views": {
+      "kohakuterrarium": [
+        {
+          "type": "webview",
+          "id": "kohakuterrarium.chat",
+          "name": "KohakuTerrarium"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "KohakuTerrarium",
+      "properties": {
+        "kohakuterrarium.defaultCreature": {
+          "type": "string",
+          "default": "@kt-biome/creatures/swe",
+          "description": "Trusted Creature config reference used when creating a new session."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "build": "node scripts/build.cjs",
+    "package": "npm run build && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.6.2",
+    "esbuild": "^0.25.10",
+    "vite": "^7.1.7",
+    "ws": "^8.18.3"
+  }
+}
