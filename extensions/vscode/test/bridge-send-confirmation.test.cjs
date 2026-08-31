@@ -6,7 +6,10 @@ const test = require('node:test')
 let BridgeWebSocket
 
 test.before(async () => {
-  const source = fs.readFileSync(path.resolve(__dirname, '../src/webview/bridge.js'), 'utf8')
+  const source = fs.readFileSync(
+    path.resolve(__dirname, '../src/webview/bridge.js'),
+    'utf8',
+  )
   const moduleUrl = `data:text/javascript;base64,${Buffer.from(
     `const markRaw = value => value;${source}`,
   ).toString('base64')}`
@@ -32,22 +35,65 @@ test('captured send retains WebSocket signature and resolves only its correlated
   const captured = BridgeWebSocket.captureSend(() => first.send('one'))
   const other = BridgeWebSocket.captureSend(() => second.send('two'))
   assert.equal(captured.value, undefined)
+  assert.equal(captured.frame, 'one')
+  assert.equal(other.frame, 'two')
   assert.equal(posts.at(-2).sendId !== posts.at(-1).sendId, true)
 
-  BridgeWebSocket.receive({ type: 'ws.send.result', id: second.id, sendId: posts.at(-1).sendId })
+  BridgeWebSocket.receive({
+    type: 'ws.send.result',
+    id: second.id,
+    sendId: posts.at(-1).sendId,
+  })
   await other.confirmation
   let settled = false
   captured.confirmation.finally(() => (settled = true))
   await Promise.resolve()
   assert.equal(settled, false)
 
-  BridgeWebSocket.receive({ type: 'ws.send.result', id: first.id, sendId: posts.at(-2).sendId })
+  BridgeWebSocket.receive({
+    type: 'ws.send.result',
+    id: first.id,
+    sendId: posts.at(-2).sendId,
+  })
   await captured.confirmation
+})
+
+test('capturing a send returns the callback error without losing a posted frame', () => {
+  BridgeWebSocket.post = () => {}
+  const socket = new BridgeWebSocket('ws://bridge')
+  BridgeWebSocket.receive({ type: 'ws.opened', id: socket.id })
+
+  const captured = BridgeWebSocket.captureSend(() => {
+    socket.send('posted')
+    throw Error('store failed after send')
+  })
+
+  assert.equal(captured.frame, 'posted')
+  assert.match(captured.error.message, /store failed/)
+})
+
+test('multiple captured frames reject and clear every confirmation immediately', async () => {
+  BridgeWebSocket.post = () => {}
+  const socket = new BridgeWebSocket('ws://bridge')
+  BridgeWebSocket.receive({ type: 'ws.opened', id: socket.id })
+
+  assert.throws(
+    () =>
+      BridgeWebSocket.captureSend(() => {
+        socket.send('one')
+        socket.send('two')
+      }),
+    /multiple WebSocket frames/,
+  )
+  assert.equal(socket.pendingSends.size, 0)
 })
 
 test('capturing a send fails when the chat store emits no socket frame', () => {
   assert.throws(
-    () => BridgeWebSocket.captureSend(() => undefined, { requireConfirmation: true }),
+    () =>
+      BridgeWebSocket.captureSend(() => undefined, {
+        requireConfirmation: true,
+      }),
     /did not reach the Host/,
   )
 })
@@ -58,7 +104,12 @@ test('correlated failure, close, timeout, and disposal reject pending confirmati
   BridgeWebSocket.receive({ type: 'ws.opened', id: socket.id })
   const failed = BridgeWebSocket.captureSend(() => socket.send('failed'))
   const failedSendId = BridgeWebSocket.nextSendId - 1
-  BridgeWebSocket.receive({ type: 'ws.send.error', id: socket.id, sendId: failedSendId, error: 'not open' })
+  BridgeWebSocket.receive({
+    type: 'ws.send.error',
+    id: socket.id,
+    sendId: failedSendId,
+    error: 'not open',
+  })
   await assert.rejects(failed.confirmation, /not open/)
 
   const closed = BridgeWebSocket.captureSend(() => socket.send('closed'))
@@ -72,8 +123,14 @@ test('correlated failure, close, timeout, and disposal reject pending confirmati
   await assert.rejects(timed.confirmation, /timed out/i)
 
   BridgeWebSocket.confirmationTimeout = 1000
-  const disposed = BridgeWebSocket.captureSend(() => timeoutSocket.send('disposed'))
+  const disposed = BridgeWebSocket.captureSend(() =>
+    timeoutSocket.send('disposed'),
+  )
   BridgeWebSocket.disposeAll(Error('disposed'))
   await assert.rejects(disposed.confirmation, /disposed/)
-  BridgeWebSocket.receive({ type: 'ws.send.result', id: timeoutSocket.id, sendId: BridgeWebSocket.nextSendId - 1 })
+  BridgeWebSocket.receive({
+    type: 'ws.send.result',
+    id: timeoutSocket.id,
+    sendId: BridgeWebSocket.nextSendId - 1,
+  })
 })

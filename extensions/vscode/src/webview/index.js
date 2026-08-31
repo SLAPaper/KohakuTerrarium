@@ -13,6 +13,7 @@ import { useChatStore } from '@/stores/chat'
 import { BridgeWebSocket } from './bridge.js'
 import { renderCarbonIcon } from './carbonIcons.mjs'
 import { applyContextCommandOutcome } from './contextCommandResult.mjs'
+import { createHostAcceptedChat, createObservedWebSocket } from './hostAcceptedChat.mjs'
 import {
   createConversationMessageOrchestrator,
   createConversationScrollController,
@@ -57,11 +58,12 @@ function request(type, data = {}, onSend = () => {}) {
 }
 
 BridgeWebSocket.post = (message) => vscode.postMessage(message)
-globalThis.WebSocket = BridgeWebSocket
 
 const App = {
   setup() {
     const chat = useChatStore()
+    const hostAcceptedChat = createHostAcceptedChat({ BridgeWebSocket, chat })
+    globalThis.WebSocket = createObservedWebSocket(BridgeWebSocket, hostAcceptedChat.observe)
     const available = ref(false)
     const automatic = ref(true)
     const sessions = ref([])
@@ -349,10 +351,7 @@ const App = {
             ? await buildMessageParts(submittedText, submitted)
             : submittedText
           assertCurrent()
-          const sent = BridgeWebSocket.captureSend(() => chat.send(content), { requireConfirmation: true })
-          const outcome = await sent.value
-          if (sent.confirmation != null) await sent.confirmation
-          return outcome
+          return hostAcceptedChat.send(content)
         })
         if (draftBuckets.get(submittedOwner) === submittedText) {
           draftBuckets.clear(submittedOwner)
@@ -411,7 +410,9 @@ const App = {
         error.value = 'Chat is disconnected. Press Refresh Sessions and try again.'
         return
       }
-      chat.submitUIReply(tab.value, message.eventId, actionId, values)
+      hostAcceptedChat
+        .submitUIReply(tab.value, message.eventId, actionId, values)
+        .catch((cause) => (error.value = cause?.message || String(cause)))
     }
 
     const { actionButton, icon, renderSession, renderSharedText, renderTranscriptMessage } =
@@ -556,6 +557,8 @@ const App = {
                   !available.value ||
                   !!chat.processingByTab[tab.value],
                 managedSubmit: true,
+                maxAttachmentBytes: 10 * 1024 * 1024,
+                maxImageBytes: 5 * 1024 * 1024,
                 attachmentTransform,
                 showContextActions: true,
                 placeholder: 'Send to selected Creature',

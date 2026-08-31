@@ -20,7 +20,8 @@ export class BridgeWebSocket {
   }
 
   send(data) {
-    if (this.readyState !== BridgeWebSocket.OPEN) throw Error('WebSocket not open')
+    if (this.readyState !== BridgeWebSocket.OPEN)
+      throw Error('WebSocket not open')
     const sendId = BridgeWebSocket.nextSendId++
     const confirmation = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -31,7 +32,11 @@ export class BridgeWebSocket {
     })
     // Standard WebSocket callers do not observe Host confirmations.
     confirmation.catch(() => {})
-    BridgeWebSocket.capture?.push(confirmation)
+    BridgeWebSocket.capture?.push({
+      confirmation,
+      frame: data,
+      cancel: (error) => BridgeWebSocket.cancelSend(this, sendId, error),
+    })
     BridgeWebSocket.post({ type: 'ws.send', id: this.id, sendId, data })
   }
 
@@ -52,19 +57,49 @@ export class BridgeWebSocket {
 
   static captureSend(callback, { requireConfirmation = false } = {}) {
     const previous = this.capture
-    const confirmations = []
-    this.capture = confirmations
+    const sends = []
+    this.capture = sends
     try {
-      const value = callback()
-      if (confirmations.length > 1) throw Error('Chat submit generated multiple WebSocket frames')
-      const confirmation = confirmations[0] || null
-      if (requireConfirmation && confirmation == null) {
-        throw Error('Chat message did not reach the Host. Press Refresh Sessions and try again.')
+      let value
+      let error = null
+      try {
+        value = callback()
+      } catch (cause) {
+        error = cause
       }
-      return { value, confirmation }
+      if (sends.length > 1) {
+        const error = Error('Chat submit generated multiple WebSocket frames')
+        for (const send of sends) send.cancel(error)
+        throw error
+      }
+      const send = sends[0] || null
+      if (requireConfirmation && send == null) {
+        throw (
+          error ||
+          Error(
+            'Chat message did not reach the Host. Press Refresh Sessions and try again.',
+          )
+        )
+      }
+      if (error && send == null) throw error
+      return {
+        value,
+        error,
+        confirmation: send?.confirmation || null,
+        frame: send?.frame,
+        cancel: send?.cancel || (() => {}),
+      }
     } finally {
       this.capture = previous
     }
+  }
+
+  static cancelSend(socket, sendId, error) {
+    const pending = socket.pendingSends.get(sendId)
+    if (!pending) return
+    socket.pendingSends.delete(sendId)
+    clearTimeout(pending.timer)
+    pending.reject(error)
   }
 
   static settleSend(socket, message, error) {
@@ -94,7 +129,11 @@ export class BridgeWebSocket {
     } else if (message.type === 'ws.send.result') {
       this.settleSend(socket, message)
     } else if (message.type === 'ws.send.error') {
-      this.settleSend(socket, message, Error(message.error || 'Chat send was rejected'))
+      this.settleSend(
+        socket,
+        message,
+        Error(message.error || 'Chat send was rejected'),
+      )
     }
   }
 
