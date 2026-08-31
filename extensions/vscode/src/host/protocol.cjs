@@ -49,7 +49,7 @@ function allowedMessage(message) {
     case 'http.interrupt':
       return hasText(message.session) && hasText(message.creature)
     case 'ws.send':
-      return hasText(message.data)
+      return hasText(message.data) && Number.isSafeInteger(message.sendId) && message.sendId > 0
     case 'context.compact':
     case 'context.clear':
       return Object.keys(message).every((field) => field === 'type' || field === 'id')

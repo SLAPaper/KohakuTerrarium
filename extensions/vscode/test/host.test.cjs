@@ -19,7 +19,7 @@ test('protocol accepts the formal vertical-slice messages with strict fields', (
     { type: 'context.compact', id: 20 },
     { type: 'context.clear', id: 21 },
     { type: 'ws.open', id: 7 },
-    { type: 'ws.send', id: 7, data: '{"type":"input"}' },
+    { type: 'ws.send', id: 7, sendId: 1, data: '{"type":"input"}' },
     { type: 'ws.close', id: 7 },
   ]) assert.equal(allowedMessage(message), true, message.type)
 

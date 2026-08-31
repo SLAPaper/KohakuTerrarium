@@ -302,6 +302,12 @@ class RuntimeHost {
         if (!this.sockets.send(this.generation, message.id, message.data)) {
           throw Error('Chat socket is not open')
         }
+        this.post({
+          type: 'ws.send.result',
+          id: message.id,
+          sendId: message.sendId,
+          readyId: this.runtimeEpoch,
+        })
         return
       case 'ws.close':
         this.sockets.closeSocket(this.generation, message.id)

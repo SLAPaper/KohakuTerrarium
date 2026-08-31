@@ -206,8 +206,9 @@ function activate(context) {
         console.error(`KohakuTerrarium ${message.type} failed`, error)
         const safe = publicError(message.type)
         return webview.postMessage({
-          type: 'error',
+          type: message.type === 'ws.send' ? 'ws.send.error' : 'error',
           id: message.id,
+          ...(message.type === 'ws.send' ? { sendId: message.sendId } : {}),
           error: safe.message,
           code: safe.code,
         })

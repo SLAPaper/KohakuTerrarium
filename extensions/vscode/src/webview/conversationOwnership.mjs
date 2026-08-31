@@ -24,7 +24,7 @@ function ownershipKey(owned) {
   return JSON.stringify([owned.readyId, owned.runtimeId, owned.creatureId])
 }
 
-export function createConversationAttachments(current) {
+function createConversationBuckets(current, empty) {
   const buckets = new Map()
   const capture = () => ({ ...current() })
   const keyFor = (owned = capture()) => ownershipKey(owned)
@@ -32,7 +32,7 @@ export function createConversationAttachments(current) {
   return {
     capture,
     get(owned) {
-      return buckets.get(keyFor(owned)) || []
+      return buckets.get(keyFor(owned)) ?? empty
     },
     set(value, owned) {
       const key = keyFor(owned)
@@ -44,6 +44,31 @@ export function createConversationAttachments(current) {
   }
 }
 
+export function createConversationAttachments(current) {
+  const buckets = createConversationBuckets(current, [])
+  return {
+    ...buckets,
+    removeSubmitted(submitted, owned) {
+      const remaining = new Map()
+      for (const attachment of submitted) remaining.set(attachment, (remaining.get(attachment) || 0) + 1)
+      buckets.set(
+        buckets.get(owned).filter((attachment) => {
+          const count = remaining.get(attachment) || 0
+          if (!count) return true
+          if (count === 1) remaining.delete(attachment)
+          else remaining.set(attachment, count - 1)
+          return false
+        }),
+        owned,
+      )
+    },
+  }
+}
+
+export function createConversationDrafts(current) {
+  return createConversationBuckets(current, '')
+}
+
 export function createConversationOwnership(current) {
   const capture = () => ({ ...current() })
   const assertion = (owned) => () => {
@@ -51,6 +76,9 @@ export function createConversationOwnership(current) {
   }
 
   return {
+    isCurrent(owned) {
+      return sameOwnership(owned, current())
+    },
     transform(transformer) {
       return async (...args) => {
         const owned = capture()
@@ -68,6 +96,12 @@ export function createConversationOwnership(current) {
       const result = await operation(assertCurrent)
       assertCurrent()
       return result
+    },
+    async dispatch(operation) {
+      const owned = capture()
+      const assertCurrent = assertion(owned)
+      assertCurrent()
+      return operation(assertCurrent)
     },
   }
 }

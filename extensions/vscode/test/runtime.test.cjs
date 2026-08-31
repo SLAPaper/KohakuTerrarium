@@ -142,6 +142,33 @@ test('session.select preserves the old socket generation when persistence fails'
   assert.equal(sockets.beginCount, before)
 })
 
+test('ws.send emits a correlated result only after the socket owner accepts the frame', async () => {
+  const { host, posts, sockets } = harness()
+  const calls = []
+  sockets.send = (...args) => {
+    calls.push(args)
+    return true
+  }
+
+  await host.handle({ type: 'ws.send', id: 7, sendId: 42, data: 'frame' })
+
+  assert.deepEqual(calls, [[host.generation, 7, 'frame']])
+  assert.deepEqual(posts.at(-1), {
+    type: 'ws.send.result', id: 7, sendId: 42, readyId: 'ready-B',
+  })
+})
+
+test('ws.send rejection throws without emitting a success result', async () => {
+  const { host, posts, sockets } = harness()
+  sockets.send = () => false
+
+  await assert.rejects(
+    host.handle({ type: 'ws.send', id: 7, sendId: 43, data: 'frame' }),
+    /not open/,
+  )
+  assert.equal(posts.some((post) => post.type === 'ws.send.result'), false)
+})
+
 test('ws.open omits the token subprotocol for loopback-bypass mode', async () => {
   const { host, socketCalls, state } = harness()
   state.selection = {

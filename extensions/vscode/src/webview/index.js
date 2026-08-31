@@ -19,12 +19,14 @@ import {
 } from './conversationScroll.mjs'
 import {
   createConversationAttachments,
+  createConversationDrafts,
   createConversationOwnership,
   isConversationSuperseded,
 } from './conversationOwnership.mjs'
 import { createReadyCoordinator } from './readyCoordinator.mjs'
 import { createSelectionVersionOwner } from './selectionVersion.mjs'
 import { createSessionShell } from './sessionShell.js'
+import { createSubmitGate, isComposerSubmitDisabled } from './submitGate.mjs'
 import { applyTopologySelection } from './topologySelection.mjs'
 import './style.css'
 
@@ -63,12 +65,24 @@ const App = {
     const automatic = ref(true)
     const sessions = ref([])
     const currentSession = ref(null)
-    const draft = ref('')
-    const attachmentBuckets = createConversationAttachments(() => ({
+    const composerOwner = () => ({
       readyId: latestReadyRequestId,
       runtimeId: currentSession.value?.session?.runtimeId,
       creatureId: currentSession.value?.targetCreatureId,
-    }))
+    })
+    const draftBuckets = createConversationDrafts(composerOwner)
+    const draftRevision = ref(0)
+    const draft = computed({
+      get: () => {
+        draftRevision.value
+        return draftBuckets.get()
+      },
+      set: (value) => {
+        draftBuckets.set(value)
+        draftRevision.value += 1
+      },
+    })
+    const attachmentBuckets = createConversationAttachments(composerOwner)
     const attachmentRevision = ref(0)
     const attachments = computed({
       get: () => {
@@ -90,12 +104,20 @@ const App = {
     let contextOperation = 0
     const selectionVersions = createSelectionVersionOwner()
     let activeSelectionReadyId = null
-    const conversationOwnership = createConversationOwnership(() => ({
+    const currentConversationOwnership = () => ({
       readyId: latestReadyRequestId,
       runtimeId: currentSession.value?.session?.runtimeId,
       creatureId: currentSession.value?.targetCreatureId,
       name: currentSession.value?.target,
-    }))
+    })
+    const conversationOwnership = createConversationOwnership(currentConversationOwnership)
+    const submitGate = createSubmitGate()
+    const submitRevision = ref(0)
+    const submitBusy = computed(() => {
+      submitRevision.value
+      attachmentRevision.value
+      return submitGate.busy(currentConversationOwnership())
+    })
     const attachmentTransform = conversationOwnership.transform((file) => file)
     const selectionRequest = async (type, data) => {
       const result = await request(type, data)
@@ -124,7 +146,10 @@ const App = {
       const creature = currentSession.value?.targetCreatureId
       return session && creature ? `${session}:${creature}` : ''
     })
-    watch(scrollIdentity, () => (attachmentRevision.value += 1))
+    watch(scrollIdentity, () => {
+      attachmentRevision.value += 1
+      draftRevision.value += 1
+    })
     const scroll = createConversationScrollController({
       schedule: (callback) => nextTick(callback),
     })
@@ -222,6 +247,7 @@ const App = {
         request('ready', {}, (id) => {
           latestReadyRequestId = id
           attachmentRevision.value += 1
+          draftRevision.value += 1
         }),
       async applyReady(result, isCurrent) {
         if (result.available === true) {
@@ -310,30 +336,39 @@ const App = {
 
     async function send({ text = draft.value, attachments: submittedAttachments = attachments.value } = {}) {
       if ((!text.trim() && submittedAttachments.length === 0) || !currentSession.value?.target) return
+      const submitToken = submitGate.acquire(currentConversationOwnership())
+      if (!submitToken) return
+      submitRevision.value += 1
       const submittedText = text
       const submitted = [...submittedAttachments]
       const submittedOwner = attachmentBuckets.capture()
       try {
-        await conversationOwnership.run(async (assertCurrent) => {
+        await conversationOwnership.dispatch(async (assertCurrent) => {
           const content = submitted.length
             ? await buildMessageParts(submittedText, submitted)
             : submittedText
           assertCurrent()
-          scroll.forceFollow()
-          await chat.send(content)
+          const sent = BridgeWebSocket.captureSend(() => chat.send(content))
+          const outcome = await sent.value
+          if (sent.confirmation != null) await sent.confirmation
+          return outcome
         })
-        if (
-          draft.value === submittedText &&
-          attachments.value.length === submitted.length &&
-          attachments.value.every((attachment, index) => attachment === submitted[index])
-        ) {
-          draft.value = ''
-          attachmentBuckets.clear(submittedOwner)
-          attachmentRevision.value += 1
+        if (draftBuckets.get(submittedOwner) === submittedText) {
+          draftBuckets.clear(submittedOwner)
+          draftRevision.value += 1
         }
-        error.value = ''
+        attachmentBuckets.removeSubmitted(submitted, submittedOwner)
+        attachmentRevision.value += 1
+        if (conversationOwnership.isCurrent(submittedOwner)) {
+          scroll.forceFollow()
+          error.value = ''
+        }
       } catch (cause) {
-        if (!isConversationSuperseded(cause)) error.value = cause?.message || String(cause)
+        if (!isConversationSuperseded(cause) && conversationOwnership.isCurrent(submittedOwner))
+          error.value = cause?.message || String(cause)
+      } finally {
+        submitGate.release(submitToken)
+        submitRevision.value += 1
       }
     }
 
@@ -448,6 +483,7 @@ const App = {
     const receiveHostMessage = ({ data: message }) => {
       BridgeWebSocket.receive(message)
       if (message?.type === 'configuration.changed') {
+        BridgeWebSocket.disposeAll(Error('KohakuTerrarium configuration changed'))
         rejectPending(Error('KohakuTerrarium configuration changed'))
         chat.unbindFromInstance()
         currentSession.value = null
@@ -489,6 +525,7 @@ const App = {
     onBeforeUnmount(() => {
       window.removeEventListener('message', receiveHostMessage)
       readyCoordinator.invalidate()
+      BridgeWebSocket.disposeAll(Error('KohakuTerrarium webview disposed'))
       rejectPending(Error('KohakuTerrarium webview disposed'))
     })
 
@@ -564,7 +601,9 @@ const App = {
                 modelValue: draft.value,
                 attachments: attachments.value,
                 processing: !!chat.processingByTab[tab.value],
-                disabled: !currentSession.value?.target,
+                disabled:
+                  !currentSession.value?.target ||
+                  isComposerSubmitDisabled(submitBusy.value, !!chat.processingByTab[tab.value]),
                 contextActionsDisabled:
                   busy.value ||
                   contextBusy.value ||

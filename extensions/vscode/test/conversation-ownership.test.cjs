@@ -2,13 +2,17 @@ const assert = require('node:assert/strict')
 const test = require('node:test')
 
 let createConversationAttachments
+let createConversationDrafts
 let createConversationOwnership
 let isConversationSuperseded
 
 test.before(async () => {
-  ;({ createConversationAttachments, createConversationOwnership, isConversationSuperseded } = await import(
-    '../src/webview/conversationOwnership.mjs'
-  ))
+  ;({
+    createConversationAttachments,
+    createConversationDrafts,
+    createConversationOwnership,
+    isConversationSuperseded,
+  } = await import('../src/webview/conversationOwnership.mjs'))
 })
 
 function deferred() {
@@ -61,6 +65,76 @@ test('clear only removes the captured conversation bucket', () => {
   buckets.set([{ name: 'b.txt' }])
   buckets.clear(owned)
   assert.deepEqual(buckets.get(), [{ name: 'b.txt' }])
+})
+
+test('confirmed submissions remove only the submitted attachment objects', () => {
+  const state = { readyId: 1, runtimeId: 'session-a', creatureId: 'root' }
+  const buckets = createConversationAttachments(() => state)
+  const owned = buckets.capture()
+  const submitted = { name: 'same.txt' }
+  const laterSameName = { name: 'same.txt' }
+  buckets.set([submitted, laterSameName], owned)
+
+  buckets.removeSubmitted([submitted], owned)
+
+  assert.deepEqual(buckets.get(owned), [laterSameName])
+})
+
+test('confirmed submissions preserve attachments added while confirmation is pending', () => {
+  const state = { readyId: 1, runtimeId: 'session-a', creatureId: 'root' }
+  const buckets = createConversationAttachments(() => state)
+  const owned = buckets.capture()
+  const submitted = { name: 'a.txt' }
+  const later = { name: 'b.txt' }
+  buckets.set([submitted, later], owned)
+
+  buckets.removeSubmitted([submitted], owned)
+
+  assert.deepEqual(buckets.get(owned), [later])
+})
+
+test('confirmed submissions leave a re-added identical object in the bucket', () => {
+  const state = { readyId: 1, runtimeId: 'session-a', creatureId: 'root' }
+  const buckets = createConversationAttachments(() => state)
+  const owned = buckets.capture()
+  const submitted = { name: 'a.txt' }
+  buckets.set([submitted, submitted], owned)
+
+  buckets.removeSubmitted([submitted], owned)
+
+  assert.deepEqual(buckets.get(owned), [submitted])
+})
+
+test('drafts are bucketed and late cleanup only clears the submitted owner', () => {
+  let state = { readyId: 1, runtimeId: 'session-a', creatureId: 'root' }
+  const drafts = createConversationDrafts(() => state)
+  const owned = drafts.capture()
+  drafts.set('submitted A')
+
+  state = { readyId: 1, runtimeId: 'session-b', creatureId: 'root' }
+  drafts.set('current B')
+  drafts.clear(owned)
+  assert.equal(drafts.get(), 'current B')
+
+  state = owned
+  assert.equal(drafts.get(), '')
+})
+
+test('dispatch permits authoritative completion after ownership switches', async () => {
+  const { ownership, setState } = fixture()
+  const confirmation = deferred()
+  let dispatched = false
+  const operation = ownership.dispatch(async (assertCurrent) => {
+    assertCurrent()
+    dispatched = true
+    await confirmation.promise
+    return 'accepted'
+  })
+
+  setState({ readyId: 1, runtimeId: 'session-b', creatureId: 'root', name: 'Root' })
+  confirmation.resolve()
+  assert.equal(await operation, 'accepted')
+  assert.equal(dispatched, true)
 })
 
 test('attachment transform from another Session with the same creature name is superseded', async () => {
