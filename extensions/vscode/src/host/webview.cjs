@@ -1,4 +1,4 @@
-function renderWebviewHtml({ cspSource, scriptUri, styleUri, nonce }) {
+function renderWebviewHtml({ cspSource, scriptUri, styleUri, brandUri = '', nonce }) {
   const policy = [
     "default-src 'none'",
     `script-src 'nonce-${nonce}'`,
@@ -19,7 +19,7 @@ function renderWebviewHtml({ cspSource, scriptUri, styleUri, nonce }) {
   <title>KohakuTerrarium</title>
 </head>
 <body>
-  <main id="app" aria-live="polite"></main>
+  <main id="app" aria-live="polite" data-brand-uri="${brandUri}"></main>
   <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`

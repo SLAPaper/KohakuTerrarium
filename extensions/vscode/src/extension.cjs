@@ -4,6 +4,7 @@ const WebSocket = require('ws')
 
 const { createClient, validateCapabilities } = require('./host/client.cjs')
 const { resolveLocalConnection } = require('./host/connection.cjs')
+const { createConnectionAttemptOwner } = require('./host/connectionAttempt.cjs')
 const { discoverInstalledKt, probeCapabilities } = require('./host/localDiscovery.cjs')
 const { publicError } = require('./host/errors.cjs')
 const { allowedMessage, validateEndpoint } = require('./host/protocol.cjs')
@@ -132,7 +133,10 @@ function activate(context) {
       const webview = view.webview
       webview.options = {
         enableScripts: true,
-        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'dist')],
+        localResourceRoots: [
+          vscode.Uri.joinPath(context.extensionUri, 'dist'),
+          vscode.Uri.joinPath(context.extensionUri, 'media'),
+        ],
       }
       webview.html = renderWebviewHtml({
         cspSource: webview.cspSource,
@@ -142,6 +146,9 @@ function activate(context) {
         styleUri: String(
           webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview.css')),
         ),
+        brandUri: String(
+          webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'kohaku-icon.png')),
+        ),
         nonce: crypto.randomBytes(16).toString('base64'),
       })
 
@@ -150,9 +157,11 @@ function activate(context) {
       let topology = null
       let activeConnection = null
       let epoch = 0
+      const connectionAttempts = createConnectionAttemptOwner()
       const entry = {
         webview,
         disposeRuntime() {
+          connectionAttempts.invalidate()
           epoch++
           topology?.close()
           topology = null
@@ -175,16 +184,21 @@ function activate(context) {
         })
       }
 
-      async function buildRuntime() {
+      async function buildRuntime(readyId) {
+        const runtimeEpoch = epoch
         const initial = stateWriter.read()
         const connection = await resolveConnection(context, initial)
-        const stored = await stateWriter.update((current) => ({
-          endpoint: connection.endpoint,
-          manual: current.manual === true,
-          source: connection.source,
-          selection: current.selection || null,
-        }))
-        const runtimeEpoch = epoch
+        if (runtimeEpoch !== epoch) throw Error('Runtime ownership changed')
+        const stored = await stateWriter.update((current) => {
+          if (runtimeEpoch !== epoch) return undefined
+          return {
+            endpoint: connection.endpoint,
+            manual: current.manual === true,
+            source: connection.source,
+            selection: current.selection || null,
+          }
+        })
+        if (runtimeEpoch !== epoch) throw Error('Runtime ownership changed')
         activeConnection = connection
         const state = {
           selection: stored.selection || null,
@@ -202,13 +216,17 @@ function activate(context) {
           client: createClient(connection),
           state,
           sockets: new SocketOwners(),
-          post: (response) => webview.postMessage(response),
+          post: (response) => {
+            if (runtimeEpoch !== epoch || runtime !== createdRuntime) return false
+            return webview.postMessage(response)
+          },
           getDefaultCreature: () =>
             vscode.workspace.getConfiguration('kohakuterrarium').get('defaultCreature', ''),
           getWorkspacePath: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || null,
           socketFactory: (url, protocols) => new WebSocket(url, protocols),
           webSocketBase: webSocketBase(connection.endpoint),
           token: connection.token,
+          runtimeEpoch: readyId,
         })
         topology = new TopologyWatcher({
           socketFactory: (url, protocols) => new WebSocket(url, protocols),
@@ -217,7 +235,8 @@ function activate(context) {
           onInvalidate: async () => {
             if (runtimeEpoch !== epoch || runtime !== createdRuntime) return
             const result = await createdRuntime.reconcileSelection()
-            await webview.postMessage({ type: 'selection.changed', data: result })
+            if (runtimeEpoch !== epoch || runtime !== createdRuntime || result.superseded) return
+            await webview.postMessage({ type: 'selection.changed', readyId: createdRuntime.runtimeEpoch, data: result })
           },
         })
         if (runtimeEpoch !== epoch) {
@@ -229,12 +248,13 @@ function activate(context) {
         return createdRuntime
       }
 
-      function ensureRuntime() {
+      function ensureRuntime(readyId = null) {
         if (runtime) return Promise.resolve(runtime)
         if (!runtimePromise) {
-          runtimePromise = buildRuntime().finally(() => {
-            runtimePromise = null
+          const ownedPromise = buildRuntime(readyId).finally(() => {
+            if (runtimePromise === ownedPromise) runtimePromise = null
           })
+          runtimePromise = ownedPromise
         }
         return runtimePromise
       }
@@ -243,10 +263,19 @@ function activate(context) {
         if (!allowedMessage(message)) return
         try {
           if (message.type === 'ready') {
+            if (runtime) entry.disposeRuntime()
+            const attempt = connectionAttempts.begin()
             try {
-              if (runtime) entry.disposeRuntime()
-              const current = await ensureRuntime()
+              const current = await ensureRuntime(message.id)
+              if (!attempt.isCurrent()) {
+                webview.postMessage({ type: 'ready.result', id: message.id, data: { superseded: true } })
+                return
+              }
               const reconciled = await current.reconcileSelection()
+              if (!attempt.isCurrent() || reconciled.superseded) {
+                webview.postMessage({ type: 'ready.result', id: message.id, data: { superseded: true } })
+                return
+              }
               webview.postMessage({
                 type: 'ready.result',
                 id: message.id,
@@ -254,16 +283,22 @@ function activate(context) {
                   available: true,
                   automatic: activeConnection.source !== 'manual',
                   selection: reconciled.selection,
+                  selectionVersion: reconciled.selectionVersion,
+                  readyId: current.runtimeEpoch,
                 },
               })
             } catch (error) {
-              entry.disposeRuntime()
-              webview.postMessage({
-                type: 'ready.result',
-                id: message.id,
-                data: { available: false, automatic: true, selection: null },
-              })
-              sendError(message, error)
+              if (attempt.isCurrent()) {
+                entry.disposeRuntime()
+                webview.postMessage({
+                  type: 'ready.result',
+                  id: message.id,
+                  data: { available: false, automatic: true, selection: null },
+                })
+                sendError(message, error)
+              } else {
+                webview.postMessage({ type: 'ready.result', id: message.id, data: { superseded: true } })
+              }
             }
             return
           }

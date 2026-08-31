@@ -25,11 +25,13 @@ test('BridgeWebSocket forwards opaque frames without parsing them', () => {
   assert.doesNotMatch(source, /activity_type|text_delta|ui_event/)
 })
 
-test('webview renderer preserves task lifecycle controls around the shared transcript', () => {
+test('webview renderer preserves Session lifecycle controls around the shared transcript', () => {
   const source = read('src/webview/index.js')
 
-  for (const label of ['New Task', 'Refresh', 'Resume', 'Detach']) {
-    assert.match(source, new RegExp(label))
-  }
   assert.match(source, /ChatTranscriptSection/)
+  assert.match(source, /const chat = useChatStore\(\)/)
+  for (const label of ['New Session', 'Sessions', 'Stop Session', 'Stop Turn']) assert.match(source, new RegExp(label))
+  for (const stale of ['New Task', 'Open Tasks', 'Detach', 'task.']) {
+    assert.doesNotMatch(source, new RegExp(stale.replace('.', '\\.')))
+  }
 })

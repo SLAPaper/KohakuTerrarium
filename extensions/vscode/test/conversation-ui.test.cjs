@@ -53,6 +53,22 @@ test('Dashboard and VS Code consume one host-neutral transcript section', () => 
   assert.doesNotMatch(webview, /`\$\{error\.value\} \$\{chat\.wsStatus\}`/)
 })
 
+test('VS Code binds transcript viewport callbacks to the rendered conversation identity', () => {
+  const webview = read(path.join(root, 'src', 'webview', 'index.js'))
+
+  assert.match(webview, /createConversationScrollController/)
+  assert.match(
+    webview,
+    /onViewportReady:\s*\(\(identity\)\s*=>\s*\(viewport\)\s*=>\s*scroll\.onViewportReady\(viewport, identity\)\)\(scrollIdentity\.value\)/,
+  )
+  assert.match(
+    webview,
+    /onScroll:\s*\(\(identity\)\s*=>\s*\(event\)\s*=>\s*scroll\.onScroll\(event, identity\)\)\(\s*scrollIdentity\.value,\s*\)/,
+  )
+  assert.match(webview, /scroll\.forceFollow\(\)\s*\n\s*chat\.send\(content\)/)
+  assert.match(webview, /messageTailSignature\(messages\.value\)/)
+})
+
 test('shared conversation CSS is the only message visual source used by both hosts', () => {
   const sharedCss = path.join(frontend, 'components', 'chat', 'shared', 'conversation-message.css')
   const dashboard = read(path.join(frontend, 'components', 'chat', 'ChatMessage.vue'))

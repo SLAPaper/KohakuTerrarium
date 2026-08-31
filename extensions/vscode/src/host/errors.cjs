@@ -3,22 +3,22 @@ function publicError(type) {
     case 'session.create':
       return {
         code: 'session_create_failed',
-        message: 'Could not create the session. Check the Creature setting and workspace.',
+        message: 'Could not create the Session. Check the Creature setting and workspace.',
       }
     case 'session.resume':
       return {
         code: 'session_resume_failed',
-        message: 'Could not resume that session. Check its saved workspace mappings.',
+        message: 'Could not resume that Session. Check its saved workspace mappings.',
       }
     case 'session.stop':
       return {
         code: 'session_stop_failed',
-        message: 'Could not stop the selected session.',
+        message: 'Could not stop the selected Session.',
       }
     case 'session.select':
       return {
         code: 'session_select_failed',
-        message: 'Could not select that Creature. Refresh Open Sessions and try again.',
+        message: 'Could not select that Creature. Refresh Sessions and try again.',
       }
     case 'session.reconcile':
       return {
@@ -28,7 +28,7 @@ function publicError(type) {
     case 'session.list':
       return {
         code: 'session_list_failed',
-        message: 'Could not load Open Sessions. Check the KohakuTerrarium connection.',
+        message: 'Could not load Sessions. Check the KohakuTerrarium connection.',
       }
     case 'http.history':
       return {

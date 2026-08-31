@@ -3,6 +3,16 @@ const test = require('node:test')
 
 const { RuntimeHost } = require('../src/host/runtime.cjs')
 
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
+}
+
 function harness() {
   const updates = []
   const posts = []
@@ -72,6 +82,7 @@ function harness() {
     socketFactory: (url, protocols) => ({ url, protocols }),
     webSocketBase: 'ws://127.0.0.1:8000',
     token: 'host-secret',
+    runtimeEpoch: 'ready-B',
   })
   return { client, host, posts, socketCalls, sockets, state, updates }
 }
@@ -85,7 +96,7 @@ test('session.create uses Host-owned config and workspace then returns a normali
   assert.deepEqual(client.createdPayload, {
     configPath: '@kt-biome/creatures/swe',
     pwd: 'C:/workspace',
-    name: 'VS Code session',
+    name: 'VS Code Session',
   })
   assert.equal(posts[0].data.runtimeId, 'graph-created')
   assert.deepEqual(posts[0].data.creatures, [{ id: 'creature-created', name: 'swe' }])
@@ -107,7 +118,7 @@ test('session.select validates the active runtime, persists stable identity, and
   assert.deepEqual(posts[0], {
     type: 'session.select.result',
     id: 2,
-    data: state.selection,
+    data: { ...state.selection, selectionVersion: 1, readyId: 'ready-B' },
   })
 })
 
@@ -215,7 +226,9 @@ test('session.stop clears ownership only after the Host stop succeeds', async ()
 
   assert.equal(state.selection, null)
   assert.equal(sockets.beginCount, before + 1)
-  assert.deepEqual(posts.at(-1), { type: 'session.stop.result', id: 11, data: { ok: true } })
+  assert.deepEqual(posts.at(-1), {
+    type: 'session.stop.result', id: 11, data: { ok: true, selectionVersion: 1, readyId: 'ready-B' },
+  })
   client.stop = async () => { throw Error('stop failed') }
   state.selection = {
     session: 'graph-next',
@@ -230,6 +243,142 @@ test('session.stop clears ownership only after the Host stop succeeds', async ()
   )
   assert.notEqual(state.selection, null)
   assert.equal(sockets.beginCount, failedBefore)
+})
+
+test('stale selection reconciliation cannot overwrite a concurrent explicit selection', async () => {
+  const { client, host, sockets, state, updates } = harness()
+  state.selection = {
+    session: 'graph-a', graph: 'graph-a', creature: 'alpha', targetCreatureId: 'creature-alpha',
+  }
+  const listed = deferred()
+  client.listOpen = () => listed.promise
+  const reconciling = host.reconcileSelection()
+  client.active = async () => ({
+    session_id: 'graph-b', creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
+  })
+
+  const selecting = host.handle({
+    type: 'session.select', id: 20, session: 'graph-b', creatureId: 'creature-beta',
+  })
+  listed.resolve([{
+    runtimeId: 'graph-a-new', isLive: true, creatures: [{ id: 'creature-alpha', name: 'alpha-new' }],
+  }])
+  const result = await reconciling
+  await selecting
+
+  assert.equal(result.selection.session, 'graph-a-new')
+  assert.equal(updates.length, 2)
+  assert.equal(state.selection.session, 'graph-b')
+  assert.equal(host.generation, 3)
+  assert.equal(sockets.beginCount, 3)
+})
+
+test('stale missing-selection reconciliation cannot clear a concurrent explicit selection', async () => {
+  const { client, host, state, updates } = harness()
+  state.selection = {
+    session: 'graph-a', graph: 'graph-a', creature: 'alpha', targetCreatureId: 'creature-alpha',
+  }
+  const listed = deferred()
+  client.listOpen = () => listed.promise
+  const reconciling = host.reconcileSelection()
+  client.active = async () => ({
+    session_id: 'graph-b', creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
+  })
+
+  const selecting = host.handle({
+    type: 'session.select', id: 21, session: 'graph-b', creatureId: 'creature-beta',
+  })
+  listed.resolve([])
+  const result = await reconciling
+  await selecting
+
+  assert.deepEqual(result, { selection: null, changed: true, selectionVersion: 1 })
+  assert.equal(updates.length, 2)
+  assert.equal(state.selection.session, 'graph-b')
+})
+
+test('selection serializes reconcile after a pending explicit selection', async () => {
+  const { client, host, posts, sockets, state, updates } = harness()
+  state.selection = {
+    session: 'graph-a', graph: 'graph-a', creature: 'alpha', targetCreatureId: 'creature-alpha',
+  }
+  const activated = deferred()
+  const listed = deferred()
+  client.active = () => activated.promise
+  client.listOpen = () => listed.promise
+
+  const selecting = host.handle({
+    type: 'session.select', id: 30, session: 'graph-b', creatureId: 'creature-beta',
+  })
+  const reconciling = host.handle({ type: 'session.reconcile', id: 31 })
+  await Promise.resolve()
+  assert.equal(updates.length, 0)
+
+  activated.resolve({
+    session_id: 'graph-b', creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
+  })
+  await selecting
+  assert.equal(posts.at(-1).id, 30)
+  assert.equal(state.selection.session, 'graph-b')
+  const selectedGeneration = host.generation
+  listed.resolve([{
+    runtimeId: 'graph-b', isLive: true, creatures: [{ id: 'creature-beta', name: 'beta' }],
+  }])
+  await reconciling
+
+  assert.equal(posts.at(-1).id, 31)
+  assert.equal(state.selection.session, 'graph-b')
+  assert.equal(host.generation, selectedGeneration)
+  assert.equal(sockets.beginCount, selectedGeneration)
+  assert.equal(updates.length, 1)
+  assert.equal(posts.find((post) => post.id === 30).data.selectionVersion, 1)
+  assert.equal(posts.find((post) => post.id === 31).data.selectionVersion, 1)
+})
+
+test('selection serializes reconcile after a pending stop', async () => {
+  const { client, host, sockets, state } = harness()
+  state.selection = {
+    session: 'graph-a', graph: 'graph-a', creature: 'alpha', targetCreatureId: 'creature-alpha',
+  }
+  const stopped = deferred()
+  let listCalls = 0
+  client.stop = () => stopped.promise
+  client.listOpen = async () => {
+    listCalls++
+    return [{ runtimeId: 'graph-a', isLive: true, creatures: [{ id: 'creature-alpha', name: 'alpha' }] }]
+  }
+
+  const stopping = host.handle({
+    type: 'session.stop', id: 32, session: 'graph-a', creatureId: 'creature-alpha',
+  })
+  const reconciling = host.handle({ type: 'session.reconcile', id: 33 })
+  await Promise.resolve()
+  assert.equal(listCalls, 0)
+  stopped.resolve({ status: 'stopped' })
+  await Promise.all([stopping, reconciling])
+
+  assert.equal(state.selection, null)
+  assert.equal(listCalls, 0)
+  assert.equal(sockets.beginCount, 2)
+})
+
+test('a rejected selection operation does not poison the queue', async () => {
+  const { client, host, posts, state } = harness()
+  const activated = deferred()
+  client.active = () => activated.promise
+
+  const failed = host.handle({
+    type: 'session.select', id: 34, session: 'graph-missing', creatureId: 'creature-missing',
+  })
+  const cleared = host.handle({ type: 'session.clearSelection', id: 35 })
+  activated.reject(Error('active failed'))
+
+  await assert.rejects(failed, /active failed/)
+  await cleared
+  assert.equal(state.selection, null)
+  assert.deepEqual(posts.at(-1), {
+    type: 'session.clearSelection.result', id: 35, data: { ok: true, selectionVersion: 0, readyId: 'ready-B' },
+  })
 })
 
 test('selection reconciliation relocates by stable Creature id and rotates transport ownership', async () => {
@@ -347,6 +496,8 @@ test('session.reconcile returns the authoritative selection for explicit recover
         targetCreatureId: 'creature-beta',
       },
       changed: true,
+      selectionVersion: 1,
+      readyId: 'ready-B',
     },
   })
 })

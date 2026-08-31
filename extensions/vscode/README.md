@@ -1,6 +1,6 @@
 # KohakuTerrarium for VS Code
 
-First-party VS Code workspace extension for creating and operating KohakuTerrarium sessions from a sidebar.
+First-party VS Code workspace extension for creating and operating KohakuTerrarium Sessions from a sidebar.
 
 ## First-release scope
 
@@ -8,11 +8,11 @@ First-party VS Code workspace extension for creating and operating KohakuTerrari
 - Fall back to a bounded probe of local KT ports when using foreground `kt web` or when daemon state is stale.
 - Use the default loopback auth bypass without reading, requesting, storing, or sending a host token.
 - Reuse a token from VS Code `SecretStorage` only when the local service explicitly disables loopback bypass; prompt once only when that strict service has no stored token.
-- List live and dormant sessions.
-- Create a session from `kohakuterrarium.defaultCreature` and the current workspace folder.
+- List live and dormant Sessions.
+- Create a Session from `kohakuterrarium.defaultCreature` and the current workspace folder.
 - Select a Creature by stable Creature ID.
-- Render a minimal plain foundation shell; shared transcript, Markdown, composer, and product layout arrive in later migration boundaries.
-- Stop and resume sessions.
+- Reuse the production KohakuTerrarium chat store for history, streaming text, tool activity, interactive replies, and Stop Turn.
+- Stop Session and resume Sessions.
 - Relocate the selected Creature after graph merge/split events and fail closed when it disappears.
 - Recover explicitly with Refresh after the KT service restarts; the extension does not run an infinite reconnect loop.
 
@@ -26,7 +26,7 @@ The first release supports Tunnel Browser plus a KohakuTerrarium service on the 
    kt serve start
    ```
 
-2. Set `kohakuterrarium.defaultCreature` to a trusted Creature path or installed `@package/...` reference if you want to create new sessions. Existing sessions can be viewed and resumed without this setting.
+2. Set `kohakuterrarium.defaultCreature` to a trusted Creature path or installed `@package/...` reference if you want to create new Sessions. Existing Sessions can be viewed and resumed without this setting.
 3. Open the KohakuTerrarium Activity Bar view.
 
 The extension discovers the daemon URL and connects automatically. With the normal local KT defaults, there is no endpoint or token prompt.

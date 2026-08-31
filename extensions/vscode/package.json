@@ -12,6 +12,7 @@
   },
   "type": "commonjs",
   "main": "./dist/extension.cjs",
+  "icon": "media/kohaku-icon.png",
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -42,7 +43,7 @@
         {
           "id": "kohakuterrarium",
           "title": "KohakuTerrarium",
-          "icon": "media/kohakuterrarium.svg"
+          "icon": "media/kohaku-icon.png"
         }
       ]
     },
@@ -61,7 +62,7 @@
         "kohakuterrarium.defaultCreature": {
           "type": "string",
           "default": "@kt-biome/creatures/swe",
-          "description": "Trusted Creature config reference used when creating a new task."
+          "description": "Trusted Creature config reference used when creating a new Session."
         }
       }
     }

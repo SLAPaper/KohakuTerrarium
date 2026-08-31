@@ -26,6 +26,7 @@ class RuntimeHost {
     socketFactory,
     webSocketBase,
     token,
+    runtimeEpoch = null,
   }) {
     this.client = client
     this.state = state
@@ -36,6 +37,9 @@ class RuntimeHost {
     this.socketFactory = socketFactory
     this.webSocketBase = webSocketBase
     this.token = token
+    this.runtimeEpoch = runtimeEpoch
+    this.selectionOperationTail = Promise.resolve()
+    this.selectionVersion = 0
     this.generation = this.sockets.begin()
   }
 
@@ -51,16 +55,35 @@ class RuntimeHost {
     return selection
   }
 
-  async clearSelection() {
-    if (!this.state.selection) return false
-    await this.state.updateSelection(null)
-    this.generation = this.sockets.begin()
-    return true
+  enqueueSelectionOperation(operation) {
+    const result = this.selectionOperationTail.then(operation)
+    this.selectionOperationTail = result.catch(() => {})
+    return result
   }
 
-  async reconcileSelection() {
+  clearSelection() {
+    return this.enqueueSelectionOperation(() => this.clearSelectionOwned())
+  }
+
+  async clearSelectionOwned() {
+    if (!this.state.selection) {
+      return { selection: null, changed: false, selectionVersion: this.selectionVersion }
+    }
+    await this.state.updateSelection(null)
+    this.generation = this.sockets.begin()
+    this.selectionVersion++
+    return { selection: null, changed: true, selectionVersion: this.selectionVersion }
+  }
+
+  reconcileSelection() {
+    return this.enqueueSelectionOperation(() => this.reconcileSelectionOwned())
+  }
+
+  async reconcileSelectionOwned() {
     const current = this.state.selection
-    if (!current?.targetCreatureId) return { selection: null, changed: false }
+    if (!current?.targetCreatureId) {
+      return { selection: null, changed: false, selectionVersion: this.selectionVersion }
+    }
     const sessions = await this.client.listOpen()
     const session = sessions.find(
       (candidate) =>
@@ -83,22 +106,67 @@ class RuntimeHost {
       !selection ||
       selection.session !== current.session ||
       selection.creature !== current.creature
-    if (!changed) return { selection: current, changed: false }
+    if (!changed) {
+      return { selection: current, changed: false, selectionVersion: this.selectionVersion }
+    }
     await this.state.updateSelection(selection)
     this.generation = this.sockets.begin()
-    return { selection, changed: true }
+    this.selectionVersion++
+    return { selection, changed: true, selectionVersion: this.selectionVersion }
+  }
+
+  async selectOwned(message) {
+    const active = await this.client.active(message.session)
+    const selected = active.creatures?.find(
+      (creature) => String(creature.creature_id ?? creature.id) === message.creatureId,
+    )
+    if (!selected?.name) throw Error('Selected Creature is not in the active Session')
+    const selection = {
+      session: active.session_id ?? message.session,
+      graph: active.session_id ?? message.session,
+      creature: selected.name,
+      targetCreatureId: message.creatureId,
+    }
+    const changed =
+      !this.state.selection ||
+      this.state.selection.session !== selection.session ||
+      this.state.selection.creature !== selection.creature ||
+      this.state.selection.targetCreatureId !== selection.targetCreatureId
+    if (changed) {
+      await this.state.updateSelection(selection)
+      this.generation = this.sockets.begin()
+      this.selectionVersion++
+    }
+    return { selection, changed, selectionVersion: this.selectionVersion }
+  }
+
+  async stopOwned(message) {
+    const selected = this.state.selection
+    if (
+      !selected ||
+      selected.session !== message.session ||
+      selected.targetCreatureId !== message.creatureId
+    ) {
+      throw Error('Session ownership changed')
+    }
+    await this.client.stop(selected.session)
+    return this.clearSelectionOwned()
   }
 
   async handle(message) {
     switch (message.type) {
       case 'session.clearSelection': {
-        await this.clearSelection()
-        this.post({ type: 'session.clearSelection.result', id: message.id, data: { ok: true } })
+        const result = await this.clearSelection()
+        this.post({
+          type: 'session.clearSelection.result',
+          id: message.id,
+          data: { ok: true, selectionVersion: result.selectionVersion, readyId: this.runtimeEpoch },
+        })
         return
       }
       case 'session.reconcile': {
         const data = await this.reconcileSelection()
-        this.post({ type: 'session.reconcile.result', id: message.id, data })
+        this.post({ type: 'session.reconcile.result', id: message.id, data: { ...data, readyId: this.runtimeEpoch } })
         return
       }
       case 'session.list': {
@@ -109,11 +177,11 @@ class RuntimeHost {
         const configPath = this.getDefaultCreature()
         const pwd = this.getWorkspacePath()
         if (!configPath) throw Error('Configure kohakuterrarium.defaultCreature first')
-        if (!pwd) throw Error('Open a workspace folder before creating a session')
+        if (!pwd) throw Error('Open a workspace folder before creating a Session')
         const created = await this.client.createCreature({
           configPath,
           pwd,
-          name: 'VS Code session',
+          name: 'VS Code Session',
         })
         const data = normalizeActive(created)
         this.post({ type: 'session.create.result', id: message.id, data })
@@ -122,7 +190,7 @@ class RuntimeHost {
       case 'session.resume': {
         const open = await this.client.listOpen()
         if (!open.some((session) => !session.isLive && session.savedName === message.savedName)) {
-          throw Error('Saved session is not an open dormant session')
+          throw Error('Saved session is not an open dormant Session')
         }
         const resumed = await this.client.resume(message.savedName)
         const data = normalizeActive({
@@ -136,35 +204,21 @@ class RuntimeHost {
         return
       }
       case 'session.select': {
-        const active = await this.client.active(message.session)
-        const selected = active.creatures?.find(
-          (creature) => String(creature.creature_id ?? creature.id) === message.creatureId,
-        )
-        if (!selected?.name) throw Error('Selected Creature is not in the active session')
-        const selection = {
-          session: active.session_id ?? message.session,
-          graph: active.session_id ?? message.session,
-          creature: selected.name,
-          targetCreatureId: message.creatureId,
-        }
-        await this.state.updateSelection(selection)
-        this.generation = this.sockets.begin()
-        this.post({ type: 'session.select.result', id: message.id, data: selection })
+        const result = await this.enqueueSelectionOperation(() => this.selectOwned(message))
+        this.post({
+          type: 'session.select.result',
+          id: message.id,
+          data: { ...result.selection, selectionVersion: result.selectionVersion, readyId: this.runtimeEpoch },
+        })
         return
       }
       case 'session.stop': {
-        const selected = this.state.selection
-        if (
-          !selected ||
-          selected.session !== message.session ||
-          selected.targetCreatureId !== message.creatureId
-        ) {
-          throw Error('Session ownership changed')
-        }
-        await this.client.stop(selected.session)
-        await this.state.updateSelection(null)
-        this.generation = this.sockets.begin()
-        this.post({ type: 'session.stop.result', id: message.id, data: { ok: true } })
+        const result = await this.enqueueSelectionOperation(() => this.stopOwned(message))
+        this.post({
+          type: 'session.stop.result',
+          id: message.id,
+          data: { ok: true, selectionVersion: result.selectionVersion, readyId: this.runtimeEpoch },
+        })
         return
       }
       case 'http.history': {
