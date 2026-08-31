@@ -61,6 +61,7 @@
       "properties": {
         "kohakuterrarium.defaultCreature": {
           "type": "string",
+          "scope": "machine",
           "default": "@kt-biome/creatures/swe",
           "description": "Trusted Creature config reference used when creating a new Session."
         }

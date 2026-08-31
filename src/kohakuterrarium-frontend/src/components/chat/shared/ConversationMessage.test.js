@@ -236,6 +236,36 @@ describe("ConversationMessage", () => {
     expect(wrapper.text()).toContain("3 tool calls")
   })
 
+  it.each([
+    [false, "select"],
+    [true, 'input[type="checkbox"]'],
+  ])("cancels native %s selection prompts without requiring a choice", async (multi, selector) => {
+    const selection = mount(ConversationMessage, {
+      props: {
+        message: {
+          role: "ui_event",
+          uiEventType: "selection",
+          payload: {
+            prompt: "Pick",
+            multi,
+            options: [
+              { id: "a", label: "A" },
+              { id: "b", label: "B" },
+            ],
+          },
+        },
+      },
+    })
+
+    expect(selection.findAll(selector)).toHaveLength(multi ? 2 : 1)
+    await selection
+      .findAll("button")
+      .find((button) => button.text() === "Cancel")
+      .trigger("click")
+
+    expect(selection.emitted("reply")).toEqual([[{ actionId: "cancel", values: {} }]])
+  })
+
   it("renders multi-selection and complete card content with safe links", async () => {
     const selection = mount(ConversationMessage, {
       props: {
@@ -255,7 +285,10 @@ describe("ConversationMessage", () => {
     })
     await selection.findAll('input[type="checkbox"]')[0].setValue(true)
     await selection.findAll('input[type="checkbox"]')[1].setValue(true)
-    await selection.get("button").trigger("click")
+    await selection
+      .findAll("button")
+      .find((button) => button.text() === "Submit")
+      .trigger("click")
     expect(selection.emitted("reply")).toEqual([
       [{ actionId: "submit", values: { selected: ["a", "b"] } }],
     ])

@@ -30,6 +30,7 @@ test('manifest defines a workspace sidebar extension and deterministic package s
       title: 'KohakuTerrarium: Use Automatic Local Discovery',
     },
   ])
+  assert.equal(manifest.contributes.configuration.properties['kohakuterrarium.defaultCreature'].scope, 'machine')
   assert.equal(manifest.scripts.test, 'node --test test/*.test.cjs')
   assert.equal(manifest.scripts.build, 'node scripts/build.cjs')
   assert.equal(manifest.scripts.package, 'npm run build && vsce package --no-dependencies')

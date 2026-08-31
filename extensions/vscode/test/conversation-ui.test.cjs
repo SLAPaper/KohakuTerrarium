@@ -26,16 +26,18 @@ test('Dashboard and VS Code import one production conversation message component
 
 test('VS Code conversation text uses the public shared Markdown renderer', () => {
   const webview = read(path.join(root, 'src', 'webview', 'index.js'))
+  const renderers = read(path.join(root, 'src', 'webview', 'viewRenderers.mjs'))
 
   assert.match(
     webview,
     /import\s*\{[^}]*\bMarkdownRenderer\b[^}]*\}\s*from ['"]@kohakuterrarium\/chat-ui['"]/s,
   )
+  assert.match(webview, /createViewRenderers\(\{[\s\S]*MarkdownRenderer/)
   assert.match(
-    webview,
+    renderers,
     /function renderSharedText\(content, breaks = false\)\s*\{\s*return h\(MarkdownRenderer, \{ content, breaks \}\)\s*\}/,
   )
-  const messages = [...webview.matchAll(/h\(ConversationMessage,\s*\{([\s\S]*?)\n\s*\}\)/g)]
+  const messages = [...renderers.matchAll(/h\(ConversationMessage,\s*\{([\s\S]*?)\n\s*\}\)/g)]
   assert.ok(messages.length > 0)
   for (const message of messages) assert.match(message[1], /renderText:\s*renderSharedText/)
 })

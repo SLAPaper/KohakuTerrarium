@@ -18,7 +18,8 @@ test('webview uses flat session, chat, and composer regions with an accessible c
   assert.match(source, /'aria-controls': 'session-list'/)
   assert.match(source, /id: 'session-list'/)
   assert.match(source, /h\('section', \{ class: 'chat-region' \}, \[\s*h\(ChatTranscriptSection/s)
-  assert.match(source, /session\.creatures\.length === 1/)
+  const renderers = read('src/webview/viewRenderers.mjs')
+  assert.match(renderers, /session\.creatures\.length === 1/)
   for (const label of ['New Session', 'Refresh Sessions', 'Stop Session']) assert.match(source, new RegExp(label))
 })
 

@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
-SRC = Path(__file__).resolve().parents[2] / "src" / "kohakuterrarium"
+ROOT = Path(__file__).resolve().parents[2]
+SRC = ROOT / "src" / "kohakuterrarium"
+VSCODE_SRC = ROOT / "extensions" / "vscode" / "src"
 
 # Pure-data files exempt from BOTH the 600-line and 1000-line caps.
 # These grow linearly with the data they describe (one entry per
@@ -230,6 +232,11 @@ def _all_py_files():
         yield p
 
 
+def _all_vscode_source_files():
+    for suffix in ("*.js", "*.cjs", "*.mjs"):
+        yield from VSCODE_SRC.rglob(suffix)
+
+
 @pytest.mark.parametrize(
     "path", list(_all_py_files()), ids=lambda p: str(p.relative_to(SRC))
 )
@@ -254,3 +261,13 @@ def test_file_under_1000_lines(path):
         return  # pure data, no upper limit
     lines = len(path.read_text(encoding="utf-8").splitlines())
     assert lines <= 1000, f"{path.relative_to(SRC)} is {lines} lines (hard max 1000)"
+
+
+@pytest.mark.parametrize(
+    "path",
+    list(_all_vscode_source_files()),
+    ids=lambda p: str(p.relative_to(VSCODE_SRC)),
+)
+def test_vscode_source_file_under_600_lines(path):
+    lines = len(path.read_text(encoding="utf-8").splitlines())
+    assert lines <= 600, f"{path.relative_to(VSCODE_SRC)} is {lines} lines (max 600)"

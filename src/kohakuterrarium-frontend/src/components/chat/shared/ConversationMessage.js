@@ -263,6 +263,7 @@ const NativeUIEvent = defineComponent({
               },
               "Submit",
             ),
+            h("button", { type: "button", onClick: () => reply("cancel", {}) }, "Cancel"),
           ]),
         )
       } else if (type === "progress") {
