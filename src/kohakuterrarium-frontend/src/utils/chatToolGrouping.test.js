@@ -4,7 +4,7 @@ import {
   computeRenderGroups,
   DEFAULT_TOOL_BATCH_THRESHOLD,
   summarizeBatch,
-} from "./chatToolGrouping"
+} from "@kohakuterrarium/chat-ui"
 
 function tool(id, name = "read", { status = "done", kind = "tool" } = {}) {
   return { type: "tool", id, name, kind, status }

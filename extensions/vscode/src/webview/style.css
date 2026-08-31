@@ -5,6 +5,40 @@
   background: var(--vscode-sideBar-background);
 }
 
+.kt-conversation-host {
+  --kt-conversation-text: var(--vscode-foreground);
+  --kt-conversation-muted: var(--vscode-descriptionForeground);
+  --kt-conversation-surface: var(--vscode-editorWidget-background);
+  --kt-conversation-surface-raised: var(--vscode-sideBar-background);
+  --kt-conversation-border: var(--vscode-panel-border);
+  --kt-conversation-accent: var(--vscode-textLink-foreground);
+  --kt-conversation-tool: var(--vscode-charts-blue);
+  --kt-conversation-warning: var(--vscode-charts-yellow);
+  --kt-conversation-error: var(--vscode-errorForeground);
+  --kt-conversation-success: var(--vscode-testing-iconPassed);
+  --kt-conversation-code: var(--vscode-textPreformat-background);
+  --color-text: var(--vscode-foreground);
+  --color-text-muted: var(--vscode-descriptionForeground);
+  --color-border: var(--vscode-panel-border);
+  --font-mono: var(--vscode-editor-font-family, monospace);
+  --kt-chat-code-meta-size: 0.8em;
+  --kt-chat-code-size: 0.9em;
+  --kt-chat-code-line-height: 1.5;
+}
+
+.kt-conversation-host .md-content a {
+  color: var(--vscode-textLink-foreground);
+}
+
+.kt-conversation-host .md-content code:not(.katex-fallback) {
+  background: var(--vscode-textPreformat-background);
+}
+
+body.vscode-high-contrast .kt-conversation-host .code-block,
+body.vscode-high-contrast-light .kt-conversation-host .code-block {
+  border: 1px solid var(--vscode-contrastBorder);
+}
+
 body {
   margin: 0;
 }
@@ -30,49 +64,45 @@ h2 {
   font-size: 14px;
 }
 
-button,
-input,
-select {
+.taskrail button,
+.selection button,
+.composer button,
+.composer input,
+.kt-conversation-event button,
+.kt-conversation-event input,
+.kt-conversation-event select,
+.kt-conversation-event textarea {
   box-sizing: border-box;
-  width: 100%;
   margin-top: 4px;
   padding: 6px;
 }
 
-button {
+.taskrail button,
+.selection button,
+.composer button,
+.kt-conversation-event button {
   color: var(--vscode-button-foreground);
   background: var(--vscode-button-background);
   border: 1px solid var(--vscode-button-border, transparent);
 }
 
-input,
-select {
+.composer input,
+.kt-conversation-event input,
+.kt-conversation-event select,
+.kt-conversation-event textarea {
   color: var(--vscode-input-foreground);
   background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, transparent);
 }
 
-.sessionrail,
-.selection,
-.message {
+.taskrail,
+.selection {
   border-bottom: 1px solid var(--vscode-panel-border);
   padding-bottom: 8px;
 }
 
-.session {
+.task {
   padding-top: 6px;
-}
-
-.message pre,
-.tool pre {
-  margin-top: 6px;
-  white-space: pre-wrap;
-}
-
-.tool {
-  border-left: 3px solid var(--vscode-charts-yellow);
-  margin-top: 6px;
-  padding-left: 6px;
 }
 
 .status {
@@ -80,7 +110,14 @@ select {
   color: var(--vscode-descriptionForeground);
 }
 
-.interactive,
 .composer {
   margin-top: 6px;
+}
+
+.composer input {
+  width: 100%;
+}
+
+.kt-conversation-message--user {
+  justify-self: end;
 }

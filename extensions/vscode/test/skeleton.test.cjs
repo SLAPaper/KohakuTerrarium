@@ -73,12 +73,23 @@ test('webview shell uses a strict CSP and only packaged resources', () => {
   })
 
   assert.match(html, /default-src 'none'/)
-  assert.match(html, /img-src vscode-webview:\/\/origin data:/)
-  assert.match(html, /style-src vscode-webview:\/\/origin/)
-  assert.match(html, /script-src 'nonce-fixed-test-nonce'/)
+  const policy = html.match(/Content-Security-Policy" content="([^"]+)"/)?.[1]
+  assert.deepEqual(
+    new Set(policy?.split('; ').map((directive) => directive.trim())),
+    new Set([
+      "default-src 'none'",
+      "script-src 'nonce-fixed-test-nonce'",
+      'style-src-elem vscode-webview://origin',
+      "style-src-attr 'unsafe-inline'",
+      'font-src vscode-webview://origin data:',
+      'img-src vscode-webview://origin data:',
+      "connect-src 'none'",
+    ]),
+  )
   assert.match(html, /src="vscode-webview:\/\/origin\/dist\/webview\.js"/)
   assert.match(html, /href="vscode-webview:\/\/origin\/dist\/webview\.css"/)
-  assert.doesNotMatch(html, /unsafe-inline/)
+  assert.doesNotMatch(policy, /script-src[^;]*(?:unsafe-inline|unsafe-eval|https?:)/)
+  assert.doesNotMatch(policy, /style-src-elem[^;]*https?:/)
   assert.doesNotMatch(html, /https?:\/\//)
 })
 

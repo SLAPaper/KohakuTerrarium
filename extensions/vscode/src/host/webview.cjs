@@ -1,9 +1,12 @@
 function renderWebviewHtml({ cspSource, scriptUri, styleUri, nonce }) {
   const policy = [
     "default-src 'none'",
-    `img-src ${cspSource} data:`,
-    `style-src ${cspSource}`,
     `script-src 'nonce-${nonce}'`,
+    `style-src-elem ${cspSource}`,
+    "style-src-attr 'unsafe-inline'",
+    `font-src ${cspSource} data:`,
+    `img-src ${cspSource} data:`,
+    "connect-src 'none'",
   ].join('; ')
 
   return `<!doctype html>

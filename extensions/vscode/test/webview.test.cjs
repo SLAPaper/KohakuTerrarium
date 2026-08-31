@@ -6,15 +6,15 @@ const test = require('node:test')
 const root = path.resolve(__dirname, '..')
 const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8')
 
-test('foundation webview build is isolated from shared frontend components', () => {
+test('webview build uses the shared transcript boundary without later UI dependencies', () => {
   const config = read('vite.config.mjs')
   const source = read('src/webview/index.js')
 
-  assert.doesNotMatch(config, /kohakuterrarium-frontend|vue|pinia|element-plus/)
-  for (const type of ['session.list', 'session.create', 'session.resume', 'session.select', 'session.stop']) {
-    assert.match(source, new RegExp(type.replace('.', '\\.')))
-  }
-  assert.doesNotMatch(source, /ConversationMessage|Markdown|Composer|useChatStore/)
+  assert.match(config, /kohakuterrarium-frontend/)
+  assert.match(source, /ChatTranscriptSection|ConversationMessage|useChatStore/)
+  assert.match(source, /from ['"]@kohakuterrarium\/chat-ui['"]/)
+  assert.match(source, /MarkdownRenderer/)
+  assert.doesNotMatch(source, /Composer/)
 })
 
 test('BridgeWebSocket forwards opaque frames without parsing them', () => {
@@ -25,11 +25,11 @@ test('BridgeWebSocket forwards opaque frames without parsing them', () => {
   assert.doesNotMatch(source, /activity_type|text_delta|ui_event/)
 })
 
-test('foundation renderer is plain and has only session lifecycle controls', () => {
+test('webview renderer preserves task lifecycle controls around the shared transcript', () => {
   const source = read('src/webview/index.js')
 
-  for (const label of ['New Session', 'Refresh', 'Resume', 'Stop Session']) {
+  for (const label of ['New Task', 'Refresh', 'Resume', 'Detach']) {
     assert.match(source, new RegExp(label))
   }
-  assert.match(source, /createVisibilityInterval/)
+  assert.match(source, /ChatTranscriptSection/)
 })

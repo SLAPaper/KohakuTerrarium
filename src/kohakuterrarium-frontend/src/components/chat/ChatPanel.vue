@@ -67,27 +67,7 @@
         <div class="px-4 py-2 rounded-lg bg-white dark:bg-warm-900 border border-iolite/40 shadow-lg text-sm text-iolite dark:text-iolite-light font-medium"><span class="i-carbon-upload mr-1" /> {{ t("chat.dropToAttach") }}</div>
       </div>
 
-      <div ref="messagesEl" class="chat-messages-viewport flex-1 overflow-y-auto px-5 py-4" @scroll="onMessagesScroll">
-        <div class="flex flex-col gap-3">
-          <template v-if="viewMessages.length === 0">
-            <div class="text-center py-16">
-              <div class="w-12 h-12 rounded-2xl bg-gradient-to-br from-iolite/10 to-amber/10 dark:from-iolite/5 dark:to-amber/5 flex items-center justify-center mx-auto mb-3">
-                <div class="i-carbon-chat text-xl text-iolite/40 dark:text-iolite-light/30" />
-              </div>
-              <p class="text-warm-400 dark:text-warm-500 text-sm">{{ resolvedEmptyTitle }}</p>
-              <p class="text-warm-300 dark:text-warm-600 text-xs mt-1">{{ resolvedEmptySubtitle }}</p>
-            </div>
-          </template>
-          <button v-if="windowStart > 0" class="self-center text-xs text-iolite dark:text-iolite-light hover:underline" @click="loadEarlierMessages">
-            {{ t("chat.showEarlier", { count: windowStart }) }}
-          </button>
-          <ChatMessage v-for="(msg, idx) in windowMessages" :key="msg.id" :message="msg" :prev-message="windowStart + idx > 0 ? viewMessages[windowStart + idx - 1] : null" :is-first="windowStart + idx === 0" :message-idx="windowStart + idx" :is-last-assistant="msg.role === 'assistant' && windowStart + idx === viewMessages.length - 1" :tab-id="viewActiveTab" />
-          <div v-if="showKohakUwUingIndicator" class="flex items-center gap-2.5 py-2 pl-1">
-            <span class="w-2 h-2 rounded-full bg-amber kohaku-pulse" />
-            <span class="text-sm text-amber/80 kohaku-pulse">{{ kohakuwuingLabel }}</span>
-          </div>
-        </div>
-      </div>
+      <ChatTranscriptSection :messages="windowMessages" :message-offset="windowStart" :total-count="viewMessages.length" :previous-message="windowStart > 0 ? viewMessages[windowStart - 1] : null" :empty-title="resolvedEmptyTitle" :empty-subtitle="resolvedEmptySubtitle" :processing="showKohakUwUingIndicator" :processing-label="kohakuwuingLabel" :reconnecting="chat.wsStatus === 'reconnecting'" :reconnect-label="t('chat.disconnected')" :earlier-count="windowStart" :earlier-label="t('chat.showEarlier', { count: windowStart })" :render-message="renderTranscriptMessage" @load-earlier="loadEarlierMessages" @scroll="onMessagesScroll" @viewport-ready="onTranscriptViewportReady" />
 
       <div v-if="!readOnly && activeQueue.length" class="px-4 pt-2 flex flex-col gap-1.5">
         <div v-for="qm in visibleQueued" :key="qm.id" class="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-amber/5 dark:bg-amber/5 border border-amber/20 text-sm" :class="{ 'opacity-50': qm.cancelling }">
@@ -188,10 +168,11 @@
 <script setup>
 import { ElMessage, ElMessageBox } from "element-plus"
 
-import { inject } from "vue"
+import { h, inject, provide } from "vue"
 
 import StatusDot from "@/components/common/StatusDot.vue"
 import ChatMessage from "@/components/chat/ChatMessage.vue"
+import { ChatTranscriptSection } from "@kohakuterrarium/chat-ui"
 import { createChatScrollScheduler } from "@/components/chat/chatScrollScheduler"
 import SlashCommandMenu from "@/components/chat/SlashCommandMenu.vue"
 import ModelSwitcher from "@/components/chrome/ModelSwitcher.vue"
@@ -219,6 +200,7 @@ const emit = defineEmits(["focus-group"])
 
 const injectedChat = inject("chatStore", null)
 const chat = injectedChat || useChatStore(props.instance?.id || props.instance?.graph_id || undefined)
+provide("chatStore", chat)
 const { t } = useI18n()
 const { isCompact } = useDensity()
 const inputText = ref("")
@@ -406,6 +388,14 @@ const showKohakUwUingIndicator = computed(() => {
   }
   return viewProcessing.value
 })
+
+function onTranscriptViewportReady(viewport) {
+  messagesEl.value = viewport
+}
+
+function renderTranscriptMessage(message, context) {
+  return h(ChatMessage, { message, prevMessage: context.previousMessage, isFirst: context.isFirst, messageIdx: context.absoluteIndex, isLastAssistant: context.isLastAssistant, tabId: viewActiveTab.value })
+}
 
 const kohakuwuingLabel = computed(() => {
   const streaming = !props.groupId || isFocusedGroup.value ? chat.processing && chat.viewingRunningBranch : viewProcessing.value

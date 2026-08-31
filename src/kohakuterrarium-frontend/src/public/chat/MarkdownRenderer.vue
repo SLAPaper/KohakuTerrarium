@@ -9,8 +9,8 @@ import MarkdownIt from "markdown-it"
 import markdownItKatex from "@vscode/markdown-it-katex"
 import hljs from "highlight.js"
 
-import { applyExternalLinkRule } from "@/utils/externalLinks"
-import { IncrementalMarkdownRenderer } from "@/utils/markdownIncremental"
+import { applyExternalLinkRule } from "./externalLinks.js"
+import { IncrementalMarkdownRenderer } from "./markdownIncremental.js"
 
 const props = defineProps({
   content: { type: String, default: "" },

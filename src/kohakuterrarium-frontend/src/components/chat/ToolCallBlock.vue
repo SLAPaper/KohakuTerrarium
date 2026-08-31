@@ -103,7 +103,9 @@
 </template>
 
 <script setup>
-import MarkdownRenderer from "@/components/common/MarkdownRenderer.vue"
+import { inject } from "vue"
+
+import { MarkdownRenderer } from "@kohakuterrarium/chat-ui"
 import VideoFilePreview from "@/components/chat/VideoFilePreview.vue"
 import SubagentConversationPanel from "@/components/subagents/SubagentConversationPanel.vue"
 import { useChatStore } from "@/stores/chat"
@@ -117,7 +119,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits(["toggle"])
-const chat = useChatStore()
+const chat = inject("chatStore", null) || useChatStore()
 const { t } = useI18n()
 const mediaParts = computed(() => safeMediaParts(props.tc.resultParts))
 const detailParts = computed(() => (Array.isArray(props.tc.resultParts) ? props.tc.resultParts : []).filter((part) => part?.type !== "image_url" && !(part?.type === "file" && part.file?.mime?.startsWith("video/"))))

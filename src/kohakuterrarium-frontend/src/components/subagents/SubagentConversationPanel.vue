@@ -74,7 +74,7 @@
 <script setup>
 import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue"
 
-import MarkdownRenderer from "@/components/common/MarkdownRenderer.vue"
+import { MarkdownRenderer } from "@kohakuterrarium/chat-ui"
 import { sessionAPI, terrariumAPI } from "@/utils/api"
 import { useI18n } from "@/utils/i18n"
 

@@ -156,7 +156,7 @@
 import { computed, ref } from "vue"
 import { ElButton, ElCheckbox, ElCheckboxGroup, ElInput, ElLink, ElProgress, ElRadio, ElRadioGroup } from "element-plus"
 
-import MarkdownRenderer from "@/components/common/MarkdownRenderer.vue"
+import { MarkdownRenderer } from "@kohakuterrarium/chat-ui"
 
 const props = defineProps({
   message: { type: Object, required: true },

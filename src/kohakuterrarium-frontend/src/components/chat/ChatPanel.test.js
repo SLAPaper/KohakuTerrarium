@@ -19,6 +19,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
 
@@ -188,7 +189,7 @@ describe("ChatPanel render window", () => {
     expect(renderedIds(wrapper).length).toBe(400)
     expect(renderedIds(wrapper)[0]).toBe("m_50")
     expect(renderedIds(wrapper).at(-1)).toBe("m_449")
-    const earlier = wrapper.find("button.self-center")
+    const earlier = wrapper.find("button.kt-transcript-earlier")
     expect(earlier.exists()).toBe(true)
     expect(earlier.text()).toContain("50")
   })
@@ -199,12 +200,12 @@ describe("ChatPanel render window", () => {
     const wrapper = mountPanel(chat)
     await flushPromises()
 
-    await wrapper.find("button.self-center").trigger("click")
+    await wrapper.find("button.kt-transcript-earlier").trigger("click")
     await flushPromises()
 
     expect(renderedIds(wrapper).length).toBe(450)
     expect(renderedIds(wrapper)[0]).toBe("m_0")
-    expect(wrapper.find("button.self-center").exists()).toBe(false)
+    expect(wrapper.find("button.kt-transcript-earlier").exists()).toBe(false)
   })
 
   it("shrinkage below an expanded window start falls back to the tail window", async () => {
@@ -214,7 +215,7 @@ describe("ChatPanel render window", () => {
     await flushPromises()
 
     // Expand once: explicit window start at index 0.
-    await wrapper.find("button.self-center").trigger("click")
+    await wrapper.find("button.kt-transcript-earlier").trigger("click")
     await flushPromises()
     expect(renderedIds(wrapper).length).toBe(450)
 
@@ -226,7 +227,7 @@ describe("ChatPanel render window", () => {
     // single message (clamp to total - 1).
     expect(renderedIds(wrapper).length).toBe(30)
     expect(renderedIds(wrapper)[0]).toBe("m_0")
-    expect(wrapper.find("button.self-center").exists()).toBe(false)
+    expect(wrapper.find("button.kt-transcript-earlier").exists()).toBe(false)
   })
 
   it("new tail messages stay mounted inside the window while streaming", async () => {
@@ -268,7 +269,7 @@ describe("ChatPanel render window", () => {
 
     chat.setGroupActiveTab(groupId, "reviewer")
     await flushPromises()
-    const viewport = wrapper.find(".chat-messages-viewport").element
+    const viewport = wrapper.find(".kt-transcript-viewport").element
     viewport.scrollTop = 73
 
     pendingFrame()
@@ -551,7 +552,7 @@ describe("ChatPanel command results", () => {
 
       chat.activeTab = "reviewer"
       await flushPromises()
-      const viewport = wrapper.find(".chat-messages-viewport").element
+      const viewport = wrapper.find(".kt-transcript-viewport").element
       Object.defineProperty(viewport, "scrollHeight", { configurable: true, value: 420 })
       viewport.scrollTop = 73
 
