@@ -16,6 +16,8 @@ test('protocol accepts the formal vertical-slice messages with strict fields', (
     { type: 'session.select', id: 4, session: 'graph-1', creatureId: 'creature-alpha' },
     { type: 'http.history', id: 5, session: 'graph-1', creature: 'alpha' },
     { type: 'http.interrupt', id: 6, session: 'graph-1', creature: 'alpha' },
+    { type: 'context.compact', id: 20 },
+    { type: 'context.clear', id: 21 },
     { type: 'ws.open', id: 7 },
     { type: 'ws.send', id: 7, data: '{"type":"input"}' },
     { type: 'ws.close', id: 7 },
@@ -30,6 +32,9 @@ test('protocol accepts the formal vertical-slice messages with strict fields', (
     { type: 'session.create', id: 12, configRef: '@secret/config' },
     { type: 'session.resume', id: 16, savedName: '' },
     { type: 'session.stop', id: 17, session: 'graph-1', creatureId: '' },
+    { type: 'context.compact', id: 20, command: 'stop' },
+    { type: 'context.clear', id: 21, args: ['anything'] },
+    { type: 'command.execute', id: 22, command: 'clear', args: [] },
   ]) assert.equal(allowedMessage(message), false, message.type)
 })
 
@@ -71,6 +76,7 @@ test('Host client authenticates with X-KT-Host-Token and constructs creature rou
 
   await client.history('graph one', 'alpha/beta')
   await client.interrupt('graph one', 'alpha/beta')
+  await client.creatureCommand('graph one', 'alpha/beta', 'clear', '--force')
 
   assert.equal(calls[0].url, 'http://127.0.0.1:8000/api/sessions/graph%20one/creatures/alpha%2Fbeta/history')
   assert.equal(calls[0].options.headers['X-KT-Host-Token'], 'host-secret')
@@ -78,6 +84,9 @@ test('Host client authenticates with X-KT-Host-Token and constructs creature rou
   assert.equal(calls[0].options.redirect, 'error')
   assert.equal(calls[1].url, 'http://127.0.0.1:8000/api/sessions/graph%20one/creatures/alpha%2Fbeta/interrupt')
   assert.equal(calls[1].options.method, 'POST')
+  assert.equal(calls[2].url, 'http://127.0.0.1:8000/api/sessions/graph%20one/creatures/alpha%2Fbeta/command')
+  assert.equal(calls[2].options.method, 'POST')
+  assert.deepEqual(JSON.parse(calls[2].options.body), { command: 'clear', args: '--force' })
 })
 
 test('capability validation accepts local bypass and rejects multi-user mode', () => {

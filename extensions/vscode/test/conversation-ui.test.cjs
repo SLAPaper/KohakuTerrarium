@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
+const { pathToFileURL } = require('node:url')
 const test = require('node:test')
 
 const root = path.resolve(__dirname, '..')
@@ -65,16 +66,43 @@ test('VS Code uses the exact public shared composer without a private input or s
   assert.doesNotMatch(webview, /Stop Turn|stop-turn/)
   assert.match(webview, /processing:\s*!!chat\.processingByTab\[tab\.value\]/)
   assert.match(webview, /onInterrupt:\s*\(\)\s*=>\s*chat\.interrupt\(tab\.value\)/)
-  assert.match(webview, /showContextActions:\s*false/)
+  assert.match(webview, /showContextActions:\s*true/)
+  assert.match(webview, /onCompact:.*context\.compact/)
+  assert.match(webview, /onClear:.*context\.clear/)
 })
 
-test('VS Code composer remains text-only at boundary 8', () => {
+test('VS Code composer context controls render accessible inline Carbon icons', async () => {
+  const iconModule = path.join(root, 'src', 'webview', 'carbonIcons.mjs')
+  assert.equal(fs.existsSync(iconModule), true)
+
+  const { renderCarbonIcon } = await import(pathToFileURL(iconModule))
+  for (const name of ['collapse-all', 'clean']) {
+    const icon = renderCarbonIcon(name)
+    assert.equal(icon.type, 'svg')
+    assert.equal(icon.props['aria-hidden'], 'true')
+    assert.equal(icon.props.focusable, 'false')
+    assert.equal(icon.props.fill, 'currentColor')
+    assert.equal(icon.props.width, '1em')
+    assert.equal(icon.props.height, '1em')
+    assert.ok(icon.children.length > 0)
+    assert.ok(icon.children.every((child) => child.type === 'path' && child.props.d))
+  }
+
+  const webview = read(path.join(root, 'src', 'webview', 'index.js'))
+  assert.match(webview, /'compact-icon': \(\) => renderCarbonIcon\('collapse-all'\)/)
+  assert.match(webview, /'clear-icon': \(\) => renderCarbonIcon\('clean'\)/)
+  assert.doesNotMatch(webview, /i-carbon-(?:collapse-all|clean)/)
+})
+
+test('VS Code composer uses managed attachment conversion and preserves state until send accepts', () => {
   const webview = read(path.join(root, 'src', 'webview', 'index.js'))
 
+  assert.match(webview, /\bbuildMessageParts\b/)
   assert.match(webview, /managedSubmit:\s*true/)
-  assert.match(webview, /showAttachmentActions:\s*false/)
-  assert.doesNotMatch(webview, /\bbuildMessageParts\b|onUpdate:attachments/)
-  assert.match(webview, /scroll\.forceFollow\(\)[\s\S]*chat\.send\(content\)[\s\S]*draft\.value = ''/)
+  assert.match(webview, /attachments:\s*attachments\.value/)
+  assert.match(webview, /onUpdate:attachments/)
+  assert.match(webview, /await chat\.send\(content\)/)
+  assert.match(webview, /scroll\.forceFollow\(\)[\s\S]*await chat\.send\(content\)/)
 })
 
 test('VS Code binds transcript viewport callbacks to the rendered conversation identity', () => {
@@ -89,7 +117,7 @@ test('VS Code binds transcript viewport callbacks to the rendered conversation i
     webview,
     /onScroll:\s*\(\(identity\)\s*=>\s*\(event\)\s*=>\s*scroll\.onScroll\(event, identity\)\)\(\s*scrollIdentity\.value,\s*\)/,
   )
-  assert.match(webview, /scroll\.forceFollow\(\)\s*\n\s*chat\.send\(content\)/)
+  assert.match(webview, /scroll\.forceFollow\(\)\s*\n\s*await chat\.send\(content\)/)
   assert.match(webview, /messageTailSignature\(messages\.value\)/)
 })
 

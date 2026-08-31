@@ -1,5 +1,7 @@
 const { normalizeSession } = require('./client.cjs')
 
+const contextCapabilities = new WeakMap()
+
 function encode(value) {
   return encodeURIComponent(value)
 }
@@ -140,6 +142,37 @@ class RuntimeHost {
     return { selection, changed, selectionVersion: this.selectionVersion }
   }
 
+  acquireContextCommand() {
+    const selected = this.state.selection
+    if (!selected) return null
+    const capability = Object.freeze({})
+    contextCapabilities.set(capability, {
+      runtime: this,
+      runtimeEpoch: this.runtimeEpoch,
+      selected,
+      selectionVersion: this.selectionVersion,
+    })
+    return capability
+  }
+
+  ownsContextCommand(capability) {
+    const owned = contextCapabilities.get(capability)
+    return owned?.runtime === this &&
+      owned.runtimeEpoch === this.runtimeEpoch &&
+      owned.selected === this.state.selection &&
+      owned.selectionVersion === this.selectionVersion
+  }
+
+  async contextCommandOwned(message, capability) {
+    if (!this.ownsContextCommand(capability)) throw Error('Selected Creature ownership changed')
+    const { selected } = contextCapabilities.get(capability)
+    const command = message.type === 'context.compact' ? 'compact' : 'clear'
+    const args = command === 'clear' ? '--force' : ''
+    const data = await this.client.creatureCommand(selected.session, selected.creature, command, args)
+    if (!this.ownsContextCommand(capability)) throw Error('Selected Creature ownership changed')
+    return data
+  }
+
   async stopOwned(message) {
     const selected = this.state.selection
     if (
@@ -237,6 +270,16 @@ class RuntimeHost {
           id: message.id,
           data: await this.client.interrupt(selected.session, selected.creature),
         })
+        return
+      }
+      case 'context.compact':
+      case 'context.clear': {
+        const capability = message.contextCapability || this.acquireContextCommand()
+        if (!capability) throw Error('Select a Creature before managing context')
+        const data = await this.enqueueSelectionOperation(() =>
+          this.contextCommandOwned(message, capability),
+        )
+        this.post({ type: `${message.type}.result`, id: message.id, data })
         return
       }
       case 'ws.open': {

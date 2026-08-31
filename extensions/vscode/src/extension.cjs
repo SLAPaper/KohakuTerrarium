@@ -102,6 +102,35 @@ function webSocketBase(endpoint) {
   return endpoint.replace(/^http:/, 'ws:')
 }
 
+async function confirmContextClear() {
+  return (
+    (await vscode.window.showWarningMessage(
+      'Clear the active Creature context? Session history remains available.',
+      { modal: true },
+      'Clear Context',
+    )) === 'Clear Context'
+  )
+}
+
+async function dispatchContextCommand({ message, getRuntime, isCurrent, confirmClear, post }) {
+  const ownedRuntime = await getRuntime()
+  const contextCapability = ownedRuntime.acquireContextCommand()
+  if (!contextCapability) throw Error('Select a Creature before managing context')
+  if (message.type === 'context.clear' && !(await confirmClear())) {
+    await post({ type: 'context.clear.result', id: message.id, data: { cancelled: true } })
+    return
+  }
+  if (!isCurrent(ownedRuntime) || !ownedRuntime.ownsContextCommand(contextCapability)) {
+    await post({
+      type: `${message.type}.result`,
+      id: message.id,
+      data: { cancelled: true, superseded: true },
+    })
+    return
+  }
+  await ownedRuntime.handle({ ...message, contextCapability })
+}
+
 function activate(context) {
   const liveViews = new Set()
   const stateWriter = new ConnectionStateWriter(context.workspaceState, CONFIG_KEY)
@@ -302,6 +331,16 @@ function activate(context) {
             }
             return
           }
+          if (message.type === 'context.clear' || message.type === 'context.compact') {
+            await dispatchContextCommand({
+              message,
+              getRuntime: ensureRuntime,
+              isCurrent: (candidate) => runtime === candidate,
+              confirmClear: confirmContextClear,
+              post: (response) => webview.postMessage(response),
+            })
+            return
+          }
           await (await ensureRuntime()).handle(message)
           if (message.type === 'session.reconcile') topology?.start()
         } catch (error) {
@@ -324,4 +363,4 @@ function activate(context) {
 
 function deactivate() {}
 
-module.exports = { activate, configure, deactivate, resolveConnection, tokenRequired, webSocketBase }
+module.exports = { activate, configure, confirmContextClear, dispatchContextCommand, deactivate, resolveConnection, tokenRequired, webSocketBase }

@@ -9,6 +9,8 @@ const ALLOWED = new Set([
   'session.select',
   'http.history',
   'http.interrupt',
+  'context.compact',
+  'context.clear',
   'ws.open',
   'ws.send',
   'ws.close',
@@ -48,6 +50,9 @@ function allowedMessage(message) {
       return hasText(message.session) && hasText(message.creature)
     case 'ws.send':
       return hasText(message.data)
+    case 'context.compact':
+    case 'context.clear':
+      return Object.keys(message).every((field) => field === 'type' || field === 'id')
     default:
       return true
   }

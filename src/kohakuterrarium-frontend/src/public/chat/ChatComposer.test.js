@@ -98,6 +98,33 @@ describe("ChatComposer", () => {
     })
   })
 
+  it("awaits host attachment transforms and silently discards superseded work", async () => {
+    let resolve
+    const transformed = new Promise((done) => (resolve = done))
+    const wrapper = mountComposer({ attachmentTransform: () => transformed })
+    const input = wrapper.findAll('input[type="file"]')[1]
+    Object.defineProperty(input.element, "files", {
+      configurable: true,
+      value: [file("notes.txt", "text/plain")],
+    })
+    await input.trigger("change")
+    expect(wrapper.emitted("update:attachments")).toBeUndefined()
+    resolve(file("converted.txt", "text/plain"))
+    await flushPromises()
+    expect(wrapper.emitted("update:attachments").at(-1)[0][0].name).toBe("converted.txt")
+
+    const stale = Object.assign(new Error("superseded"), { silent: true })
+    await wrapper.setProps({ attachmentTransform: () => Promise.reject(stale) })
+    Object.defineProperty(input.element, "files", {
+      configurable: true,
+      value: [file("old.txt", "text/plain")],
+    })
+    await input.trigger("change")
+    await flushPromises()
+    expect(wrapper.emitted("update:attachments")).toHaveLength(1)
+    expect(wrapper.emitted("error")).toBeUndefined()
+  })
+
   it("handles focused file paste and drop while leaving text paste native", async () => {
     const wrapper = mountComposer()
     const textarea = wrapper.find("textarea")
@@ -169,6 +196,13 @@ describe("ChatComposer", () => {
     await wrapper.get('button[aria-label="Clear context"]').trigger("click")
     expect(wrapper.emitted("compact")).toHaveLength(1)
     expect(wrapper.emitted("clear")).toHaveLength(1)
+    await wrapper.setProps({ contextActionsDisabled: true })
+    expect(wrapper.get('button[aria-label="Compact context"]').attributes()).toHaveProperty(
+      "disabled",
+    )
+    expect(wrapper.get('button[aria-label="Clear context"]').attributes()).toHaveProperty(
+      "disabled",
+    )
     await wrapper.setProps({ disabled: true, modelValue: "text" })
     expect(wrapper.find("textarea").attributes()).toHaveProperty("disabled")
     expect(wrapper.get('button[aria-label="Send message"]').attributes()).toHaveProperty("disabled")

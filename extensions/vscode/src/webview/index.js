@@ -1,4 +1,5 @@
 import {
+  buildMessageParts,
   ChatComposer,
   ChatTranscriptSection,
   ConversationMessage,
@@ -10,10 +11,17 @@ import { computed, createApp, h, nextTick, onBeforeUnmount, ref, watch } from 'v
 import { useChatStore } from '@/stores/chat'
 
 import { BridgeWebSocket } from './bridge.js'
+import { renderCarbonIcon } from './carbonIcons.mjs'
+import { applyContextCommandOutcome } from './contextCommandResult.mjs'
 import {
   createConversationMessageOrchestrator,
   createConversationScrollController,
 } from './conversationScroll.mjs'
+import {
+  createConversationAttachments,
+  createConversationOwnership,
+  isConversationSuperseded,
+} from './conversationOwnership.mjs'
 import { createReadyCoordinator } from './readyCoordinator.mjs'
 import { createSelectionVersionOwner } from './selectionVersion.mjs'
 import { createSessionShell } from './sessionShell.js'
@@ -56,13 +64,39 @@ const App = {
     const sessions = ref([])
     const currentSession = ref(null)
     const draft = ref('')
+    const attachmentBuckets = createConversationAttachments(() => ({
+      readyId: latestReadyRequestId,
+      runtimeId: currentSession.value?.session?.runtimeId,
+      creatureId: currentSession.value?.targetCreatureId,
+    }))
+    const attachmentRevision = ref(0)
+    const attachments = computed({
+      get: () => {
+        attachmentRevision.value
+        return attachmentBuckets.get()
+      },
+      set: (value) => {
+        attachmentBuckets.set(value)
+        attachmentRevision.value += 1
+      },
+    })
     const error = ref('')
+    const status = ref('')
     const busy = ref(false)
+    const contextBusy = ref(false)
     const sessionsExpanded = ref(false)
     const brandUri = document.querySelector('#app')?.dataset.brandUri || ''
     let reconciliation = Promise.resolve()
+    let contextOperation = 0
     const selectionVersions = createSelectionVersionOwner()
     let activeSelectionReadyId = null
+    const conversationOwnership = createConversationOwnership(() => ({
+      readyId: latestReadyRequestId,
+      runtimeId: currentSession.value?.session?.runtimeId,
+      creatureId: currentSession.value?.targetCreatureId,
+      name: currentSession.value?.target,
+    }))
+    const attachmentTransform = conversationOwnership.transform((file) => file)
     const selectionRequest = async (type, data) => {
       const result = await request(type, data)
       if (result.readyId !== latestReadyRequestId && result.readyId !== activeSelectionReadyId) return result
@@ -90,6 +124,7 @@ const App = {
       const creature = currentSession.value?.targetCreatureId
       return session && creature ? `${session}:${creature}` : ''
     })
+    watch(scrollIdentity, () => (attachmentRevision.value += 1))
     const scroll = createConversationScrollController({
       schedule: (callback) => nextTick(callback),
     })
@@ -183,7 +218,11 @@ const App = {
 
     let latestReadyRequestId = null
     const readyCoordinator = createReadyCoordinator({
-      requestReady: () => request('ready', {}, (id) => (latestReadyRequestId = id)),
+      requestReady: () =>
+        request('ready', {}, (id) => {
+          latestReadyRequestId = id
+          attachmentRevision.value += 1
+        }),
       async applyReady(result, isCurrent) {
         if (result.available === true) {
           activeSelectionReadyId = result.readyId
@@ -269,12 +308,66 @@ const App = {
       }
     }
 
-    function send({ text = draft.value } = {}) {
-      const content = text.trim()
-      if (!content || !currentSession.value?.target) return
-      scroll.forceFollow()
-      chat.send(content)
-      draft.value = ''
+    async function send({ text = draft.value, attachments: submittedAttachments = attachments.value } = {}) {
+      if ((!text.trim() && submittedAttachments.length === 0) || !currentSession.value?.target) return
+      const submittedText = text
+      const submitted = [...submittedAttachments]
+      const submittedOwner = attachmentBuckets.capture()
+      try {
+        await conversationOwnership.run(async (assertCurrent) => {
+          const content = submitted.length
+            ? await buildMessageParts(submittedText, submitted)
+            : submittedText
+          assertCurrent()
+          scroll.forceFollow()
+          await chat.send(content)
+        })
+        if (
+          draft.value === submittedText &&
+          attachments.value.length === submitted.length &&
+          attachments.value.every((attachment, index) => attachment === submitted[index])
+        ) {
+          draft.value = ''
+          attachmentBuckets.clear(submittedOwner)
+          attachmentRevision.value += 1
+        }
+        error.value = ''
+      } catch (cause) {
+        if (!isConversationSuperseded(cause)) error.value = cause?.message || String(cause)
+      }
+    }
+
+    async function manageContext(type) {
+      if (!available.value || !currentSession.value?.target || busy.value || contextBusy.value) return
+      const ownedReadyId = activeSelectionReadyId
+      const ownedTarget = currentSession.value.targetCreatureId
+      const operation = ++contextOperation
+      const isCurrent = () =>
+        operation === contextOperation &&
+        ownedReadyId === activeSelectionReadyId &&
+        ownedTarget === currentSession.value?.targetCreatureId
+      contextBusy.value = true
+      error.value = ''
+      status.value = ''
+      try {
+        const response = await request(type)
+        applyContextCommandOutcome(response, isCurrent(), (kind, text) => {
+          if (kind === 'error') error.value = text
+          else status.value = text
+        })
+      } catch (cause) {
+        if (isCurrent()) error.value = cause?.message || String(cause)
+      } finally {
+        if (operation === contextOperation) contextBusy.value = false
+      }
+    }
+
+    function onComposerError(problem) {
+      error.value =
+        problem?.error?.message ||
+        (problem?.code === 'too-large'
+          ? `${problem.name} is too large to attach`
+          : `Could not attach ${problem?.name || 'file'}`)
     }
 
     function submitReply(message, actionId, values) {
@@ -444,7 +537,8 @@ const App = {
               ])
             : null,
         ]),
-        error.value ? h('p', { class: 'status', role: 'status' }, error.value) : null,
+        error.value ? h('p', { class: 'status is-error', role: 'alert' }, error.value) : null,
+        status.value ? h('p', { class: 'status', role: 'status', 'aria-live': 'polite' }, status.value) : null,
         h('section', { class: 'chat-region' }, [
           h(ChatTranscriptSection, {
             messages: messages.value,
@@ -468,23 +562,38 @@ const App = {
           currentSession.value?.target
             ? h(ChatComposer, {
                 modelValue: draft.value,
+                attachments: attachments.value,
                 processing: !!chat.processingByTab[tab.value],
                 disabled: !currentSession.value?.target,
+                contextActionsDisabled:
+                  busy.value ||
+                  contextBusy.value ||
+                  !available.value ||
+                  !!chat.processingByTab[tab.value],
                 managedSubmit: true,
-                showContextActions: false,
-                showAttachmentActions: false,
+                attachmentTransform,
+                showContextActions: true,
                 placeholder: 'Send to selected Creature',
                 labels: {
                   attachFile: 'Attach file',
                   attachImage: 'Attach image',
+                  compact: 'Compact context',
+                  clear: 'Clear context',
                   message: 'Message',
                   removeAttachment: 'Remove {name}',
                   send: 'Send',
                   stop: 'Stop generation',
                 },
                 'onUpdate:modelValue': (value) => (draft.value = value),
+                'onUpdate:attachments': (value) => (attachments.value = value),
                 onSubmit: send,
                 onInterrupt: () => chat.interrupt(tab.value),
+                onCompact: () => manageContext('context.compact'),
+                onClear: () => manageContext('context.clear'),
+                onError: onComposerError,
+              }, {
+                'compact-icon': () => renderCarbonIcon('collapse-all'),
+                'clear-icon': () => renderCarbonIcon('clean'),
               })
             : h('p', { class: 'composer-placeholder' }, 'Select a Session to start chatting'),
         ]),

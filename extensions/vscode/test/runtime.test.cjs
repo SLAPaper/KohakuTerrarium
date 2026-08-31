@@ -48,6 +48,11 @@ function harness() {
     }),
     history: async () => ({ events: [] }),
     interrupt: async () => ({ ok: true }),
+    commandCalls: [],
+    async creatureCommand(session, creature, command, args) {
+      this.commandCalls.push({ session, creature, command, args })
+      return { ok: true }
+    },
   }
   const state = {
     selection: null,
@@ -529,4 +534,47 @@ test('history and interrupt always use the persisted selected target', async () 
   ])
   assert.equal(posts[0].type, 'http.history.result')
   assert.equal(posts[1].type, 'http.interrupt.result')
+})
+
+test('context actions bind fixed commands to the current Host selection', async () => {
+  const { client, host, posts, state } = harness()
+  state.selection = { session: 'graph-live', creature: 'beta', targetCreatureId: 'creature-beta' }
+
+  await host.handle({ type: 'context.compact', id: 50 })
+  await host.handle({ type: 'context.clear', id: 51 })
+
+  assert.deepEqual(client.commandCalls, [
+    { session: 'graph-live', creature: 'beta', command: 'compact', args: '' },
+    { session: 'graph-live', creature: 'beta', command: 'clear', args: '--force' },
+  ])
+  assert.deepEqual(posts.map(({ type, id }) => ({ type, id })), [
+    { type: 'context.compact.result', id: 50 },
+    { type: 'context.clear.result', id: 51 },
+  ])
+})
+
+test('context actions preserve the backend response payload exactly', async () => {
+  const { client, host, posts, state } = harness()
+  const payload = { error: 'logical failure', notify: { message: 'notice' }, data: { message: 'detail' }, output: 'text' }
+  state.selection = { session: 'graph-live', creature: 'beta', targetCreatureId: 'creature-beta' }
+  client.creatureCommand = async () => payload
+
+  await host.handle({ type: 'context.compact', id: 53 })
+
+  assert.strictEqual(posts[0].data, payload)
+})
+
+test('context action fails closed when selection ownership changes during request', async () => {
+  const { client, host, posts, state } = harness()
+  const command = deferred()
+  state.selection = { session: 'graph-live', creature: 'beta', targetCreatureId: 'creature-beta' }
+  client.creatureCommand = () => command.promise
+
+  const pending = host.handle({ type: 'context.compact', id: 52 })
+  await Promise.resolve()
+  state.selection = { session: 'other', creature: 'other', targetCreatureId: 'other' }
+  command.resolve({ ok: true })
+
+  await assert.rejects(pending, /ownership changed/)
+  assert.deepEqual(posts, [])
 })

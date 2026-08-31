@@ -26,8 +26,8 @@
       <textarea ref="textarea" :value="modelValue" rows="1" :placeholder="placeholder" :aria-label="label('message', {}, placeholder || 'Message')" :aria-autocomplete="ariaAutocomplete" :aria-expanded="ariaExpanded" :aria-controls="ariaControls" :aria-activedescendant="ariaActivedescendant" :role="inputRole" :disabled="disabled" @input="onInput" @keydown="onKeydown" @paste="onPaste" @focus="onFocus" @blur="onBlur" />
 
       <template v-if="showContextActions && !(compactMode && active)">
-        <button type="button" :aria-label="label('compact')" :title="label('compact')" :disabled="disabled" @click="$emit('compact')"><slot name="compact-icon">⇤</slot></button>
-        <button type="button" :aria-label="label('clear')" :title="label('clear')" :disabled="disabled" @click="$emit('clear')"><slot name="clear-icon">⌫</slot></button>
+        <button type="button" :aria-label="label('compact')" :title="label('compact')" :disabled="disabled || contextActionsDisabled" @click="$emit('compact')"><slot name="compact-icon">⇤</slot></button>
+        <button type="button" :aria-label="label('clear')" :title="label('clear')" :disabled="disabled || contextActionsDisabled" @click="$emit('clear')"><slot name="clear-icon">⌫</slot></button>
       </template>
       <button v-if="processing" type="button" class="kt-chat-composer__primary" :aria-label="label('stop')" :title="label('stop')" :disabled="disabled" @click="$emit('interrupt')"><slot name="stop-icon">■</slot></button>
       <button v-else type="button" class="kt-chat-composer__primary" :aria-label="label('send')" :title="label('send')" :disabled="disabled || !canSubmit" @click="submit"><slot name="send-icon">➤</slot></button>
@@ -41,8 +41,8 @@
           <button type="button" :aria-label="label('attachImage')" @click="secondaryAction(openImage)">
             <slot name="image-icon">▧</slot><span>{{ label("attachImage") }}</span>
           </button>
-          <button v-if="showContextActions" type="button" :aria-label="label('compact')" @click="secondaryAction(() => $emit('compact'))"><slot name="compact-icon">⇤</slot></button>
-          <button v-if="showContextActions" type="button" :aria-label="label('clear')" @click="secondaryAction(() => $emit('clear'))"><slot name="clear-icon">⌫</slot></button>
+          <button v-if="showContextActions" type="button" :aria-label="label('compact')" :disabled="disabled || contextActionsDisabled" @click="secondaryAction(() => $emit('compact'))"><slot name="compact-icon">⇤</slot></button>
+          <button v-if="showContextActions" type="button" :aria-label="label('clear')" :disabled="disabled || contextActionsDisabled" @click="secondaryAction(() => $emit('clear'))"><slot name="clear-icon">⌫</slot></button>
         </div>
       </template>
     </div>
@@ -62,6 +62,7 @@ const props = defineProps({
   disabled: { type: Boolean, default: false },
   compactMode: { type: Boolean, default: false },
   showContextActions: { type: Boolean, default: true },
+  contextActionsDisabled: { type: Boolean, default: false },
   showAttachmentActions: { type: Boolean, default: true },
   touch: { type: Boolean, default: false },
   managedSubmit: { type: Boolean, default: false },
@@ -153,12 +154,17 @@ function secondaryAction(fn) {
   secondaryOpen.value = false
   fn()
 }
-function addFiles(files, kind, source = "file") {
-  const normalized = Array.from(files || []).map((file) => props.attachmentTransform?.(file, kind || undefined, source) || file)
-  const result = validateAttachments(normalized, { kind, maxAttachmentBytes: props.maxAttachmentBytes, maxImageBytes: props.maxImageBytes })
-  for (const error of result.errors) emit("error", error)
-  if (result.attachments.length) emit("update:attachments", [...props.attachments, ...result.attachments])
-  return result.attachments.length > 0
+async function addFiles(files, kind, source = "file") {
+  try {
+    const normalized = await Promise.all(Array.from(files || []).map(async (file) => (await props.attachmentTransform?.(file, kind || undefined, source)) || file))
+    const result = validateAttachments(normalized, { kind, maxAttachmentBytes: props.maxAttachmentBytes, maxImageBytes: props.maxImageBytes })
+    for (const error of result.errors) emit("error", error)
+    if (result.attachments.length) emit("update:attachments", [...props.attachments, ...result.attachments])
+    return result.attachments.length > 0
+  } catch (error) {
+    if (!error?.silent) emit("error", { code: "read-failed", error })
+    return false
+  }
 }
 function onFileChange(event, kind) {
   addFiles(event.target.files, kind, "file")
@@ -171,7 +177,7 @@ function removeAttachment(index) {
     props.attachments.filter((_, itemIndex) => itemIndex !== index),
   )
 }
-function onPaste(event) {
+async function onPaste(event) {
   emit("paste", event)
   if (event.defaultPrevented || props.disabled || !event.clipboardData) return
   const files = Array.from(event.clipboardData.files || [])
@@ -183,7 +189,10 @@ function onPaste(event) {
       }
     }
   }
-  if (files.length && addFiles(files, undefined, "paste")) event.preventDefault()
+  if (files.length) {
+    event.preventDefault()
+    await addFiles(files, undefined, "paste")
+  }
 }
 function setDragOver(value) {
   dragOver.value = value
