@@ -1,6 +1,11 @@
+import { readFileSync } from "node:fs"
+import { fileURLToPath } from "node:url"
+
+import { compileStyle, parse } from "@vue/compiler-sfc"
 import { flushPromises, mount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
 import { ElMessage, ElMessageBox } from "element-plus"
+import { defineComponent, h, onMounted, ref } from "vue"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import ChatPanel from "./ChatPanel.vue"
@@ -277,6 +282,59 @@ describe("ChatPanel render window", () => {
     }
   }
 
+  it.each(["text/uri-list", "text/plain"])(
+    "prevents a %s drop on the conversation bubble without adding an attachment",
+    async (type) => {
+      const chat = useChatStore("graph_1")
+      chat.messagesByTab = { kohaku: [] }
+      const wrapper = mountPanel(chat)
+      await flushPromises()
+      const transcript = wrapper.findComponent({ name: "ChatTranscriptSection" })
+      const bubble = transcript.element.parentElement
+      const dataTransfer = { types: [type], files: [] }
+      const dragOver = new Event("dragover", { bubbles: true, cancelable: true })
+      Object.defineProperty(dragOver, "dataTransfer", { value: dataTransfer })
+      const event = new Event("drop", { bubbles: true, cancelable: true })
+      Object.defineProperty(event, "dataTransfer", { value: dataTransfer })
+
+      bubble.dispatchEvent(dragOver)
+      bubble.dispatchEvent(event)
+      await flushPromises()
+
+      expect(dragOver.defaultPrevented).toBe(true)
+      expect(event.defaultPrevented).toBe(true)
+      expect(wrapper.vm.attachments).toEqual([])
+    },
+  )
+
+  it("uses the rendered transcript scroll viewport as the image query container", async () => {
+    const chat = useChatStore("graph_1")
+    chat.messagesByTab = { kohaku: [] }
+    const wrapper = mountPanel(chat)
+    await flushPromises()
+
+    const transcript = wrapper.findComponent({ name: "ChatTranscriptSection" })
+    const viewport = transcript.get(".kt-transcript-viewport")
+    expect(viewport.classes()).toContain("chat-messages-viewport")
+
+    const source = readFileSync(fileURLToPath(import.meta.resolve("./ChatPanel.vue")), "utf8")
+    const { descriptor } = parse(source, { filename: "ChatPanel.vue" })
+    expect(descriptor.styles).toEqual(
+      expect.arrayContaining([expect.objectContaining({ scoped: true, src: "./chat-panel.css" })]),
+    )
+    const cssSource = readFileSync(fileURLToPath(import.meta.resolve("./chat-panel.css")), "utf8")
+    const { code, errors } = compileStyle({
+      filename: "ChatPanel.vue",
+      id: "data-v-chat-panel",
+      source: cssSource,
+      scoped: true,
+    })
+    expect(errors).toEqual([])
+    expect(code).toMatch(
+      /\[data-v-chat-panel\]\s+\.chat-messages-viewport\s*{[^}]*container-type:\s*size/s,
+    )
+  })
+
   it("renders only the newest window for a very long transcript", async () => {
     const chat = useChatStore("graph_1")
     seedMessages(chat, 450)
@@ -339,6 +397,74 @@ describe("ChatPanel render window", () => {
     expect(renderedIds(wrapper).length).toBe(400)
     expect(renderedIds(wrapper).at(-1)).toBe("m_420")
     expect(renderedIds(wrapper)).not.toContain("m_0")
+  })
+
+  it("keeps a later uniquely-id'd message mounted when an earlier message is removed", async () => {
+    const chat = useChatStore("graph_1")
+    seedMessages(chat, 3)
+    const mounts = new Map()
+    const MessageStub = defineComponent({
+      props: {
+        message: { type: Object, required: true },
+        messageIdx: { type: Number, required: true },
+      },
+      setup(props) {
+        const messageId = props.message.id
+        const expanded = ref(false)
+        onMounted(() => mounts.set(messageId, (mounts.get(messageId) || 0) + 1))
+        return () =>
+          h(
+            "button",
+            {
+              class: "identity-stub",
+              "data-index": props.messageIdx,
+              "data-message-id": messageId,
+              onClick: () => (expanded.value = !expanded.value),
+            },
+            expanded.value
+              ? `expanded:${props.message.content}`
+              : `collapsed:${props.message.content}`,
+          )
+      },
+    })
+    chat._instanceId = "graph_1"
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "kohaku"
+    chat.tabs = ["kohaku"]
+    chat.commandInventoryByTab = { kohaku: { commands: [], skills: [] } }
+    chat._commandInventoryFetchedAtByTab = { kohaku: Date.now() }
+    const wrapper = mount(ChatPanel, {
+      props: {
+        instance: {
+          id: "graph_1",
+          graph_id: "graph_1",
+          creatures: [{ name: "kohaku", status: "idle" }],
+        },
+      },
+      global: {
+        provide: { chatStore: chat },
+        stubs: {
+          ChatMessage: MessageStub,
+          ModelSwitcher: true,
+          SiteChip: true,
+          StatusDot: true,
+        },
+      },
+    })
+    await flushPromises()
+    const later = wrapper.get('[data-message-key="m_2"]')
+    const laterNode = later.element
+    await later.trigger("click")
+    expect(later.text()).toBe("expanded:message 2")
+
+    chat.messagesByTab.kohaku.splice(0, 1)
+    await flushPromises()
+
+    const retained = wrapper.get('[data-message-key="m_2"]')
+    expect(retained.element).toBe(laterNode)
+    expect(retained.attributes("data-index")).toBe("1")
+    expect(retained.text()).toBe("expanded:message 2")
+    expect(mounts.get("m_2")).toBe(1)
   })
 
   it("does not let a pending frame from the previous tab overwrite the new tab position", async () => {

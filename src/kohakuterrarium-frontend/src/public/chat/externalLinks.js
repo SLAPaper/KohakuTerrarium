@@ -1,5 +1,9 @@
+function currentOrigin() {
+  return globalThis.location?.origin || null
+}
+
 /** Whether `href` points at an http(s) resource outside `origin`. */
-export function isExternalUrl(href, origin = null) {
+export function isExternalUrl(href, origin = currentOrigin()) {
   if (!href) return false
   let url
   try {
@@ -13,7 +17,7 @@ export function isExternalUrl(href, origin = null) {
 }
 
 /** Teach a markdown-it instance to render external links as `_blank`. */
-export function applyExternalLinkRule(md, origin = null) {
+export function applyExternalLinkRule(md, origin = currentOrigin()) {
   const fallback =
     md.renderer.rules.link_open ||
     ((tokens, idx, options, env, self) => self.renderToken(tokens, idx, options, env, self))

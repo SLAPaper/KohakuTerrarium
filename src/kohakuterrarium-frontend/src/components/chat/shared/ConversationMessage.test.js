@@ -1,6 +1,13 @@
 import { mount } from "@vue/test-utils"
 import { defineComponent, h } from "vue"
-import { describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
+
+const { computeRenderGroupsSpy } = vi.hoisted(() => ({ computeRenderGroupsSpy: vi.fn() }))
+vi.mock("../../../public/chat/chatToolGrouping.js", async (importOriginal) => {
+  const actual = await importOriginal()
+  computeRenderGroupsSpy.mockImplementation(actual.computeRenderGroups)
+  return { ...actual, computeRenderGroups: computeRenderGroupsSpy }
+})
 
 import ConversationMessage from "./ConversationMessage"
 
@@ -20,6 +27,10 @@ const ToolRenderer = defineComponent({
 })
 
 describe("ConversationMessage", () => {
+  beforeEach(() => {
+    computeRenderGroupsSpy.mockClear()
+  })
+
   it("renders user and assistant messages with one semantic visual contract", () => {
     const user = mount(ConversationMessage, {
       props: {
@@ -316,6 +327,58 @@ describe("ConversationMessage", () => {
     expect(card.text()).toContain("Footer")
     expect(card.findAll("a")).toHaveLength(1)
     expect(card.get("a").attributes("href")).toBe("https://example.com/")
+  })
+
+  it.each([
+    ["assistant", "blob:https://app.test/image"],
+    ["assistant", "images/result.png"],
+    ["assistant", "/api/artifacts/result.png"],
+    ["assistant", "data:image/png;base64,AAAA"],
+    ["user", "blob:https://app.test/user"],
+    ["user", "images/user.png"],
+    ["channel", "blob:https://app.test/channel"],
+    ["channel", "images/channel.png"],
+  ])("renders the existing Dashboard %s image URL %s verbatim", (role, url) => {
+    const image = { type: "image_url", image_url: { url } }
+    const wrapper = mount(ConversationMessage, {
+      props: {
+        message:
+          role === "assistant"
+            ? { role, parts: [image] }
+            : {
+                role,
+                contentParts: [image],
+                ...(role === "channel" ? { sender: "worker" } : {}),
+              },
+      },
+    })
+
+    expect(wrapper.get("img").attributes("src")).toBe(url)
+  })
+
+  it("does not recompute assistant tool groups for an unrelated prop rerender", async () => {
+    computeRenderGroupsSpy.mockClear()
+    const parts = [
+      { type: "tool", id: "read-1", name: "read", status: "done" },
+      { type: "tool", id: "read-2", name: "read", status: "done" },
+      { type: "tool", id: "bash-1", name: "bash", status: "running" },
+    ]
+    const message = { id: "assistant", role: "assistant", parts }
+    const wrapper = mount(ConversationMessage, { props: { message, bare: false } })
+
+    const callsAfterMount = computeRenderGroupsSpy.mock.calls.length
+    expect(callsAfterMount).toBeGreaterThanOrEqual(1)
+    expect(computeRenderGroupsSpy).toHaveBeenLastCalledWith(parts)
+
+    await wrapper.setProps({ bare: true })
+
+    expect(computeRenderGroupsSpy).toHaveBeenCalledTimes(callsAfterMount)
+
+    const nextParts = [...parts, { type: "text", id: "follow-up", content: "updated" }]
+    await wrapper.setProps({ message: { ...message, parts: nextParts } })
+
+    expect(computeRenderGroupsSpy).toHaveBeenCalledTimes(callsAfterMount + 1)
+    expect(computeRenderGroupsSpy).toHaveBeenLastCalledWith(nextParts)
   })
 
   it("rejects unsafe image URLs and preserves clear-message counts", () => {

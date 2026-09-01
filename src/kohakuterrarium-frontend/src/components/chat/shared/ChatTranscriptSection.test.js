@@ -143,10 +143,10 @@ describe("ChatTranscriptSection", () => {
     const messageKeys = list.children
       .filter((child) => child.type === Message)
       .map((child) => child.key)
-    expect(messageKeys).toEqual([
-      "message:id:string:duplicate:index:0",
-      "message:id:string:duplicate:index:1",
-    ])
+    expect(messageKeys).toHaveLength(2)
+    expect(messageKeys[0]).toMatch(/^message:id:string:duplicate:object:/)
+    expect(messageKeys[1]).toMatch(/^message:id:string:duplicate:object:/)
+    expect(new Set(messageKeys).size).toBe(2)
   })
 
   it("retains a later duplicate-id renderer when expanding the window earlier", async () => {
@@ -183,6 +183,33 @@ describe("ChatTranscriptSection", () => {
     const keys = list.children.filter((child) => child.type === Message).map((child) => child.key)
     expect(keys[1]).toBe(initialKey)
     expect(new Set(keys).size).toBe(keys.length)
+  })
+
+  it("retains a surviving duplicate-id renderer after its sibling is removed", async () => {
+    const mounted = vi.fn()
+    const unmounted = vi.fn()
+    const Message = {
+      props: ["message"],
+      mounted,
+      unmounted,
+      template: '<div class="duplicate-collapse-message">{{ message.content }}</div>',
+    }
+    const removed = { id: "duplicate", content: "removed" }
+    const retained = { id: "duplicate", content: "retained" }
+    const wrapper = mount(ChatTranscriptSection, {
+      props: {
+        messages: [removed, retained],
+        renderMessage: (message) => h(Message, { message }),
+      },
+    })
+    const retainedElement = wrapper.findAll(".duplicate-collapse-message")[1].element
+
+    await wrapper.setProps({ messages: [retained] })
+    await nextTick()
+
+    expect(wrapper.find(".duplicate-collapse-message").element).toBe(retainedElement)
+    expect(mounted).toHaveBeenCalledTimes(2)
+    expect(unmounted).toHaveBeenCalledTimes(1)
   })
 
   it("declares reduced-motion handling for the processing pulse", async () => {

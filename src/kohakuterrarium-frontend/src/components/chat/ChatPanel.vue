@@ -244,8 +244,15 @@ function onBubbleDragLeave(ev) {
   if (props.groupId) tabDrag.onBubbleDragLeave(ev, props.groupId)
 }
 function onBubbleDragOver(ev) {
-  if (!props.readOnly && hasDraggedFiles(ev)) ev.preventDefault()
-  else if (props.groupId) tabDrag.onBubbleDragOver(ev, props.groupId)
+  const types = Array.from(ev.dataTransfer?.types || [])
+  const isTabDrag = props.groupId && types.includes("application/x-kt-tab")
+  if (isTabDrag) {
+    tabDrag.onBubbleDragOver(ev, props.groupId)
+    return
+  }
+  if (hasDraggedFiles(ev) || types.includes("text/uri-list") || types.includes("text/plain")) {
+    ev.preventDefault()
+  }
 }
 
 const activeQueue = computed(() => {
@@ -363,6 +370,7 @@ const showKohakUwUingIndicator = computed(() => {
 
 function onTranscriptViewportReady(viewport) {
   messagesEl.value = viewport
+  viewport.classList.add("chat-messages-viewport")
 }
 
 function renderTranscriptMessage(message, context) {
@@ -604,14 +612,13 @@ watch(inputText, () => {
 function onBubbleDrop(e) {
   fileDragDepth = 0
   dragOver.value = false
+  e.preventDefault()
   if (!props.readOnly && hasDraggedFiles(e)) {
-    e.preventDefault()
     e.stopPropagation()
     composerEl.value?.addFiles(e.dataTransfer?.files || [], undefined, "drop")
     return
   }
   if (!props.groupId || !Array.from(e.dataTransfer?.types || []).includes("application/x-kt-tab")) return
-  e.preventDefault()
   e.stopPropagation()
   tabDrag.onBubbleDrop(e, props.groupId)
 }

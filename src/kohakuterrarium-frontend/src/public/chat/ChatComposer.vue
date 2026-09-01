@@ -1,5 +1,5 @@
 <template>
-  <div class="kt-chat-composer" :class="{ 'is-dragging': dragOver }" @dragenter.prevent="onDragEnter" @dragleave.prevent="onDragLeave" @dragover.prevent @drop.prevent="onDrop">
+  <div class="kt-chat-composer" :class="{ 'is-dragging': dragOver }" @dragenter.prevent="onDragEnter" @dragleave.prevent="onDragLeave" @dragover.prevent @drop.prevent.stop="onDrop">
     <div v-if="showAttachmentActions && attachments.length" class="kt-chat-composer__attachments">
       <span v-for="(attachment, index) in attachments" :key="attachment.id || `${attachment.name}:${index}`" class="kt-chat-composer__chip">
         <slot name="attachment-icon" :attachment="attachment"

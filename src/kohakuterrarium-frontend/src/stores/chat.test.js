@@ -8,6 +8,12 @@ beforeEach(() => {
   setActivePinia(createPinia())
 })
 
+afterEach(() => {
+  useChatStore()._clearBranchResyncTimers()
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
+
 describe("chat store — websocket ownership", () => {
   const OriginalWebSocket = globalThis.WebSocket
 
@@ -1044,6 +1050,37 @@ describe("chat store — slash commands", () => {
       command: "goal",
       args: "set X",
     })
+  })
+
+  it("sends channel text over HTTP while its existing websocket is closed", async () => {
+    const chat = useChatStore()
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "ch:team"
+    chat.messagesByTab = { "ch:team": [] }
+    const wsSend = vi.fn()
+    chat._ws = { readyState: WebSocket.CLOSED, send: wsSend }
+
+    const importActual = await vi.importActual("@/utils/api")
+    const channelSpy = vi.spyOn(importActual.terrariumAPI, "sendToChannel").mockResolvedValue({})
+
+    try {
+      await chat.send([{ type: "text", text: "hello team" }])
+
+      expect(channelSpy).toHaveBeenCalledWith(
+        "graph_1",
+        "team",
+        [{ type: "text", text: "hello team" }],
+        "human",
+      )
+      expect(wsSend).not.toHaveBeenCalled()
+      expect(chat.messagesByTab["ch:team"]).toHaveLength(1)
+      expect(chat.messagesByTab["ch:team"][0]).toMatchObject({
+        role: "user",
+        content: "hello team",
+      })
+    } finally {
+      channelSpy.mockRestore()
+    }
   })
 
   it("sends slash-prefixed channel text to the channel instead", async () => {

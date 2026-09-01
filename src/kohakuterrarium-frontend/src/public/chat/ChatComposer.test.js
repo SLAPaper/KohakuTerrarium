@@ -138,7 +138,14 @@ describe("ChatComposer", () => {
     expect(wrapper.emitted("update:attachments").at(-1)[0][0].kind).toBe("image")
 
     const dropped = file("notes.txt", "text/plain")
-    await wrapper.trigger("drop", { dataTransfer: { files: [dropped] } })
+    const parentDrop = vi.fn()
+    wrapper.element.parentElement.addEventListener("drop", parentDrop)
+    const dropEvent = new Event("drop", { bubbles: true, cancelable: true })
+    Object.defineProperty(dropEvent, "dataTransfer", { value: { files: [dropped] } })
+    wrapper.element.dispatchEvent(dropEvent)
+    await flushPromises()
+    expect(dropEvent.defaultPrevented).toBe(true)
+    expect(parentDrop).not.toHaveBeenCalled()
     expect(wrapper.emitted("update:attachments").at(-1)[0][0]).toMatchObject({
       name: "notes.txt",
       kind: "file",

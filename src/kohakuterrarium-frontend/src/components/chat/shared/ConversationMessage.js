@@ -1,4 +1,4 @@
-import { defineComponent, h, reactive, ref } from "vue"
+import { computed, defineComponent, h, reactive, ref } from "vue"
 
 import "./conversation-message.css"
 
@@ -24,8 +24,9 @@ function safeExternalUrl(value) {
 
 function safeImageUrl(value) {
   if (typeof value !== "string") return ""
-  if (value.startsWith("data:image/")) return value
+  if (value.startsWith("data:image/") || value.startsWith("blob:")) return value
   if (value.startsWith("/") && !value.startsWith("//")) return value
+  if (!/^[a-z][a-z\d+.-]*:/i.test(value) && !value.startsWith("//")) return value
   return safeExternalUrl(value)
 }
 
@@ -306,6 +307,20 @@ export default defineComponent({
     const compactExpanded = ref(false)
     const expandedReasoning = reactive(new Set())
     const compactContentId = `kt-compact-summary-${++compactSummaryId}`
+    const assistantParts = computed(() => {
+      const message = props.message
+      const rawParts = message.parts?.length
+        ? message.parts
+        : [
+            ...(message.content ? [{ type: "text", content: message.content }] : []),
+            ...(message.tool_calls || []).map((tool) => ({ ...tool, type: "tool" })),
+          ]
+      return computeRenderGroups(rawParts).map((group) =>
+        group.type === "tool-batch"
+          ? { type: "tool-batch", id: group.id, tools: group.tools }
+          : group.part,
+      )
+    })
 
     function renderTool(tool) {
       return props.renderTool ? props.renderTool(tool) : h(NativeTool, { tool })
@@ -409,17 +424,7 @@ export default defineComponent({
               onReply: (reply) => emit("reply", reply),
             })
       } else if (role === "assistant") {
-        const rawParts = message.parts?.length
-          ? message.parts
-          : [
-              ...(message.content ? [{ type: "text", content: message.content }] : []),
-              ...(message.tool_calls || []).map((tool) => ({ ...tool, type: "tool" })),
-            ]
-        const parts = computeRenderGroups(rawParts).map((group) =>
-          group.type === "tool-batch"
-            ? { type: "tool-batch", id: group.id, tools: group.tools }
-            : group.part,
-        )
+        const parts = assistantParts.value
         content = parts.length
           ? h(
               "div",
@@ -501,9 +506,16 @@ export default defineComponent({
           h("pre", message.content || ""),
         ])
       } else if (role === "channel") {
+        const channelContent = message.contentParts?.length
+          ? h(
+              "div",
+              { class: "kt-conversation-parts" },
+              message.contentParts.map((part, index) => renderPart(part, index, true)),
+            )
+          : renderedText(props.renderText, message.content, true)
         content = h("section", { class: "kt-conversation-channel" }, [
           h("header", { class: "kt-conversation-author" }, message.sender || "channel"),
-          renderedText(props.renderText, message.content, true),
+          channelContent,
         ])
       } else if (role === "wire_inbound") {
         content = h("section", { class: "kt-conversation-banner is-compact" }, [

@@ -258,6 +258,18 @@ describe("MarkdownRenderer streaming", () => {
     expect(anchor.attributes("target")).toBeUndefined()
   })
 
+  it("keeps an absolute same-origin link navigating inside the app", () => {
+    const href = `${window.location.origin}/sessions/absolute`
+    const wrapper = mount(MarkdownRenderer, {
+      props: { content: `open [the session](${href})`, origin: window.location.origin },
+    })
+
+    const anchor = wrapper.get("a")
+    expect(anchor.attributes("href")).toBe(href)
+    expect(anchor.attributes("target")).toBeUndefined()
+    expect(anchor.attributes("rel")).toBeUndefined()
+  })
+
   it("still renders inline math after the link rule is installed", () => {
     const wrapper = mount(MarkdownRenderer, { props: { content: "$x^2$" } })
 

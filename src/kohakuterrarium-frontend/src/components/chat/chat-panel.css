@@ -1,4 +1,4 @@
-.chat-messages-viewport {
+:deep(.chat-messages-viewport) {
   container-type: size;
 }
 

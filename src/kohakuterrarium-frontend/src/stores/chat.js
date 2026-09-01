@@ -2450,7 +2450,7 @@ const _chatStoreOptions = {
           return { handled: "command", result }
         }
       }
-      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) {
+      if (!tab.startsWith("ch:") && (!this._ws || this._ws.readyState !== WebSocket.OPEN)) {
         throw Error("Chat is not connected")
       }
 

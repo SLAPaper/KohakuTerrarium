@@ -53,7 +53,7 @@
       <span v-if="message.preview" class="i-carbon-chevron-down text-iolite/50 text-[10px] transition-transform" :class="{ 'rotate-180': expandedTools['wire_' + message.id] }" />
     </div>
     <div v-if="expandedTools['wire_' + message.id] && message.preview" class="px-3 py-2 border-t border-iolite/10 dark:border-iolite/15 text-xs max-h-32 overflow-y-auto">
-      <MarkdownRenderer :content="message.preview" />
+      <MarkdownRenderer :content="message.preview" :origin="markdownOrigin" />
     </div>
   </div>
 
@@ -66,7 +66,7 @@
       <span v-if="message.triggerContent" class="i-carbon-chevron-down text-amber/50 text-[10px] transition-transform" :class="{ 'rotate-180': expandedTools['trig_' + message.id] }" />
     </div>
     <div v-if="expandedTools['trig_' + message.id] && message.triggerContent" class="px-3 py-2 border-t border-amber/10 dark:border-amber/15 text-xs max-h-32 overflow-y-auto">
-      <MarkdownRenderer :content="message.triggerContent" />
+      <MarkdownRenderer :content="message.triggerContent" :origin="markdownOrigin" />
     </div>
   </div>
 
@@ -190,7 +190,7 @@
       <template v-if="message.contentParts?.length">
         <div class="flex flex-col gap-2">
           <template v-for="(part, i) in message.contentParts" :key="i">
-            <MarkdownRenderer v-if="part.type === 'text'" :content="part.text || ''" :breaks="true" />
+            <MarkdownRenderer v-if="part.type === 'text'" :content="part.text || ''" :breaks="true" :origin="markdownOrigin" />
             <img v-else-if="part.type === 'image_url'" :src="part.image_url?.url" class="chat-inline-image" />
             <VideoFilePreview v-else-if="part.type === 'file' && part.file?.mime?.startsWith('video/')" :file="part.file" />
             <div v-else-if="part.type === 'file'" class="px-3 py-2 rounded-lg border border-aquamarine/20 bg-aquamarine/5 text-xs text-warm-600 dark:text-warm-300">
@@ -200,7 +200,7 @@
           </template>
         </div>
       </template>
-      <MarkdownRenderer v-else :content="message.content" :breaks="true" />
+      <MarkdownRenderer v-else :content="message.content" :breaks="true" :origin="markdownOrigin" />
     </div>
   </div>
 
@@ -288,8 +288,9 @@ function toggleTool(id) {
   expandedTools[id] = !expandedTools[id]
 }
 
+const markdownOrigin = window.location.origin
 function renderSharedText(content, breaks = false) {
-  return h(MarkdownRenderer, { content, breaks })
+  return h(MarkdownRenderer, { content, breaks, origin: markdownOrigin })
 }
 
 function renderSharedTool(tool) {
