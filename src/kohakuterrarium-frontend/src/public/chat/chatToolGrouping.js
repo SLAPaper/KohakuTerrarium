@@ -1,4 +1,12 @@
-/** Group consecutive plain tool calls into render-friendly chunks. */
+/**
+ * Group assistant-message parts into render-friendly chunks.
+ *
+ * Consecutive plain tool calls become one accordion only when the run
+ * reaches the threshold. Sub-agents and every non-tool part break the run,
+ * while shorter runs remain flat. Each batch ID comes from its first tool,
+ * so the batch ID stays stable as streaming appends later tool calls and the
+ * renderer can preserve expansion state.
+ */
 export const DEFAULT_TOOL_BATCH_THRESHOLD = 3
 
 export function computeRenderGroups(parts, options = {}) {
@@ -18,6 +26,8 @@ export function computeRenderGroups(parts, options = {}) {
   }
 
   for (const part of parts) {
+    // Streaming may insert a null placeholder before a complete part arrives.
+    // Dropping it is required because renderers dereference group.part.type.
     if (!part || typeof part !== "object" || !part.type) continue
     if (part.type === "tool" && part.kind === "tool") {
       run.push(part)
@@ -30,6 +40,7 @@ export function computeRenderGroups(parts, options = {}) {
   return groups
 }
 
+/** Aggregate status and name counts for a tool-batch header. */
 export function summarizeBatch(tools) {
   const counts = { done: 0, running: 0, error: 0, interrupted: 0, other: 0 }
   const names = new Map()

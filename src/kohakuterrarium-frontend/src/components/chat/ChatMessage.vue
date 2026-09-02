@@ -7,7 +7,6 @@
   <!-- Context cleared banner -->
   <ConversationMessage v-else-if="message.role === 'clear'" :message="message" />
 
-  <!-- Context compacted disclosure is shared with Extension. -->
   <ConversationMessage v-else-if="message.role === 'compact'" :message="message" :render-text="renderSharedText" />
 
   <!-- Background result delivered -->
