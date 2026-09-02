@@ -127,7 +127,7 @@
           <span v-if="message.payload?.subtitle" class="text-xs text-warm-500">{{ message.payload.subtitle }}</span>
         </div>
         <div v-if="message.payload?.body" class="text-sm py-2 px-1">
-          <MarkdownRenderer :content="message.payload.body" :breaks="true" />
+          <MarkdownRenderer :content="message.payload.body" :breaks="true" :origin="markdownOrigin" />
         </div>
         <div v-if="(message.payload?.fields || []).length" class="grid gap-x-3 gap-y-1 my-2 px-1" :style="{ gridTemplateColumns: anyInlineField ? '1fr 1fr' : '1fr' }">
           <div v-for="(f, i) in message.payload.fields" :key="i" class="text-xs" :style="!f.inline ? { gridColumn: '1 / -1' } : {}">
@@ -163,6 +163,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits(["reply"])
+const markdownOrigin = window.location.origin
 
 // ── Local form state (per-event) ────────────────────────────────
 const textValue = ref(props.message.payload?.default || "")

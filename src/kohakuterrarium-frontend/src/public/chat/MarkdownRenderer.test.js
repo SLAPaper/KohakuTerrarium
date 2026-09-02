@@ -258,6 +258,17 @@ describe("MarkdownRenderer streaming", () => {
     expect(anchor.attributes("target")).toBeUndefined()
   })
 
+  it("does not infer a host origin for absolute URLs", () => {
+    const href = `${window.location.origin}/sessions/unbound`
+    const wrapper = mount(MarkdownRenderer, {
+      props: { content: `open [the session](${href})` },
+    })
+
+    const anchor = wrapper.get("a")
+    expect(anchor.attributes("target")).toBe("_blank")
+    expect(anchor.attributes("rel")).toBe("noopener noreferrer")
+  })
+
   it("keeps an absolute same-origin link navigating inside the app", () => {
     const href = `${window.location.origin}/sessions/absolute`
     const wrapper = mount(MarkdownRenderer, {
