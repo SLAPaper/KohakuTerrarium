@@ -40,6 +40,46 @@ function readZipEntry(archive, entryName) {
   })
 }
 
+test('CI validates Extension tests, build, package, and public chat boundary', () => {
+  const workflow = fs
+    .readFileSync(path.resolve(ROOT, '..', '..', '.github', 'workflows', 'ci.yml'), 'utf8')
+    .replaceAll('\r\n', '\n')
+  const start = workflow.indexOf('  vscode-extension-check:\n')
+  assert.notEqual(start, -1)
+  const jobTail = workflow.slice(start + 2)
+  const nextJob = jobTail.search(/\n  [a-z][a-z0-9-]*:\n/)
+  const job = nextJob === -1 ? jobTail : jobTail.slice(0, nextJob)
+
+  assert.match(job, /\n    runs-on: ubuntu-latest\n/)
+  assert.match(job, /\n    defaults:\n      run:\n        working-directory: extensions\/vscode\n/)
+  assert.match(job, /\n          node-version: "24"\n/)
+  assert.match(job, /\n          cache: npm\n/)
+  assert.match(job, /\n          cache-dependency-path: extensions\/vscode\/package-lock\.json\n/)
+  const commands = [...job.matchAll(/^      - run: (.+)$/gm)].map((match) => match[1])
+  assert.deepEqual(commands, ["npm ci", "npm test", "npm run build", "npm run package"])
+  assert.match(
+    job,
+    /- name: Install frontend config dependencies\n        working-directory: src\/kohakuterrarium-frontend\n        run: npm ci\n/,
+  )
+  assert.match(
+    job,
+    /- name: Verify public chat import boundary\n        run: node --test test\/chat-ui-boundary\.test\.cjs\n/,
+  )
+  assert.match(job, /- name: Verify packaged extension\n        shell: bash\n        run: \|\n/)
+  for (const contract of [
+    'test "${#packages[@]}" -eq 1',
+    'test -s "${packages[0]}"',
+    "node node_modules/@vscode/vsce/vsce ls",
+    "grep -Fx 'LICENSE'",
+    "grep -Fx 'dist/extension.cjs'",
+    "grep -Fx 'dist/webview.js'",
+    "grep -Fx 'dist/webview.css'",
+    "! grep -E '\\.(map|test\\.cjs)$|^node_modules/'",
+  ]) {
+    assert.ok(job.includes(contract), contract)
+  }
+})
+
 test('manifest defines a workspace sidebar extension and deterministic package scripts', () => {
   const manifest = JSON.parse(read('package.json'))
 
