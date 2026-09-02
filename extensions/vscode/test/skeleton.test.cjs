@@ -2,11 +2,42 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const test = require('node:test')
+const { execFileSync } = require('node:child_process')
+const yauzl = require('yauzl')
 
 const ROOT = path.resolve(__dirname, '..')
 
 function read(relative) {
   return fs.readFileSync(path.join(ROOT, relative), 'utf8')
+}
+
+function readZipEntry(archive, entryName) {
+  return new Promise((resolve, reject) => {
+    yauzl.open(archive, { lazyEntries: true }, (openError, zip) => {
+      if (openError) return reject(openError)
+      let settled = false
+      const finish = (error, value) => {
+        if (settled) return
+        settled = true
+        zip.close()
+        if (error) reject(error)
+        else resolve(value)
+      }
+      zip.readEntry()
+      zip.on('entry', (entry) => {
+        if (entry.fileName !== entryName) return zip.readEntry()
+        zip.openReadStream(entry, (streamError, stream) => {
+          if (streamError) return finish(streamError)
+          const chunks = []
+          stream.on('data', (chunk) => chunks.push(chunk))
+          stream.on('end', () => finish(null, Buffer.concat(chunks).toString('utf8')))
+          stream.on('error', finish)
+        })
+      })
+      zip.on('end', () => finish(Error(`${entryName} not found in ${archive}`)))
+      zip.on('error', finish)
+    })
+  })
 }
 
 test('manifest defines a workspace sidebar extension and deterministic package scripts', () => {
@@ -35,10 +66,48 @@ test('manifest defines a workspace sidebar extension and deterministic package s
   assert.equal(manifest.scripts.build, 'node scripts/build.cjs')
   assert.equal(manifest.scripts.package, 'npm run build && vsce package --no-dependencies')
   assert.equal(manifest.repository.url, 'https://github.com/Kohaku-Lab/KohakuTerrarium')
+  assert.equal(manifest.license, 'LicenseRef-KohakuTerrarium-1.0')
+  const lockManifest = JSON.parse(read('package-lock.json')).packages['']
+  assert.equal(lockManifest.license, manifest.license)
+  const rootLicense = fs.readFileSync(path.resolve(ROOT, '..', '..', 'LICENSE'), 'utf8')
+  assert.equal(read('LICENSE'), rootLicense)
+  assert.match(rootLicense, /KohakuTerrarium License/)
+  assert.match(rootLicense, /Naming Requirement/)
   assert.equal(manifest.files, undefined)
   const ignored = read('.vscodeignore')
   for (const entry of ['src/**', 'test/**', 'scripts/**', 'node_modules/**', 'package-lock.json']) {
     assert.match(ignored, new RegExp(entry.replaceAll('*', '\\*')))
+  }
+})
+
+test('packaged VSIX carries the repository license', async () => {
+  const archive = path.join(ROOT, 'kohakuterrarium-vscode-license-test.vsix')
+  const dist = path.join(ROOT, 'dist')
+  const distBackup = path.join(ROOT, `dist.license-test-${process.pid}`)
+  const hadDist = fs.existsSync(dist)
+  fs.rmSync(distBackup, { recursive: true, force: true })
+  if (hadDist) fs.renameSync(dist, distBackup)
+  try {
+    execFileSync(process.execPath, [path.join(ROOT, 'scripts', 'build.cjs')], {
+      cwd: ROOT,
+      stdio: 'pipe',
+    })
+    execFileSync(
+      process.execPath,
+      [
+        path.join(ROOT, 'node_modules', '@vscode', 'vsce', 'vsce'),
+        'package',
+        '--no-dependencies',
+        '--out',
+        archive,
+      ],
+      { cwd: ROOT, stdio: 'pipe' },
+    )
+    assert.equal(await readZipEntry(archive, 'extension/LICENSE.txt'), read('LICENSE'))
+  } finally {
+    fs.rmSync(archive, { force: true })
+    fs.rmSync(dist, { recursive: true, force: true })
+    if (hadDist) fs.renameSync(distBackup, dist)
   }
 })
 
