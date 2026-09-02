@@ -3,18 +3,22 @@ const test = require('node:test')
 
 function deferred() {
   let resolve
-  const promise = new Promise((onResolve) => { resolve = onResolve })
+  const promise = new Promise((onResolve) => {
+    resolve = onResolve
+  })
   return { promise, resolve }
 }
 
 const selected = (id) => ({ session: id, targetCreatureId: `${id}-creature` })
-const listed = (id) => [{
-  isLive: true,
-  runtimeId: id,
-  title: id,
-  kind: 'creature',
-  creatures: [{ id: `${id}-creature`, name: id }],
-}]
+const listed = (id) => [
+  {
+    isLive: true,
+    runtimeId: id,
+    title: id,
+    kind: 'creature',
+    creatures: [{ id: `${id}-creature`, name: id }],
+  },
+]
 
 test('an explicit selection result invalidates a delayed older topology notification before list returns', async () => {
   const { createSelectionVersionOwner } = await import('../src/webview/selectionVersion.mjs')
@@ -28,12 +32,23 @@ test('an explicit selection result invalidates a delayed older topology notifica
     selection: selected('A'),
     shell: {
       list: () => pendingList.promise,
-      restore() { effects.binds++; return { marker: 'A' } },
+      restore() {
+        effects.binds++
+        return { marker: 'A' }
+      },
     },
-    chat: { unbindFromInstance() { effects.unbinds++ } },
+    chat: {
+      unbindFromInstance() {
+        effects.unbinds++
+      },
+    },
     getCurrentSession: () => effects.current,
-    setCurrentSession: (value) => { effects.current = value },
-    setSessions: (value) => { effects.sessions = value },
+    setCurrentSession: (value) => {
+      effects.current = value
+    },
+    setSessions: (value) => {
+      effects.sessions = value
+    },
     isCurrent: notification.isCurrent,
   })
 

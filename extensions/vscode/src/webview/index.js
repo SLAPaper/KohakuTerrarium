@@ -1,10 +1,4 @@
-import {
-  buildMessageParts,
-  ChatComposer,
-  ChatTranscriptSection,
-  ConversationMessage,
-  MarkdownRenderer,
-} from '@kohakuterrarium/chat-ui'
+import { buildMessageParts, ChatComposer, ChatTranscriptSection, ConversationMessage, MarkdownRenderer } from '@kohakuterrarium/chat-ui'
 import { createPinia } from 'pinia'
 import { computed, createApp, h, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 
@@ -14,10 +8,7 @@ import { BridgeWebSocket } from './bridge.js'
 import { renderCarbonIcon } from './carbonIcons.mjs'
 import { applyContextCommandOutcome } from './contextCommandResult.mjs'
 import { createHostAcceptedChat, createObservedWebSocket } from './hostAcceptedChat.mjs'
-import {
-  createConversationMessageOrchestrator,
-  createConversationScrollController,
-} from './conversationScroll.mjs'
+import { createConversationMessageOrchestrator, createConversationScrollController } from './conversationScroll.mjs'
 import {
   createConversationAttachments,
   createConversationDrafts,
@@ -141,12 +132,10 @@ const App = {
       list: () => request('session.list'),
       create: () => request('session.create'),
       resume: (savedName) => request('session.resume', { savedName }),
-      stop: ({ session, creatureId }) =>
-        selectionRequest('session.stop', { session, creatureId }),
+      stop: ({ session, creatureId }) => selectionRequest('session.stop', { session, creatureId }),
       clearSelection: () => selectionRequest('session.clearSelection'),
       reconcile: () => request('session.reconcile'),
-      select: ({ session, creatureId }) =>
-        selectionRequest('session.select', { session, creatureId }),
+      select: ({ session, creatureId }) => selectionRequest('session.select', { session, creatureId }),
     }
     const shell = createSessionShell({ api, chat })
     const tab = computed(() => currentSession.value?.target || '')
@@ -175,11 +164,9 @@ const App = {
       return transcriptWindow.view(messages.value, scrollIdentity.value, messageSequence.value)
     })
 
-    watch(
-      [scrollIdentity, () => messages.value.length],
-      ([identity, count]) => scroll.setIdentity(identity, { hasMessages: count > 0 }),
-      { immediate: true },
-    )
+    watch([scrollIdentity, () => messages.value.length], ([identity, count]) => scroll.setIdentity(identity, { hasMessages: count > 0 }), {
+      immediate: true,
+    })
     watch(
       () => ({
         identity: scrollIdentity.value,
@@ -187,12 +174,7 @@ const App = {
       }),
       (current, previous) => {
         if (!previous || (current.sequence.length === 0 && previous.sequence.length === 0)) return
-        messageChanges.beforeMessagesChange(
-          previous.identity,
-          previous.sequence,
-          current.identity,
-          current.sequence,
-        )
+        messageChanges.beforeMessagesChange(previous.identity, previous.sequence, current.identity, current.sequence)
       },
       { flush: 'sync' },
     )
@@ -203,7 +185,10 @@ const App = {
         tail: messageTail.value,
       }),
       (current, previous) => {
-        if (previous && (current.structure !== previous.structure || current.tail !== previous.tail || current.identity !== previous.identity))
+        if (
+          previous &&
+          (current.structure !== previous.structure || current.tail !== previous.tail || current.identity !== previous.identity)
+        )
           messageChanges.afterMessagesChange(current.identity, messageSequence.value)
       },
       { flush: 'post' },
@@ -248,13 +233,7 @@ const App = {
           activeSelectionReadyId = result.readyId
           const versioned = selectionVersions.acceptBaseline(activeSelectionReadyId, result.selectionVersion)
           const readyVersion = result.selectionVersion
-          await applySelection(
-            result.selection,
-            true,
-            () =>
-              isCurrent() &&
-              (!versioned || selectionVersions.highest() === readyVersion),
-          )
+          await applySelection(result.selection, true, () => isCurrent() && (!versioned || selectionVersions.highest() === readyVersion))
         }
         if (!isCurrent()) return
         available.value = result.available === true
@@ -338,9 +317,7 @@ const App = {
       const submittedOwner = attachmentBuckets.capture()
       try {
         await conversationOwnership.dispatch(async (assertCurrent) => {
-          const content = submitted.length
-            ? await buildMessageParts(submittedText, submitted)
-            : submittedText
+          const content = submitted.length ? await buildMessageParts(submittedText, submitted) : submittedText
           assertCurrent()
           return hostAcceptedChat.send(content)
         })
@@ -369,9 +346,7 @@ const App = {
       const ownedTarget = currentSession.value.targetCreatureId
       const operation = ++contextOperation
       const isCurrent = () =>
-        operation === contextOperation &&
-        ownedReadyId === activeSelectionReadyId &&
-        ownedTarget === currentSession.value?.targetCreatureId
+        operation === contextOperation && ownedReadyId === activeSelectionReadyId && ownedTarget === currentSession.value?.targetCreatureId
       contextBusy.value = true
       error.value = ''
       status.value = ''
@@ -391,9 +366,7 @@ const App = {
     function onComposerError(problem) {
       error.value =
         problem?.error?.message ||
-        (problem?.code === 'too-large'
-          ? `${problem.name} is too large to attach`
-          : `Could not attach ${problem?.name || 'file'}`)
+        (problem?.code === 'too-large' ? `${problem.name} is too large to attach` : `Could not attach ${problem?.name || 'file'}`)
     }
 
     function submitReply(message, actionId, values) {
@@ -420,16 +393,15 @@ const App = {
       messageChanges.afterMessagesChange(scrollIdentity.value, messageSequence.value)
     }
 
-    const { actionButton, icon, renderSession, renderSharedText, renderTranscriptMessage } =
-      createViewRenderers({
-        ConversationMessage,
-        MarkdownRenderer,
-        available,
-        busy,
-        currentSession,
-        openSession,
-        resumeSession,
-      })
+    const { actionButton, icon, renderSession, renderSharedText, renderTranscriptMessage } = createViewRenderers({
+      ConversationMessage,
+      MarkdownRenderer,
+      available,
+      busy,
+      currentSession,
+      openSession,
+      resumeSession,
+    })
 
     const receiveHostMessage = ({ data: message }) => {
       BridgeWebSocket.receive(message)
@@ -447,11 +419,7 @@ const App = {
         const eventReadyId = message.readyId ?? activeSelectionReadyId
         const pendingRuntime = eventReadyId === latestReadyRequestId
         if (!pendingRuntime && eventReadyId !== activeSelectionReadyId) return
-        const notification = selectionVersions.beginNotification(
-          eventReadyId,
-          message.data.selectionVersion,
-          pendingRuntime,
-        )
+        const notification = selectionVersions.beginNotification(eventReadyId, message.data.selectionVersion, pendingRuntime)
         if (!notification) return
         const ownedReadyId = message.readyId
         const isCurrent = () =>
@@ -498,13 +466,17 @@ const App = {
         ]),
         h('section', { class: 'session-region', 'aria-label': 'Sessions' }, [
           h('div', { class: 'session-toolbar' }, [
-            h('button', {
-              type: 'button',
-              class: 'session-disclosure',
-              'aria-expanded': sessionsExpanded.value,
-              'aria-controls': 'session-list',
-              onClick: () => (sessionsExpanded.value = !sessionsExpanded.value),
-            }, [icon('chevron'), h('span', { class: 'session-summary' }, currentSummary)]),
+            h(
+              'button',
+              {
+                type: 'button',
+                class: 'session-disclosure',
+                'aria-expanded': sessionsExpanded.value,
+                'aria-controls': 'session-list',
+                onClick: () => (sessionsExpanded.value = !sessionsExpanded.value),
+              },
+              [icon('chevron'), h('span', { class: 'session-summary' }, currentSummary)],
+            ),
             h('div', { class: 'session-actions' }, [
               actionButton('New Session', 'add', { disabled: busy.value || !available.value, onClick: createSession }),
               actionButton('Refresh Sessions', 'refresh', {
@@ -520,7 +492,12 @@ const App = {
             ? h('div', { id: 'session-list', class: 'session-list' }, [
                 ...sessions.value.map(renderSession),
                 currentSession.value?.targetCreatureId
-                  ? actionButton('Stop Session', 'stop', { class: 'stop-session', disabled: busy.value, onClick: stopSession, text: 'Stop Session' })
+                  ? actionButton('Stop Session', 'stop', {
+                      class: 'stop-session',
+                      disabled: busy.value,
+                      onClick: stopSession,
+                      text: 'Stop Session',
+                    })
                   : null,
               ])
             : null,
@@ -550,46 +527,46 @@ const App = {
         ]),
         h('section', { class: 'composer-region', 'aria-label': 'Message composer' }, [
           currentSession.value?.target
-            ? h(ChatComposer, {
-                modelValue: draft.value,
-                attachments: attachments.value,
-                processing: !!chat.processingByTab[tab.value],
-                disabled:
-                  !currentSession.value?.target ||
-                  chat.wsStatus !== 'open' ||
-                  isComposerSubmitDisabled(submitBusy.value, !!chat.processingByTab[tab.value]),
-                contextActionsDisabled:
-                  busy.value ||
-                  contextBusy.value ||
-                  !available.value ||
-                  !!chat.processingByTab[tab.value],
-                managedSubmit: true,
-                maxAttachmentBytes: 10 * 1024 * 1024,
-                maxImageBytes: 5 * 1024 * 1024,
-                attachmentTransform,
-                showContextActions: true,
-                placeholder: 'Send to selected Creature',
-                labels: {
-                  attachFile: 'Attach file',
-                  attachImage: 'Attach image',
-                  compact: 'Compact context',
-                  clear: 'Clear context',
-                  message: 'Message',
-                  removeAttachment: 'Remove {name}',
-                  send: 'Send',
-                  stop: 'Stop generation',
+            ? h(
+                ChatComposer,
+                {
+                  modelValue: draft.value,
+                  attachments: attachments.value,
+                  processing: !!chat.processingByTab[tab.value],
+                  disabled:
+                    !currentSession.value?.target ||
+                    chat.wsStatus !== 'open' ||
+                    isComposerSubmitDisabled(submitBusy.value, !!chat.processingByTab[tab.value]),
+                  contextActionsDisabled: busy.value || contextBusy.value || !available.value || !!chat.processingByTab[tab.value],
+                  managedSubmit: true,
+                  maxAttachmentBytes: 10 * 1024 * 1024,
+                  maxImageBytes: 5 * 1024 * 1024,
+                  attachmentTransform,
+                  showContextActions: true,
+                  placeholder: 'Send to selected Creature',
+                  labels: {
+                    attachFile: 'Attach file',
+                    attachImage: 'Attach image',
+                    compact: 'Compact context',
+                    clear: 'Clear context',
+                    message: 'Message',
+                    removeAttachment: 'Remove {name}',
+                    send: 'Send',
+                    stop: 'Stop generation',
+                  },
+                  'onUpdate:modelValue': (value) => (draft.value = value),
+                  'onUpdate:attachments': (value) => (attachments.value = value),
+                  onSubmit: send,
+                  onInterrupt: () => chat.interrupt(tab.value),
+                  onCompact: () => manageContext('context.compact'),
+                  onClear: () => manageContext('context.clear'),
+                  onError: onComposerError,
                 },
-                'onUpdate:modelValue': (value) => (draft.value = value),
-                'onUpdate:attachments': (value) => (attachments.value = value),
-                onSubmit: send,
-                onInterrupt: () => chat.interrupt(tab.value),
-                onCompact: () => manageContext('context.compact'),
-                onClear: () => manageContext('context.clear'),
-                onError: onComposerError,
-              }, {
-                'compact-icon': () => renderCarbonIcon('collapse-all'),
-                'clear-icon': () => renderCarbonIcon('clean'),
-              })
+                {
+                  'compact-icon': () => renderCarbonIcon('collapse-all'),
+                  'clear-icon': () => renderCarbonIcon('clean'),
+                },
+              )
             : h('p', { class: 'composer-placeholder' }, 'Select a Session to start chatting'),
         ]),
       ])

@@ -65,7 +65,10 @@ test('ws.send emits a correlated result only after the socket owner accepts the 
 
   assert.deepEqual(calls, [[host.generation, 7, 'frame']])
   assert.deepEqual(posts.at(-1), {
-    type: 'ws.send.result', id: 7, sendId: 42, readyId: 'ready-B',
+    type: 'ws.send.result',
+    id: 7,
+    sendId: 42,
+    readyId: 'ready-B',
   })
 })
 
@@ -73,11 +76,11 @@ test('ws.send rejection throws without emitting a success result', async () => {
   const { host, posts, sockets } = harness()
   sockets.send = () => false
 
-  await assert.rejects(
-    host.handle({ type: 'ws.send', id: 7, sendId: 43, data: 'frame' }),
-    /not open/,
+  await assert.rejects(host.handle({ type: 'ws.send', id: 7, sendId: 43, data: 'frame' }), /not open/)
+  assert.equal(
+    posts.some((post) => post.type === 'ws.send.result'),
+    false,
   )
-  assert.equal(posts.some((post) => post.type === 'ws.send.result'), false)
 })
 
 test('ws.open omits the token subprotocol for loopback-bypass mode', async () => {
@@ -109,10 +112,7 @@ test('ws.open constructs the authenticated selected-creature route on the Host',
 
   assert.equal(socketCalls[0].generation, 4)
   assert.equal(socketCalls[0].id, 9)
-  assert.equal(
-    socketCalls[0].socket.url,
-    'ws://127.0.0.1:8000/ws/sessions/graph%20live/creatures/beta%2Fname/chat',
-  )
+  assert.equal(socketCalls[0].socket.url, 'ws://127.0.0.1:8000/ws/sessions/graph%20live/creatures/beta%2Fname/chat')
   assert.deepEqual(socketCalls[0].socket.protocols, ['kt-token.host-secret'])
 })
 
@@ -170,9 +170,13 @@ test('session.stop clears ownership only after the Host stop succeeds', async ()
   assert.equal(state.selection, null)
   assert.equal(sockets.beginCount, before + 1)
   assert.deepEqual(posts.at(-1), {
-    type: 'session.stop.result', id: 11, data: { ok: true, selectionVersion: 1, readyId: 'ready-B' },
+    type: 'session.stop.result',
+    id: 11,
+    data: { ok: true, selectionVersion: 1, readyId: 'ready-B' },
   })
-  client.stop = async () => { throw Error('stop failed') }
+  client.stop = async () => {
+    throw Error('stop failed')
+  }
   state.selection = {
     session: 'graph-next',
     graph: 'graph-next',
@@ -180,10 +184,7 @@ test('session.stop clears ownership only after the Host stop succeeds', async ()
     targetCreatureId: 'creature-beta',
   }
   const failedBefore = sockets.beginCount
-  await assert.rejects(
-    host.handle({ type: 'session.stop', id: 12, session: 'graph-next', creatureId: 'creature-beta' }),
-    /stop failed/,
-  )
+  await assert.rejects(host.handle({ type: 'session.stop', id: 12, session: 'graph-next', creatureId: 'creature-beta' }), /stop failed/)
   assert.notEqual(state.selection, null)
   assert.equal(sockets.beginCount, failedBefore)
 })

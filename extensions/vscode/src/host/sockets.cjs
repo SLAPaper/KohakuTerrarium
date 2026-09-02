@@ -23,8 +23,7 @@ class SocketOwners {
     this.sockets.set(id, socket)
     const owned = () => this.generation === generation && this.sockets.get(id) === socket
     socket.onopen = () => owned() && view.postMessage({ type: 'ws.opened', id })
-    socket.onmessage = (event) =>
-      owned() && view.postMessage({ type: 'ws.frame', id, data: String(event.data) })
+    socket.onmessage = (event) => owned() && view.postMessage({ type: 'ws.frame', id, data: String(event.data) })
     socket.onerror = () => {
       if (!owned()) return
       view.postMessage({ type: 'ws.error', id })

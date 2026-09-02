@@ -77,7 +77,15 @@ test('failed socket creation emits a deterministic error and close frame', () =>
   const generation = owners.begin()
 
   assert.throws(
-    () => owners.open(generation, 4, () => { throw Error('connect failed') }, { postMessage: (message) => messages.push(message) }),
+    () =>
+      owners.open(
+        generation,
+        4,
+        () => {
+          throw Error('connect failed')
+        },
+        { postMessage: (message) => messages.push(message) },
+      ),
     /connect failed/,
   )
 

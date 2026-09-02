@@ -112,7 +112,9 @@ for (const staleOutcome of ['resolve', 'reject']) {
       constructor() {
         this.value = { manual: false, selection: null }
       }
-      read() { return this.value }
+      read() {
+        return this.value
+      }
       async update(change) {
         const next = change(this.value)
         if (next) this.value = next
@@ -120,11 +122,16 @@ for (const staleOutcome of ['resolve', 'reject']) {
       }
     }
     class RuntimeHost {
-      async reconcileSelection() { return { selection: null } }
+      async reconcileSelection() {
+        return { selection: null }
+      }
       dispose() {}
       async handle() {}
     }
-    class TopologyWatcher { start() {} close() {} }
+    class TopologyWatcher {
+      start() {}
+      close() {}
+    }
     const originalLoad = Module._load
     Module._load = function (request, parent, isMain) {
       const mocks = {
@@ -165,12 +172,17 @@ for (const staleOutcome of ['resolve', 'reject']) {
     const webview = {
       cspSource: 'test',
       asWebviewUri: String,
-      onDidReceiveMessage(callback) { receiveMessage = callback; return { dispose() {} } },
+      onDidReceiveMessage(callback) {
+        receiveMessage = callback
+        return { dispose() {} }
+      },
       async postMessage() {},
     }
     provider.resolveWebviewView({
       webview,
-      onDidDispose(callback) { disposeView = callback },
+      onDidDispose(callback) {
+        disposeView = callback
+      },
     })
 
     const stale = receiveMessage({ type: 'ready', id: 1 })

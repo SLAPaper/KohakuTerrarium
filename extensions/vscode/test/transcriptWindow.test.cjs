@@ -184,38 +184,21 @@ test('tail signatures detect equal-length, reasoning, result, and nested child c
   const initial = createMessageTailSignature([message])
 
   assert.notEqual(createMessageTailSignature([{ ...message, content: 'diff' }]), initial)
+  assert.notEqual(createMessageTailSignature([{ ...message, parts: [{ type: 'reasoning', text: 'other' }, message.parts[1]] }]), initial)
   assert.notEqual(
-    createMessageTailSignature([
-      { ...message, parts: [{ type: 'reasoning', text: 'other' }, message.parts[1]] },
-    ]),
+    createMessageTailSignature([{ ...message, parts: [message.parts[0], { ...message.parts[1], result: { value: 'other' } }] }]),
     initial,
   )
   assert.notEqual(
-    createMessageTailSignature([
-      { ...message, parts: [message.parts[0], { ...message.parts[1], result: { value: 'other' } }] },
-    ]),
+    createMessageTailSignature([{ ...message, parts: [{ ...message.parts[0], signature: 'sig-b' }, message.parts[1]] }]),
     initial,
   )
-  assert.notEqual(
-    createMessageTailSignature([
-      { ...message, parts: [{ ...message.parts[0], signature: 'sig-b' }, message.parts[1]] },
-    ]),
-    initial,
-  )
-  assert.notEqual(
-    createMessageTailSignature([
-      { ...message, parts: [{ ...message.parts[0], source: 'tool' }, message.parts[1]] },
-    ]),
-    initial,
-  )
+  assert.notEqual(createMessageTailSignature([{ ...message, parts: [{ ...message.parts[0], source: 'tool' }, message.parts[1]] }]), initial)
   assert.notEqual(
     createMessageTailSignature([
       {
         ...message,
-        parts: [
-          message.parts[0],
-          { ...message.parts[1], children: [{ ...message.parts[1].children[0], status: 'done' }] },
-        ],
+        parts: [message.parts[0], { ...message.parts[1], children: [{ ...message.parts[1].children[0], status: 'done' }] }],
       },
     ]),
     initial,

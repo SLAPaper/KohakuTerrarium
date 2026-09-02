@@ -20,8 +20,7 @@ export class BridgeWebSocket {
   }
 
   send(data) {
-    if (this.readyState !== BridgeWebSocket.OPEN)
-      throw Error('WebSocket not open')
+    if (this.readyState !== BridgeWebSocket.OPEN) throw Error('WebSocket not open')
     const sendId = BridgeWebSocket.nextSendId++
     const confirmation = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -74,12 +73,7 @@ export class BridgeWebSocket {
       }
       const send = sends[0] || null
       if (requireConfirmation && send == null) {
-        throw (
-          error ||
-          Error(
-            'Chat message did not reach the Host. Press Refresh Sessions and try again.',
-          )
-        )
+        throw error || Error('Chat message did not reach the Host. Press Refresh Sessions and try again.')
       }
       if (error && send == null) throw error
       return {
@@ -129,11 +123,7 @@ export class BridgeWebSocket {
     } else if (message.type === 'ws.send.result') {
       this.settleSend(socket, message)
     } else if (message.type === 'ws.send.error') {
-      this.settleSend(
-        socket,
-        message,
-        Error(message.error || 'Chat send was rejected'),
-      )
+      this.settleSend(socket, message, Error(message.error || 'Chat send was rejected'))
     }
   }
 

@@ -94,10 +94,14 @@ test('visibility interval supports immediate start and contains callback errors'
   try {
     const { createVisibilityInterval } = await loadShim()
     let calls = 0
-    const controller = createVisibilityInterval(() => {
-      calls++
-      throw new Error('boom')
-    }, 100, { immediate: true })
+    const controller = createVisibilityInterval(
+      () => {
+        calls++
+        throw new Error('boom')
+      },
+      100,
+      { immediate: true },
+    )
 
     assert.doesNotThrow(() => controller.start())
     assert.equal(calls, 1)

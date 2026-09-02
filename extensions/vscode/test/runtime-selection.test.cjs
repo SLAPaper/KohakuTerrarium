@@ -6,21 +6,32 @@ const { deferred, harness } = require('./runtimeHarness.cjs')
 test('stale selection reconciliation cannot overwrite a concurrent explicit selection', async () => {
   const { client, host, sockets, state, updates } = harness()
   state.selection = {
-    session: 'graph-a', graph: 'graph-a', creature: 'alpha', targetCreatureId: 'creature-alpha',
+    session: 'graph-a',
+    graph: 'graph-a',
+    creature: 'alpha',
+    targetCreatureId: 'creature-alpha',
   }
   const listed = deferred()
   client.listOpen = () => listed.promise
   const reconciling = host.reconcileSelection()
   client.active = async () => ({
-    session_id: 'graph-b', creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
+    session_id: 'graph-b',
+    creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
   })
 
   const selecting = host.handle({
-    type: 'session.select', id: 20, session: 'graph-b', creatureId: 'creature-beta',
+    type: 'session.select',
+    id: 20,
+    session: 'graph-b',
+    creatureId: 'creature-beta',
   })
-  listed.resolve([{
-    runtimeId: 'graph-a-new', isLive: true, creatures: [{ id: 'creature-alpha', name: 'alpha-new' }],
-  }])
+  listed.resolve([
+    {
+      runtimeId: 'graph-a-new',
+      isLive: true,
+      creatures: [{ id: 'creature-alpha', name: 'alpha-new' }],
+    },
+  ])
   const result = await reconciling
   await selecting
 
@@ -34,17 +45,24 @@ test('stale selection reconciliation cannot overwrite a concurrent explicit sele
 test('stale missing-selection reconciliation cannot clear a concurrent explicit selection', async () => {
   const { client, host, state, updates } = harness()
   state.selection = {
-    session: 'graph-a', graph: 'graph-a', creature: 'alpha', targetCreatureId: 'creature-alpha',
+    session: 'graph-a',
+    graph: 'graph-a',
+    creature: 'alpha',
+    targetCreatureId: 'creature-alpha',
   }
   const listed = deferred()
   client.listOpen = () => listed.promise
   const reconciling = host.reconcileSelection()
   client.active = async () => ({
-    session_id: 'graph-b', creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
+    session_id: 'graph-b',
+    creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
   })
 
   const selecting = host.handle({
-    type: 'session.select', id: 21, session: 'graph-b', creatureId: 'creature-beta',
+    type: 'session.select',
+    id: 21,
+    session: 'graph-b',
+    creatureId: 'creature-beta',
   })
   listed.resolve([])
   const result = await reconciling
@@ -58,7 +76,10 @@ test('stale missing-selection reconciliation cannot clear a concurrent explicit 
 test('selection serializes reconcile after a pending explicit selection', async () => {
   const { client, host, posts, sockets, state, updates } = harness()
   state.selection = {
-    session: 'graph-a', graph: 'graph-a', creature: 'alpha', targetCreatureId: 'creature-alpha',
+    session: 'graph-a',
+    graph: 'graph-a',
+    creature: 'alpha',
+    targetCreatureId: 'creature-alpha',
   }
   const activated = deferred()
   const listed = deferred()
@@ -66,22 +87,30 @@ test('selection serializes reconcile after a pending explicit selection', async 
   client.listOpen = () => listed.promise
 
   const selecting = host.handle({
-    type: 'session.select', id: 30, session: 'graph-b', creatureId: 'creature-beta',
+    type: 'session.select',
+    id: 30,
+    session: 'graph-b',
+    creatureId: 'creature-beta',
   })
   const reconciling = host.handle({ type: 'session.reconcile', id: 31 })
   await Promise.resolve()
   assert.equal(updates.length, 0)
 
   activated.resolve({
-    session_id: 'graph-b', creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
+    session_id: 'graph-b',
+    creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
   })
   await selecting
   assert.equal(posts.at(-1).id, 30)
   assert.equal(state.selection.session, 'graph-b')
   const selectedGeneration = host.generation
-  listed.resolve([{
-    runtimeId: 'graph-b', isLive: true, creatures: [{ id: 'creature-beta', name: 'beta' }],
-  }])
+  listed.resolve([
+    {
+      runtimeId: 'graph-b',
+      isLive: true,
+      creatures: [{ id: 'creature-beta', name: 'beta' }],
+    },
+  ])
   await reconciling
 
   assert.equal(posts.at(-1).id, 31)
@@ -96,7 +125,10 @@ test('selection serializes reconcile after a pending explicit selection', async 
 test('selection serializes reconcile after a pending stop', async () => {
   const { client, host, sockets, state } = harness()
   state.selection = {
-    session: 'graph-a', graph: 'graph-a', creature: 'alpha', targetCreatureId: 'creature-alpha',
+    session: 'graph-a',
+    graph: 'graph-a',
+    creature: 'alpha',
+    targetCreatureId: 'creature-alpha',
   }
   const stopped = deferred()
   let listCalls = 0
@@ -107,7 +139,10 @@ test('selection serializes reconcile after a pending stop', async () => {
   }
 
   const stopping = host.handle({
-    type: 'session.stop', id: 32, session: 'graph-a', creatureId: 'creature-alpha',
+    type: 'session.stop',
+    id: 32,
+    session: 'graph-a',
+    creatureId: 'creature-alpha',
   })
   const reconciling = host.handle({ type: 'session.reconcile', id: 33 })
   await Promise.resolve()
@@ -126,7 +161,10 @@ test('a rejected selection operation does not poison the queue', async () => {
   client.active = () => activated.promise
 
   const failed = host.handle({
-    type: 'session.select', id: 34, session: 'graph-missing', creatureId: 'creature-missing',
+    type: 'session.select',
+    id: 34,
+    session: 'graph-missing',
+    creatureId: 'creature-missing',
   })
   const cleared = host.handle({ type: 'session.clearSelection', id: 35 })
   activated.reject(Error('active failed'))
@@ -135,7 +173,9 @@ test('a rejected selection operation does not poison the queue', async () => {
   await cleared
   assert.equal(state.selection, null)
   assert.deepEqual(posts.at(-1), {
-    type: 'session.clearSelection.result', id: 35, data: { ok: true, selectionVersion: 0, readyId: 'ready-B' },
+    type: 'session.clearSelection.result',
+    id: 35,
+    data: { ok: true, selectionVersion: 0, readyId: 'ready-B' },
   })
 })
 
@@ -176,9 +216,7 @@ test('selection reconciliation fails closed when the stable target disappears', 
     creature: 'beta',
     targetCreatureId: 'creature-beta',
   }
-  client.listOpen = async () => [
-    { runtimeId: 'graph-other', isLive: true, creatures: [{ id: 'creature-alpha', name: 'alpha' }] },
-  ]
+  client.listOpen = async () => [{ runtimeId: 'graph-other', isLive: true, creatures: [{ id: 'creature-alpha', name: 'alpha' }] }]
   const before = sockets.beginCount
 
   const result = await host.reconcileSelection()
@@ -196,7 +234,9 @@ test('selection reconciliation preserves stale ownership when the service is una
     creature: 'beta',
     targetCreatureId: 'creature-beta',
   }
-  client.listOpen = async () => { throw Error('service unavailable') }
+  client.listOpen = async () => {
+    throw Error('service unavailable')
+  }
   const before = sockets.beginCount
 
   await assert.rejects(host.reconcileSelection(), /service unavailable/)
@@ -218,9 +258,7 @@ test('selection reconciliation keeps ownership stable when the attachment is unc
     creature: 'beta',
     targetCreatureId: 'creature-beta',
   }
-  client.listOpen = async () => [
-    { runtimeId: 'graph-live', isLive: true, creatures: [{ id: 'creature-beta', name: 'beta' }] },
-  ]
+  client.listOpen = async () => [{ runtimeId: 'graph-live', isLive: true, creatures: [{ id: 'creature-beta', name: 'beta' }] }]
   const before = sockets.beginCount
 
   const result = await host.reconcileSelection()
@@ -237,9 +275,7 @@ test('session.reconcile returns the authoritative selection for explicit recover
     creature: 'old-name',
     targetCreatureId: 'creature-beta',
   }
-  client.listOpen = async () => [
-    { runtimeId: 'graph-new', isLive: true, creatures: [{ id: 'creature-beta', name: 'beta' }] },
-  ]
+  client.listOpen = async () => [{ runtimeId: 'graph-new', isLive: true, creatures: [{ id: 'creature-beta', name: 'beta' }] }]
 
   await host.handle({ type: 'session.reconcile', id: 13 })
 
@@ -300,15 +336,23 @@ test('context actions bind fixed commands to the current Host selection', async 
     { session: 'graph-live', creature: 'beta', command: 'compact', args: '' },
     { session: 'graph-live', creature: 'beta', command: 'clear', args: '--force' },
   ])
-  assert.deepEqual(posts.map(({ type, id }) => ({ type, id })), [
-    { type: 'context.compact.result', id: 50 },
-    { type: 'context.clear.result', id: 51 },
-  ])
+  assert.deepEqual(
+    posts.map(({ type, id }) => ({ type, id })),
+    [
+      { type: 'context.compact.result', id: 50 },
+      { type: 'context.clear.result', id: 51 },
+    ],
+  )
 })
 
 test('context actions preserve the backend response payload exactly', async () => {
   const { client, host, posts, state } = harness()
-  const payload = { error: 'logical failure', notify: { message: 'notice' }, data: { message: 'detail' }, output: 'text' }
+  const payload = {
+    error: 'logical failure',
+    notify: { message: 'notice' },
+    data: { message: 'detail' },
+    output: 'text',
+  }
   state.selection = { session: 'graph-live', creature: 'beta', targetCreatureId: 'creature-beta' }
   client.creatureCommand = async () => payload
 

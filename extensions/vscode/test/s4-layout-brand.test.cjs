@@ -40,12 +40,9 @@ test('sidebar conversation uses host-scoped gutters without horizontal overflow'
   assert.match(css, /\.chat-region\s*\{[^}]*padding:\s*8px 0(?:px)?\s*;/s)
   assert.match(
     css,
-    /\.kt-conversation-host \.kt-transcript-viewport\s*\{[^}]*overflow-x:\s*hidden\s*;[^}]*padding-inline:\s*\.5rem\s*;/s,
+    /\.kt-conversation-host \.kt-transcript-viewport\s*\{[^}]*overflow-x:\s*hidden\s*;[^}]*padding-inline:\s*(?:\.5|0\.5)rem\s*;/s,
   )
-  assert.match(
-    css,
-    /\.kt-conversation-host \.kt-conversation-message--assistant\s*\{[^}]*width:\s*100%\s*;[^}]*max-width:\s*none\s*;/s,
-  )
+  assert.match(css, /\.kt-conversation-host \.kt-conversation-message--assistant\s*\{[^}]*width:\s*100%\s*;[^}]*max-width:\s*none\s*;/s)
   assert.match(
     css,
     /@media \(max-width:\s*420px\)[^{]*\{[^}]*\.kt-conversation-host \.kt-conversation-message--user\s*\{[^}]*width:\s*100%\s*;/s,

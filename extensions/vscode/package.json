@@ -69,6 +69,8 @@
     }
   },
   "scripts": {
+    "format": "prettier --write .prettierrc.json scripts/ src/ test/ package.json vite.config.mjs",
+    "format:check": "prettier --check .prettierrc.json scripts/ src/ test/ package.json vite.config.mjs",
     "test": "node --test test/*.test.cjs",
     "build": "node scripts/build.cjs",
     "package": "npm run build && vsce package --no-dependencies"
@@ -83,6 +85,7 @@
     "katex": "^0.16.45",
     "markdown-it": "^14.0.0",
     "pinia": "^3.0.3",
+    "prettier": "^3.8.2",
     "unplugin-auto-import": "^20.2.0",
     "vite": "^7.1.7",
     "vue": "^3.5.22",

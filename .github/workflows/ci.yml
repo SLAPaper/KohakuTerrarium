@@ -127,6 +127,7 @@ jobs:
           cache: npm
           cache-dependency-path: extensions/vscode/package-lock.json
       - run: npm ci
+      - run: npm run format:check
       - name: Install frontend config dependencies
         working-directory: src/kohakuterrarium-frontend
         run: npm ci

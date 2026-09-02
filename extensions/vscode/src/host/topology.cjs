@@ -23,9 +23,7 @@ class TopologyWatcher {
         return
       }
       if (!['topology_changed', 'creature_stopped'].includes(frame.type)) return
-      this.queue = this.queue
-        .then(() => (this.socket === socket ? this.onInvalidate(frame) : undefined))
-        .catch(() => {})
+      this.queue = this.queue.then(() => (this.socket === socket ? this.onInvalidate(frame) : undefined)).catch(() => {})
     }
     return socket
   }

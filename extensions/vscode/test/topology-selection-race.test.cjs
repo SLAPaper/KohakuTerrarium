@@ -12,12 +12,14 @@ function deferred() {
 }
 
 const selected = (id) => ({ session: id, targetCreatureId: `${id}-creature` })
-const listed = (id) => [{
-  isLive: true,
-  runtimeId: id,
-  title: id,
-  creatures: [{ id: `${id}-creature`, name: id }],
-}]
+const listed = (id) => [
+  {
+    isLive: true,
+    runtimeId: id,
+    title: id,
+    creatures: [{ id: `${id}-creature`, name: id }],
+  },
+]
 
 async function harness(listPromise, isCurrent) {
   const { applyTopologySelection } = await import('../src/webview/topologySelection.mjs')
@@ -29,7 +31,11 @@ async function harness(listPromise, isCurrent) {
       return { session, targetCreatureId: selection.targetCreatureId }
     },
   }
-  const chat = { unbindFromInstance() { effects.unbinds++ } }
+  const chat = {
+    unbindFromInstance() {
+      effects.unbinds++
+    },
+  }
   return {
     effects,
     apply: applyTopologySelection({
@@ -37,8 +43,12 @@ async function harness(listPromise, isCurrent) {
       shell,
       chat,
       getCurrentSession: () => effects.current,
-      setCurrentSession: (value) => { effects.current = value },
-      setSessions: (value) => { effects.sessions = value },
+      setCurrentSession: (value) => {
+        effects.current = value
+      },
+      setSessions: (value) => {
+        effects.sessions = value
+      },
       isCurrent,
     }),
   }
@@ -53,7 +63,10 @@ test('queued selection cannot mutate topology after a newer ready generation bec
   await run.apply
 
   assert.deepEqual(run.effects, {
-    sessions: ['B-session'], current: { marker: 'B' }, binds: 0, unbinds: 0,
+    sessions: ['B-session'],
+    current: { marker: 'B' },
+    binds: 0,
+    unbinds: 0,
   })
 })
 
@@ -65,7 +78,10 @@ test('stale queued selection quietly discards a list failure', async () => {
   pendingList.reject(Error('stale list failure'))
   await run.apply
   assert.deepEqual(run.effects, {
-    sessions: ['B-session'], current: { marker: 'B' }, binds: 0, unbinds: 0,
+    sessions: ['B-session'],
+    current: { marker: 'B' },
+    binds: 0,
+    unbinds: 0,
   })
 })
 

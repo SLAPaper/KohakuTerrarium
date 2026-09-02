@@ -71,9 +71,7 @@ async function discoverLocalKt({
   }
 
   for (let index = 0; index < ports.length; index += concurrency) {
-    const endpoints = ports
-      .slice(index, index + concurrency)
-      .map((port) => `http://127.0.0.1:${port}`)
+    const endpoints = ports.slice(index, index + concurrency).map((port) => `http://127.0.0.1:${port}`)
     const found = await supportedCandidates(endpoints, probe)
     for (const match of found) {
       const candidate = result(match.endpoint, match.capabilities, 'probe')

@@ -8,10 +8,7 @@ function parseFrame(frame) {
 }
 
 function removeEvent(chat, tab, eventId) {
-  for (const bucket of [
-    chat.messagesByTab?.[tab],
-    chat.queuedMessagesByTab?.[tab],
-  ]) {
+  for (const bucket of [chat.messagesByTab?.[tab], chat.queuedMessagesByTab?.[tab]]) {
     if (!Array.isArray(bucket)) continue
     const index = bucket.findIndex((message) => message?.eventId === eventId)
     if (index >= 0) bucket.splice(index, 1)
@@ -21,13 +18,7 @@ function removeEvent(chat, tab, eventId) {
 function snapshotReply(prompt) {
   return prompt
     ? Object.fromEntries(
-        [
-          'replied',
-          'superseded',
-          'timedOut',
-          'repliedActionId',
-          'repliedValues',
-        ]
+        ['replied', 'superseded', 'timedOut', 'repliedActionId', 'repliedValues']
           .filter((key) => key in prompt)
           .map((key) => [key, prompt[key]]),
       )
@@ -37,22 +28,13 @@ function snapshotReply(prompt) {
 function restoreReply(prompt, snapshot, actionId) {
   if (!prompt || prompt.repliedActionId !== actionId) return
   Object.assign(prompt, snapshot)
-  for (const key of [
-    'replied',
-    'superseded',
-    'timedOut',
-    'repliedActionId',
-    'repliedValues',
-  ]) {
+  for (const key of ['replied', 'superseded', 'timedOut', 'repliedActionId', 'repliedValues']) {
     if (!(key in snapshot)) delete prompt[key]
   }
 }
 
 async function settleSend(sent) {
-  const [value, confirmation] = await Promise.allSettled([
-    Promise.resolve(sent.value),
-    sent.confirmation || Promise.resolve(),
-  ])
+  const [value, confirmation] = await Promise.allSettled([Promise.resolve(sent.value), sent.confirmation || Promise.resolve()])
   if (sent.error) throw sent.error
   if (value.status === 'rejected') throw value.reason
   if (confirmation.status === 'rejected') throw confirmation.reason
@@ -96,14 +78,8 @@ export function createHostAcceptedChat({ BridgeWebSocket, chat }) {
       return await settleSend(sent)
     } catch (cause) {
       if (!pending.inputAccepted && eventId) removeEvent(chat, tab, eventId)
-      const sameBinding =
-        chat.messagesByTab?.[tab] === previousMessages &&
-        chat.queuedMessagesByTab?.[tab] === previousQueue
-      if (
-        !pending.processingObserved &&
-        sameBinding &&
-        chat.processingByTab?.[tab] === true
-      ) {
+      const sameBinding = chat.messagesByTab?.[tab] === previousMessages && chat.queuedMessagesByTab?.[tab] === previousQueue
+      if (!pending.processingObserved && sameBinding && chat.processingByTab?.[tab] === true) {
         if (previousProcessing === undefined) delete chat.processingByTab[tab]
         else chat.processingByTab[tab] = previousProcessing
       }
@@ -115,19 +91,15 @@ export function createHostAcceptedChat({ BridgeWebSocket, chat }) {
 
   const submitUIReply = async (tab, eventId, actionId, values) => {
     const key = `${tab}:${eventId}`
-    if (pendingReplies.has(key))
-      throw Error('UI reply is already pending Host acceptance')
-    const prompt = (chat.messagesByTab?.[tab] || []).find(
-      (message) => message?.role === 'ui_event' && message.eventId === eventId,
-    )
+    if (pendingReplies.has(key)) throw Error('UI reply is already pending Host acceptance')
+    const prompt = (chat.messagesByTab?.[tab] || []).find((message) => message?.role === 'ui_event' && message.eventId === eventId)
     const snapshot = snapshotReply(prompt)
     const pending = { backendSettled: false }
     pendingReplies.set(key, pending)
     try {
-      const sent = BridgeWebSocket.captureSend(
-        () => chat.submitUIReply(tab, eventId, actionId, values),
-        { requireConfirmation: true },
-      )
+      const sent = BridgeWebSocket.captureSend(() => chat.submitUIReply(tab, eventId, actionId, values), {
+        requireConfirmation: true,
+      })
       return await settleSend(sent)
     } catch (cause) {
       if (!pending.backendSettled) restoreReply(prompt, snapshot, actionId)

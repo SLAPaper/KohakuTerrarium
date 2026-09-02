@@ -20,8 +20,14 @@ test('loopback-bypass discovery connects without reading or prompting for a toke
   let prompts = 0
   const result = await resolveLocalConnection({
     discover: async () => bypass,
-    getStoredToken: async () => { secretReads++; return 'unused' },
-    promptToken: async () => { prompts++; return 'unused' },
+    getStoredToken: async () => {
+      secretReads++
+      return 'unused'
+    },
+    promptToken: async () => {
+      prompts++
+      return 'unused'
+    },
     verify: async ({ token }) => assert.equal(token, ''),
   })
 
@@ -35,7 +41,10 @@ test('strict local discovery silently reuses a valid SecretStorage token', async
   const result = await resolveLocalConnection({
     discover: async () => strict,
     getStoredToken: async () => 'stored-secret',
-    promptToken: async () => { prompts++; return 'prompted' },
+    promptToken: async () => {
+      prompts++
+      return 'prompted'
+    },
     verify: async ({ token }) => assert.equal(token, 'stored-secret'),
   })
 
@@ -72,8 +81,13 @@ test('strict local discovery does not prompt when a stored-token request fails t
     resolveLocalConnection({
       discover: async () => strict,
       getStoredToken: async () => 'stored-secret',
-      promptToken: async () => { prompts++; return 'replacement' },
-      verify: async () => { throw Error('connection refused') },
+      promptToken: async () => {
+        prompts++
+        return 'replacement'
+      },
+      verify: async () => {
+        throw Error('connection refused')
+      },
     }),
     /connection refused/,
   )

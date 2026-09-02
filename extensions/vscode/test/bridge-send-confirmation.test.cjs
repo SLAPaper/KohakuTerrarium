@@ -6,13 +6,8 @@ const test = require('node:test')
 let BridgeWebSocket
 
 test.before(async () => {
-  const source = fs.readFileSync(
-    path.resolve(__dirname, '../src/webview/bridge.js'),
-    'utf8',
-  )
-  const moduleUrl = `data:text/javascript;base64,${Buffer.from(
-    `const markRaw = value => value;${source}`,
-  ).toString('base64')}`
+  const source = fs.readFileSync(path.resolve(__dirname, '../src/webview/bridge.js'), 'utf8')
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(`const markRaw = value => value;${source}`).toString('base64')}`
   ;({ BridgeWebSocket } = await import(moduleUrl))
 })
 
@@ -123,9 +118,7 @@ test('correlated failure, close, timeout, and disposal reject pending confirmati
   await assert.rejects(timed.confirmation, /timed out/i)
 
   BridgeWebSocket.confirmationTimeout = 1000
-  const disposed = BridgeWebSocket.captureSend(() =>
-    timeoutSocket.send('disposed'),
-  )
+  const disposed = BridgeWebSocket.captureSend(() => timeoutSocket.send('disposed'))
   BridgeWebSocket.disposeAll(Error('disposed'))
   await assert.rejects(disposed.confirmation, /disposed/)
   BridgeWebSocket.receive({

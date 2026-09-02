@@ -86,19 +86,13 @@ function createClient({ endpoint, token, fetchImpl = fetch }) {
       return (await request(`/api/sessions/active/${encode(session)}`)).json()
     },
     async resume(savedName) {
-      return (
-        await request(`/api/sessions/${encode(savedName)}/resume`, { method: 'POST' })
-      ).json()
+      return (await request(`/api/sessions/${encode(savedName)}/resume`, { method: 'POST' })).json()
     },
     async stop(session) {
-      return (
-        await request(`/api/sessions/active/${encode(session)}`, { method: 'DELETE' })
-      ).json()
+      return (await request(`/api/sessions/active/${encode(session)}`, { method: 'DELETE' })).json()
     },
     async history(session, creature) {
-      return (
-        await request(`/api/sessions/${encode(session)}/creatures/${encode(creature)}/history`)
-      ).json()
+      return (await request(`/api/sessions/${encode(session)}/creatures/${encode(creature)}/history`)).json()
     },
     async interrupt(session, creature) {
       return (

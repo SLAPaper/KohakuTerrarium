@@ -12,11 +12,7 @@ function supersededError() {
 }
 
 function sameOwnership(left, right) {
-  return (
-    left?.readyId === right?.readyId &&
-    left?.runtimeId === right?.runtimeId &&
-    left?.creatureId === right?.creatureId
-  )
+  return left?.readyId === right?.readyId && left?.runtimeId === right?.runtimeId && left?.creatureId === right?.creatureId
 }
 
 function ownershipKey(owned) {

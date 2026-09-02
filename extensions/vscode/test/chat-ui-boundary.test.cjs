@@ -19,13 +19,7 @@ const read = (file) => fs.readFileSync(file, 'utf8')
 
 test('Extension independently owns shared Markdown SFC build dependencies', async () => {
   const packageJson = JSON.parse(read(path.join(root, 'package.json')))
-  const required = [
-    '@vitejs/plugin-vue',
-    '@vscode/markdown-it-katex',
-    'highlight.js',
-    'katex',
-    'markdown-it',
-  ]
+  const required = ['@vitejs/plugin-vue', '@vscode/markdown-it-katex', 'highlight.js', 'katex', 'markdown-it']
   const extensionRequire = createRequire(path.join(root, 'package.json'))
   for (const dependency of required) {
     assert.equal(typeof packageJson.devDependencies?.[dependency], 'string', `${dependency} must be direct`)
@@ -34,19 +28,17 @@ test('Extension independently owns shared Markdown SFC build dependencies', asyn
   }
 
   const config = (await import(`${pathToFileURL(path.join(root, 'vite.config.mjs')).href}?ownership`)).default
-  assert.ok(config.plugins.some((plugin) => plugin?.name === 'vite:vue'), 'Vue SFC plugin must be registered')
+  assert.ok(
+    config.plugins.some((plugin) => plugin?.name === 'vite:vue'),
+    'Vue SFC plugin must be registered',
+  )
   assert.deepEqual(config.resolve.dedupe, ['vue', 'pinia'])
   for (const dependency of [...required, 'vue', 'pinia']) {
     const resolved = extensionRequire.resolve(`${dependency}/package.json`)
     assert.doesNotMatch(resolved, /kohakuterrarium-frontend[\\/]node_modules/, `${dependency}: ${resolved}`)
   }
 
-  const rendererImports = [
-    'markdown-it',
-    '@vscode/markdown-it-katex',
-    'highlight.js',
-    'katex/dist/katex.min.css',
-  ]
+  const rendererImports = ['markdown-it', '@vscode/markdown-it-katex', 'highlight.js', 'katex/dist/katex.min.css']
   for (const specifier of rendererImports) {
     const alias = config.resolve.alias.find(({ find }) => find instanceof RegExp && find.test(specifier))
     assert.ok(alias, `${specifier} must have an exact Extension-owned alias`)
@@ -94,9 +86,7 @@ test('public Markdown graph is recursively host-neutral', () => {
     if (visited.has(file)) continue
     visited.add(file)
     const source = read(file)
-    const imports = [...source.matchAll(/(?:from\s*|import\s*)['"]([^'"]+)['"]/g)].map(
-      (match) => match[1],
-    )
+    const imports = [...source.matchAll(/(?:from\s*|import\s*)['"]([^'"]+)['"]/g)].map((match) => match[1])
     for (const specifier of imports) {
       assert.doesNotMatch(specifier, forbidden, `${file}: ${specifier}`)
       if (!specifier.startsWith('.')) continue
@@ -128,9 +118,7 @@ test('public aliases match only the package root and precede compatibility @', a
     assert.equal(publicFind.test('@kohakuterrarium/chat-ui/private'), false, file)
   }
 
-  const webviewFiles = fs
-    .readdirSync(path.join(root, 'src', 'webview'), { recursive: true })
-    .filter((name) => /\.(?:js|vue)$/.test(name))
+  const webviewFiles = fs.readdirSync(path.join(root, 'src', 'webview'), { recursive: true }).filter((name) => /\.(?:js|vue)$/.test(name))
   for (const name of webviewFiles) {
     const source = read(path.join(root, 'src', 'webview', name))
     const privateImports = [...source.matchAll(/from ['"](@\/[^'"]+)['"]/g)].map((match) => match[1])

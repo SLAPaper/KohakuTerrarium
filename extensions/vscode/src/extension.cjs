@@ -162,22 +162,13 @@ function activate(context) {
       const webview = view.webview
       webview.options = {
         enableScripts: true,
-        localResourceRoots: [
-          vscode.Uri.joinPath(context.extensionUri, 'dist'),
-          vscode.Uri.joinPath(context.extensionUri, 'media'),
-        ],
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'dist'), vscode.Uri.joinPath(context.extensionUri, 'media')],
       }
       webview.html = renderWebviewHtml({
         cspSource: webview.cspSource,
-        scriptUri: String(
-          webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview.js')),
-        ),
-        styleUri: String(
-          webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview.css')),
-        ),
-        brandUri: String(
-          webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'kohaku-icon.png')),
-        ),
+        scriptUri: String(webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview.js'))),
+        styleUri: String(webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'dist', 'webview.css'))),
+        brandUri: String(webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'kohaku-icon.png'))),
         nonce: crypto.randomBytes(16).toString('base64'),
       })
 
@@ -250,8 +241,7 @@ function activate(context) {
             if (runtimeEpoch !== epoch || runtime !== createdRuntime) return false
             return webview.postMessage(response)
           },
-          getDefaultCreature: () =>
-            vscode.workspace.getConfiguration('kohakuterrarium').get('defaultCreature', ''),
+          getDefaultCreature: () => vscode.workspace.getConfiguration('kohakuterrarium').get('defaultCreature', ''),
           getWorkspacePath: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || null,
           socketFactory: (url, protocols) => new WebSocket(url, protocols),
           webSocketBase: webSocketBase(connection.endpoint),
@@ -357,11 +347,18 @@ function activate(context) {
     },
   }
 
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider('kohakuterrarium.chat', provider),
-  )
+  context.subscriptions.push(vscode.window.registerWebviewViewProvider('kohakuterrarium.chat', provider))
 }
 
 function deactivate() {}
 
-module.exports = { activate, configure, confirmContextClear, dispatchContextCommand, deactivate, resolveConnection, tokenRequired, webSocketBase }
+module.exports = {
+  activate,
+  configure,
+  confirmContextClear,
+  dispatchContextCommand,
+  deactivate,
+  resolveConnection,
+  tokenRequired,
+  webSocketBase,
+}

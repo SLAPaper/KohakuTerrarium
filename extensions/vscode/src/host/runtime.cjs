@@ -47,11 +47,7 @@ class RuntimeHost {
 
   requireSelection(message) {
     const selection = this.state.selection
-    if (
-      !selection ||
-      selection.session !== message.session ||
-      selection.creature !== message.creature
-    ) {
+    if (!selection || selection.session !== message.session || selection.creature !== message.creature) {
       throw Error('Selected Creature ownership changed')
     }
     return selection
@@ -88,13 +84,9 @@ class RuntimeHost {
     }
     const sessions = await this.client.listOpen()
     const session = sessions.find(
-      (candidate) =>
-        candidate.isLive &&
-        candidate.creatures.some((creature) => creature.id === current.targetCreatureId),
+      (candidate) => candidate.isLive && candidate.creatures.some((creature) => creature.id === current.targetCreatureId),
     )
-    const creature = session?.creatures.find(
-      (candidate) => candidate.id === current.targetCreatureId,
-    )
+    const creature = session?.creatures.find((candidate) => candidate.id === current.targetCreatureId)
     const selection =
       session && creature
         ? {
@@ -104,10 +96,7 @@ class RuntimeHost {
             targetCreatureId: current.targetCreatureId,
           }
         : null
-    const changed =
-      !selection ||
-      selection.session !== current.session ||
-      selection.creature !== current.creature
+    const changed = !selection || selection.session !== current.session || selection.creature !== current.creature
     if (!changed) {
       return { selection: current, changed: false, selectionVersion: this.selectionVersion }
     }
@@ -119,9 +108,7 @@ class RuntimeHost {
 
   async selectOwned(message) {
     const active = await this.client.active(message.session)
-    const selected = active.creatures?.find(
-      (creature) => String(creature.creature_id ?? creature.id) === message.creatureId,
-    )
+    const selected = active.creatures?.find((creature) => String(creature.creature_id ?? creature.id) === message.creatureId)
     if (!selected?.name) throw Error('Selected Creature is not in the active Session')
     const selection = {
       session: active.session_id ?? message.session,
@@ -157,10 +144,12 @@ class RuntimeHost {
 
   ownsContextCommand(capability) {
     const owned = contextCapabilities.get(capability)
-    return owned?.runtime === this &&
+    return (
+      owned?.runtime === this &&
       owned.runtimeEpoch === this.runtimeEpoch &&
       owned.selected === this.state.selection &&
       owned.selectionVersion === this.selectionVersion
+    )
   }
 
   async contextCommandOwned(message, capability) {
@@ -175,11 +164,7 @@ class RuntimeHost {
 
   async stopOwned(message) {
     const selected = this.state.selection
-    if (
-      !selected ||
-      selected.session !== message.session ||
-      selected.targetCreatureId !== message.creatureId
-    ) {
+    if (!selected || selected.session !== message.session || selected.targetCreatureId !== message.creatureId) {
       throw Error('Session ownership changed')
     }
     await this.client.stop(selected.session)
@@ -276,9 +261,7 @@ class RuntimeHost {
       case 'context.clear': {
         const capability = message.contextCapability || this.acquireContextCommand()
         if (!capability) throw Error('Select a Creature before managing context')
-        const data = await this.enqueueSelectionOperation(() =>
-          this.contextCommandOwned(message, capability),
-        )
+        const data = await this.enqueueSelectionOperation(() => this.contextCommandOwned(message, capability))
         this.post({ type: `${message.type}.result`, id: message.id, data })
         return
       }
@@ -289,11 +272,7 @@ class RuntimeHost {
         this.sockets.open(
           this.generation,
           message.id,
-          () =>
-            this.socketFactory(
-              `${this.webSocketBase}${route}`,
-              this.token ? [`kt-token.${this.token}`] : [],
-            ),
+          () => this.socketFactory(`${this.webSocketBase}${route}`, this.token ? [`kt-token.${this.token}`] : []),
           { postMessage: this.post },
         )
         return

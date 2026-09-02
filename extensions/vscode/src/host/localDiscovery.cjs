@@ -54,11 +54,7 @@ async function verifyKtProbe(endpoint, timeoutMs = 500) {
     })
     if (!response.ok) return false
     const body = await response.json()
-    return (
-      typeof body?.version === 'string' &&
-      Number.isSafeInteger(body?.daemon?.pid) &&
-      typeof body?.daemon?.mode === 'string'
-    )
+    return typeof body?.version === 'string' && Number.isSafeInteger(body?.daemon?.pid) && typeof body?.daemon?.mode === 'string'
   } finally {
     clearTimeout(timer)
   }

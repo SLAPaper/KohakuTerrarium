@@ -6,9 +6,7 @@ const test = require('node:test')
 const root = path.resolve(__dirname, '..')
 
 async function helpers() {
-  return import(
-    pathToFileURL(path.join(root, 'src', 'webview', 'hostAcceptedChat.mjs'))
-  )
+  return import(pathToFileURL(path.join(root, 'src', 'webview', 'hostAcceptedChat.mjs')))
 }
 
 test('Host-rejected input restores only its Extension-owned optimistic state', async () => {
@@ -160,9 +158,7 @@ test('callback failure still honors backend acceptance before deciding rollback'
           target: 'worker',
           event_id: 'event-1',
         }),
-        confirmation: new Promise(
-          (resolve, reject) => (rejectConfirmation = reject),
-        ),
+        confirmation: new Promise((resolve, reject) => (rejectConfirmation = reject)),
       }
     },
   }
@@ -208,10 +204,7 @@ test('Host-rejected UI reply restores its prompt without changing the shared sto
   }
   const accepted = createHostAcceptedChat({ BridgeWebSocket, chat })
 
-  await assert.rejects(
-    accepted.submitUIReply('worker', 'event-1', 'submit', { text: 'hi' }),
-    /Host rejected reply/,
-  )
+  await assert.rejects(accepted.submitUIReply('worker', 'event-1', 'submit', { text: 'hi' }), /Host rejected reply/)
   assert.deepEqual(prompt, {
     role: 'ui_event',
     eventId: 'event-1',
@@ -403,10 +396,7 @@ test('pending UI reply rejects duplicate clicks until Host settles', async () =>
   const accepted = createHostAcceptedChat({ BridgeWebSocket, chat })
 
   const first = accepted.submitUIReply('worker', 'event-1', 'submit', {})
-  await assert.rejects(
-    accepted.submitUIReply('worker', 'event-1', 'submit', {}),
-    /already pending/,
-  )
+  await assert.rejects(accepted.submitUIReply('worker', 'event-1', 'submit', {}), /already pending/)
   resolveConfirmation()
   await first
   assert.equal(sends, 1)
@@ -437,19 +427,13 @@ test('failed UI reply can be retried after Host settlement', async () => {
           target: 'worker',
           event_id: 'event-1',
         }),
-        confirmation:
-          attempt === 1
-            ? Promise.reject(Error('Host rejected reply'))
-            : Promise.resolve(),
+        confirmation: attempt === 1 ? Promise.reject(Error('Host rejected reply')) : Promise.resolve(),
       }
     },
   }
   const accepted = createHostAcceptedChat({ BridgeWebSocket, chat })
 
-  await assert.rejects(
-    accepted.submitUIReply('worker', 'event-1', 'submit', {}),
-    /Host rejected reply/,
-  )
+  await assert.rejects(accepted.submitUIReply('worker', 'event-1', 'submit', {}), /Host rejected reply/)
   await accepted.submitUIReply('worker', 'event-1', 'submit', {})
   assert.equal(attempt, 2)
 })

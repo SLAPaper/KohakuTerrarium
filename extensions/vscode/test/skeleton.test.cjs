@@ -41,9 +41,7 @@ function readZipEntry(archive, entryName) {
 }
 
 test('CI validates Extension tests, build, package, and public chat boundary', () => {
-  const workflow = fs
-    .readFileSync(path.resolve(ROOT, '..', '..', '.github', 'workflows', 'ci.yml'), 'utf8')
-    .replaceAll('\r\n', '\n')
+  const workflow = fs.readFileSync(path.resolve(ROOT, '..', '..', '.github', 'workflows', 'ci.yml'), 'utf8').replaceAll('\r\n', '\n')
   const start = workflow.indexOf('  vscode-extension-check:\n')
   assert.notEqual(start, -1)
   const jobTail = workflow.slice(start + 2)
@@ -56,20 +54,17 @@ test('CI validates Extension tests, build, package, and public chat boundary', (
   assert.match(job, /\n          cache: npm\n/)
   assert.match(job, /\n          cache-dependency-path: extensions\/vscode\/package-lock\.json\n/)
   const commands = [...job.matchAll(/^      - run: (.+)$/gm)].map((match) => match[1])
-  assert.deepEqual(commands, ["npm ci", "npm test", "npm run build", "npm run package"])
+  assert.deepEqual(commands, ['npm ci', 'npm run format:check', 'npm test', 'npm run build', 'npm run package'])
   assert.match(
     job,
     /- name: Install frontend config dependencies\n        working-directory: src\/kohakuterrarium-frontend\n        run: npm ci\n/,
   )
-  assert.match(
-    job,
-    /- name: Verify public chat import boundary\n        run: node --test test\/chat-ui-boundary\.test\.cjs\n/,
-  )
+  assert.match(job, /- name: Verify public chat import boundary\n        run: node --test test\/chat-ui-boundary\.test\.cjs\n/)
   assert.match(job, /- name: Verify packaged extension\n        shell: bash\n        run: \|\n/)
   for (const contract of [
     'test "${#packages[@]}" -eq 1',
     'test -s "${packages[0]}"',
-    "node node_modules/@vscode/vsce/vsce ls",
+    'node node_modules/@vscode/vsce/vsce ls',
     "grep -Fx 'LICENSE'",
     "grep -Fx 'dist/extension.cjs'",
     "grep -Fx 'dist/webview.js'",
@@ -88,9 +83,7 @@ test('manifest defines a workspace sidebar extension and deterministic package s
   assert.equal(manifest.main, './dist/extension.cjs')
   assert.deepEqual(manifest.extensionKind, ['workspace'])
   assert.ok(manifest.activationEvents.includes('onView:kohakuterrarium.chat'))
-  assert.deepEqual(manifest.contributes.views.kohakuterrarium, [
-    { type: 'webview', id: 'kohakuterrarium.chat', name: 'KohakuTerrarium' },
-  ])
+  assert.deepEqual(manifest.contributes.views.kohakuterrarium, [{ type: 'webview', id: 'kohakuterrarium.chat', name: 'KohakuTerrarium' }])
   assert.deepEqual(manifest.contributes.commands, [
     {
       command: 'kohakuterrarium.configure',
@@ -102,6 +95,8 @@ test('manifest defines a workspace sidebar extension and deterministic package s
     },
   ])
   assert.equal(manifest.contributes.configuration.properties['kohakuterrarium.defaultCreature'].scope, 'machine')
+  assert.equal(manifest.scripts.format, 'prettier --write .prettierrc.json scripts/ src/ test/ package.json vite.config.mjs')
+  assert.equal(manifest.scripts['format:check'], 'prettier --check .prettierrc.json scripts/ src/ test/ package.json vite.config.mjs')
   assert.equal(manifest.scripts.test, 'node --test test/*.test.cjs')
   assert.equal(manifest.scripts.build, 'node scripts/build.cjs')
   assert.equal(manifest.scripts.package, 'npm run build && vsce package --no-dependencies')
@@ -109,6 +104,8 @@ test('manifest defines a workspace sidebar extension and deterministic package s
   assert.equal(manifest.license, 'LicenseRef-KohakuTerrarium-1.0')
   const lockManifest = JSON.parse(read('package-lock.json')).packages['']
   assert.equal(lockManifest.license, manifest.license)
+  assert.equal(manifest.devDependencies.prettier, '^3.8.2')
+  assert.equal(lockManifest.devDependencies.prettier, manifest.devDependencies.prettier)
   const rootLicense = fs.readFileSync(path.resolve(ROOT, '..', '..', 'LICENSE'), 'utf8')
   assert.equal(read('LICENSE'), rootLicense)
   assert.match(rootLicense, /KohakuTerrarium License/)
@@ -134,13 +131,7 @@ test('packaged VSIX carries the repository license', async () => {
     })
     execFileSync(
       process.execPath,
-      [
-        path.join(ROOT, 'node_modules', '@vscode', 'vsce', 'vsce'),
-        'package',
-        '--no-dependencies',
-        '--out',
-        archive,
-      ],
+      [path.join(ROOT, 'node_modules', '@vscode', 'vsce', 'vsce'), 'package', '--no-dependencies', '--out', archive],
       { cwd: ROOT, stdio: 'pipe' },
     )
     assert.equal(await readZipEntry(archive, 'extension/LICENSE.txt'), read('LICENSE'))

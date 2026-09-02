@@ -1,10 +1,4 @@
-async function resolveLocalConnection({
-  discover,
-  getStoredToken,
-  promptToken,
-  storeToken = async () => {},
-  verify,
-}) {
+async function resolveLocalConnection({ discover, getStoredToken, promptToken, storeToken = async () => {}, verify }) {
   const local = await discover()
   if (!local.requiresToken) {
     const connection = { ...local, token: '' }

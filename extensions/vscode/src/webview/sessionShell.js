@@ -45,9 +45,7 @@ export function createSessionShell({ api, chat }) {
   return {
     list: () => api.list(),
     restore: (session, selection) => {
-      const creature = session.creatures.find(
-        (candidate) => candidate.id === selection.targetCreatureId,
-      )
+      const creature = session.creatures.find((candidate) => candidate.id === selection.targetCreatureId)
       if (!creature || session.runtimeId !== selection.session) {
         throw Error('Reconciled Creature is not in Sessions')
       }

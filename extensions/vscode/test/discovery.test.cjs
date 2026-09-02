@@ -58,11 +58,7 @@ test('stale daemon state falls back to a bounded loopback port probe', async () 
 
   assert.equal(result.endpoint, 'http://127.0.0.1:8002')
   assert.equal(result.source, 'probe')
-  assert.deepEqual(calls, [
-    'http://127.0.0.1:8001',
-    'http://127.0.0.1:8002',
-    'http://127.0.0.1:8003',
-  ])
+  assert.deepEqual(calls, ['http://127.0.0.1:8001', 'http://127.0.0.1:8002', 'http://127.0.0.1:8003'])
 })
 
 test('bounded probe continues within a batch after a false identity match', async () => {
@@ -96,7 +92,10 @@ test('bounded probe rejects strict-token candidates and requires KT diagnostics 
       readState: async () => null,
       ports: [8001],
       probe: async () => strictCapabilities,
-      verifyProbe: async () => { diagnostics++; return true },
+      verifyProbe: async () => {
+        diagnostics++
+        return true
+      },
     }),
     /No supported local KohakuTerrarium service was found/,
   )

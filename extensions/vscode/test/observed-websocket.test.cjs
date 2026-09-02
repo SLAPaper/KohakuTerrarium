@@ -8,10 +8,7 @@ const root = path.resolve(__dirname, '..')
 let BridgeWebSocket
 
 test.before(async () => {
-  const source = fs.readFileSync(
-    path.join(root, 'src', 'webview', 'bridge.js'),
-    'utf8',
-  )
+  const source = fs.readFileSync(path.join(root, 'src', 'webview', 'bridge.js'), 'utf8')
   const moduleUrl = `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
   ;({ BridgeWebSocket } = await import(moduleUrl))
 })
@@ -29,9 +26,7 @@ test('observed production Bridge WebSocket sees backend frames before chat store
   )
   const observed = []
   const handled = []
-  const ObservedWebSocket = createObservedWebSocket(BridgeWebSocket, (frame) =>
-    observed.push(frame),
-  )
+  const ObservedWebSocket = createObservedWebSocket(BridgeWebSocket, (frame) => observed.push(frame))
   const socket = new ObservedWebSocket('ws://bridge')
   socket.onmessage = (event) => handled.push(JSON.parse(event.data))
   BridgeWebSocket.receive({ type: 'ws.opened', id: socket.id })

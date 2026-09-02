@@ -21,7 +21,8 @@ test('protocol accepts the formal vertical-slice messages with strict fields', (
     { type: 'ws.open', id: 7 },
     { type: 'ws.send', id: 7, sendId: 1, data: '{"type":"input"}' },
     { type: 'ws.close', id: 7 },
-  ]) assert.equal(allowedMessage(message), true, message.type)
+  ])
+    assert.equal(allowedMessage(message), true, message.type)
 
   for (const message of [
     { type: 'session.select', id: 8, session: 'graph-1' },
@@ -35,7 +36,8 @@ test('protocol accepts the formal vertical-slice messages with strict fields', (
     { type: 'context.compact', id: 20, command: 'stop' },
     { type: 'context.clear', id: 21, args: ['anything'] },
     { type: 'command.execute', id: 22, command: 'clear', args: [] },
-  ]) assert.equal(allowedMessage(message), false, message.type)
+  ])
+    assert.equal(allowedMessage(message), false, message.type)
 })
 
 test('endpoint validation allows explicit loopback HTTP only', () => {
@@ -47,7 +49,8 @@ test('endpoint validation allows explicit loopback HTTP only', () => {
     'http://localhost:8000',
     'http://127.0.0.1:8000/path',
     'http://user:pass@127.0.0.1:8000',
-  ]) assert.throws(() => validateEndpoint(value))
+  ])
+    assert.throws(() => validateEndpoint(value))
 })
 
 test('Host client omits credentials for loopback-bypass mode', async () => {

@@ -37,11 +37,7 @@ test('session shell selects by stable Creature id and unbinds only after Host su
 
   const attached = await shell.open(session, 'creature-b')
 
-  assert.deepEqual(calls, [
-    ['select', { session: 'graph-one', creatureId: 'creature-b' }],
-    'unbind',
-    ['init', 'same-name', false],
-  ])
+  assert.deepEqual(calls, [['select', { session: 'graph-one', creatureId: 'creature-b' }], 'unbind', ['init', 'same-name', false]])
   assert.equal(attached.targetCreatureId, 'creature-b')
 })
 
@@ -64,10 +60,7 @@ test('stop unbinds only after Host ownership is stopped', async () => {
 
   await shell.stop(current)
 
-  assert.deepEqual(calls, [
-    ['stop', { session: 'graph-one', creatureId: 'creature-a' }],
-    'unbind',
-  ])
+  assert.deepEqual(calls, [['stop', { session: 'graph-one', creatureId: 'creature-a' }], 'unbind'])
 })
 
 test('resume attaches a single Creature by stable id and leaves multi-Creature sessions unselected', async () => {
@@ -109,10 +102,7 @@ test('resume attaches a single Creature by stable id and leaves multi-Creature s
   const multi = await shell.resume('multi')
 
   assert.equal(single.targetCreatureId, 'creature-single')
-  assert.deepEqual(calls, [
-    { session: 'graph-single', creatureId: 'creature-single' },
-    'clear',
-  ])
+  assert.deepEqual(calls, [{ session: 'graph-single', creatureId: 'creature-single' }, 'clear'])
   assert.deepEqual(multi, { session: sessions.multi, target: null, targetCreatureId: null })
 })
 
@@ -126,7 +116,11 @@ test('restore consumes a Host-reconciled stable selection without selecting agai
     creatures: [{ id: 'creature-b', name: 'renamed' }],
   }
   const shell = createSessionShell({
-    api: { select: async () => { throw Error('must not select again') } },
+    api: {
+      select: async () => {
+        throw Error('must not select again')
+      },
+    },
     chat: {
       unbindFromInstance: () => calls.push('unbind'),
       initForInstance: (_instance, options) => calls.push(['init', options.initialTab, options.autoReconnect]),
@@ -147,9 +141,15 @@ test('Host selection failure preserves the old production chat binding', async (
   const { createSessionShell } = await loadSessionShell()
   let unbound = false
   const shell = createSessionShell({
-    api: { select: async () => { throw Error('selection failed') } },
+    api: {
+      select: async () => {
+        throw Error('selection failed')
+      },
+    },
     chat: {
-      unbindFromInstance: () => { unbound = true },
+      unbindFromInstance: () => {
+        unbound = true
+      },
       initForInstance() {},
     },
   })

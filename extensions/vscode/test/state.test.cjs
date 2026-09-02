@@ -10,7 +10,9 @@ test('connection state updates are serialized and the newest configuration wins'
     get: () => value,
     async update(_key, next) {
       if (next.endpoint === 'old' && next.selection) {
-        await new Promise((resolve) => { releaseOld = resolve })
+        await new Promise((resolve) => {
+          releaseOld = resolve
+        })
       }
       value = next
     },
@@ -36,11 +38,7 @@ test('a guarded stale selection write can no-op at execution time', async () => 
   }
   const writer = new ConnectionStateWriter(workspaceState, 'connection')
 
-  await writer.update((current) =>
-    current.endpoint === 'old'
-      ? { endpoint: 'old', selection: { session: 'stale' } }
-      : undefined,
-  )
+  await writer.update((current) => (current.endpoint === 'old' ? { endpoint: 'old', selection: { session: 'stale' } } : undefined))
 
   assert.deepEqual(value, { endpoint: 'new', selection: null })
 })

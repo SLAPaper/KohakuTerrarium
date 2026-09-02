@@ -28,10 +28,7 @@ test('VS Code conversation text uses the public shared Markdown renderer', () =>
   const webview = read(path.join(root, 'src', 'webview', 'index.js'))
   const renderers = read(path.join(root, 'src', 'webview', 'viewRenderers.mjs'))
 
-  assert.match(
-    webview,
-    /import\s*\{[^}]*\bMarkdownRenderer\b[^}]*\}\s*from ['"]@kohakuterrarium\/chat-ui['"]/s,
-  )
+  assert.match(webview, /import\s*\{[^}]*\bMarkdownRenderer\b[^}]*\}\s*from ['"]@kohakuterrarium\/chat-ui['"]/s)
   assert.match(webview, /createViewRenderers\(\{[\s\S]*MarkdownRenderer/)
   assert.match(
     renderers,
@@ -59,11 +56,8 @@ test('Dashboard and VS Code consume one host-neutral transcript section', () => 
 test('VS Code uses the exact public shared composer without a private input or separate turn stop', () => {
   const webview = read(path.join(root, 'src', 'webview', 'index.js'))
 
-  assert.match(
-    webview,
-    /import\s*\{[^}]*\bChatComposer\b[^}]*\}\s*from ['"]@kohakuterrarium\/chat-ui['"]/s,
-  )
-  assert.match(webview, /h\(ChatComposer,\s*\{/)
+  assert.match(webview, /import\s*\{[^}]*\bChatComposer\b[^}]*\}\s*from ['"]@kohakuterrarium\/chat-ui['"]/s)
+  assert.match(webview, /h\(\s*ChatComposer,\s*\{/)
   assert.doesNotMatch(webview, /h\(['"]input['"],\s*\{[^}]*aria-label:\s*['"]Message['"]/s)
   assert.doesNotMatch(webview, /Stop Turn|stop-turn/)
   assert.match(webview, /processing:\s*!!chat\.processingByTab\[tab\.value\]/)
@@ -135,7 +129,10 @@ test('VS Code windows transcript rendering and separates structural from tail ob
   assert.equal((webview.match(/createMessageSequence\(messages\.value\)/g) || []).length, 1)
   assert.match(webview, /const messageSequence = computed\(\(\) => createMessageSequence\(messages\.value\)\)/)
   assert.match(webview, /watch\(\s*\(\) => \(\{\s*identity: scrollIdentity\.value,\s*sequence: messageSequence\.value,\s*\}\)/s)
-  assert.match(webview, /watch\(\s*\(\) => \(\{\s*identity: scrollIdentity\.value,\s*structure: messageStructure\.value,\s*tail: messageTail\.value,\s*\}\)/s)
+  assert.match(
+    webview,
+    /watch\(\s*\(\) => \(\{\s*identity: scrollIdentity\.value,\s*structure: messageStructure\.value,\s*tail: messageTail\.value,\s*\}\)/s,
+  )
   assert.match(webview, /const transcriptRevision = ref\(0\)/)
   assert.match(webview, /const transcriptView = computed\(\(\) => \{[\s\S]*transcriptRevision\.value[\s\S]*transcriptWindow\.view/s)
   assert.match(webview, /transcriptRevision\.value \+= 1/)
@@ -144,7 +141,10 @@ test('VS Code windows transcript rendering and separates structural from tail ob
   assert.match(webview, /previousMessage: transcriptView\.value\.previousMessage/)
   assert.match(webview, /earlierCount: transcriptView\.value\.earlierCount/)
   assert.match(webview, /onLoadEarlier: loadEarlierMessages/)
-  assert.match(webview, /function loadEarlierMessages\(\)[\s\S]*scroll\.beforePrepend\(\)[\s\S]*messageChanges\.afterMessagesChange\(scrollIdentity\.value, messageSequence\.value\)/)
+  assert.match(
+    webview,
+    /function loadEarlierMessages\(\)[\s\S]*scroll\.beforePrepend\(\)[\s\S]*messageChanges\.afterMessagesChange\(scrollIdentity\.value, messageSequence\.value\)/,
+  )
   assert.match(webview, /onViewportReady: transcriptCallbacks\.value\.onViewportReady/)
   assert.match(webview, /onScroll: transcriptCallbacks\.value\.onScroll/)
   assert.match(webview, /onReply: transcriptCallbacks\.value\.onReply/)

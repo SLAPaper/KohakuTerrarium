@@ -5,7 +5,14 @@ const test = require('node:test')
 
 async function loadWithChoice(choice) {
   const calls = []
-  const vscode = { window: { async showWarningMessage(...args) { calls.push(args); return choice } } }
+  const vscode = {
+    window: {
+      async showWarningMessage(...args) {
+        calls.push(args)
+        return choice
+      },
+    },
+  }
   const originalLoad = Module._load
   Module._load = function (request, parent, isMain) {
     if (request === 'vscode') return vscode
@@ -24,11 +31,7 @@ async function loadWithChoice(choice) {
 test('clear context uses an explicit native modal confirmation', async () => {
   const { extension, calls } = await loadWithChoice('Clear Context')
   assert.equal(await extension.confirmContextClear(), true)
-  assert.deepEqual(calls[0], [
-    'Clear the active Creature context? Session history remains available.',
-    { modal: true },
-    'Clear Context',
-  ])
+  assert.deepEqual(calls[0], ['Clear the active Creature context? Session history remains available.', { modal: true }, 'Clear Context'])
 })
 
 test('clear context cancellation fails closed', async () => {
@@ -42,9 +45,17 @@ function runtimeHarness() {
   const runtime = {
     acquireContextCommand: () => ({ capability: true }),
     ownsContextCommand: () => owned,
-    async handle(message) { calls.push(message) },
+    async handle(message) {
+      calls.push(message)
+    },
   }
-  return { runtime, calls, supersede: () => { owned = false } }
+  return {
+    runtime,
+    calls,
+    supersede: () => {
+      owned = false
+    },
+  }
 }
 
 test('clear captures runtime and selection ownership before confirmation', async () => {
@@ -52,7 +63,9 @@ test('clear captures runtime and selection ownership before confirmation', async
   const first = runtimeHarness()
   let current = first.runtime
   let resolveConfirmation
-  const confirmation = new Promise((resolve) => { resolveConfirmation = resolve })
+  const confirmation = new Promise((resolve) => {
+    resolveConfirmation = resolve
+  })
   const posts = []
 
   const pending = extension.dispatchContextCommand({
@@ -69,9 +82,13 @@ test('clear captures runtime and selection ownership before confirmation', async
   await pending
 
   assert.deepEqual(first.calls, [])
-  assert.deepEqual(posts, [{
-    type: 'context.clear.result', id: 7, data: { cancelled: true, superseded: true },
-  }])
+  assert.deepEqual(posts, [
+    {
+      type: 'context.clear.result',
+      id: 7,
+      data: { cancelled: true, superseded: true },
+    },
+  ])
 })
 
 test('clear executes only for the same confirmed ownership and cancel never executes', async () => {
@@ -83,10 +100,14 @@ test('clear executes only for the same confirmed ownership and cancel never exec
     post: async () => {},
   }
   await extension.dispatchContextCommand({
-    ...args, message: { type: 'context.clear', id: 8 }, confirmClear: async () => true,
+    ...args,
+    message: { type: 'context.clear', id: 8 },
+    confirmClear: async () => true,
   })
   await extension.dispatchContextCommand({
-    ...args, message: { type: 'context.clear', id: 9 }, confirmClear: async () => false,
+    ...args,
+    message: { type: 'context.clear', id: 9 },
+    confirmClear: async () => false,
   })
   assert.equal(owned.calls.length, 1)
   assert.equal(owned.calls[0].type, 'context.clear')

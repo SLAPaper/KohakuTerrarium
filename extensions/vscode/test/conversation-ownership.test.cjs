@@ -7,12 +7,8 @@ let createConversationOwnership
 let isConversationSuperseded
 
 test.before(async () => {
-  ;({
-    createConversationAttachments,
-    createConversationDrafts,
-    createConversationOwnership,
-    isConversationSuperseded,
-  } = await import('../src/webview/conversationOwnership.mjs'))
+  ;({ createConversationAttachments, createConversationDrafts, createConversationOwnership, isConversationSuperseded } =
+    await import('../src/webview/conversationOwnership.mjs'))
 })
 
 function deferred() {
