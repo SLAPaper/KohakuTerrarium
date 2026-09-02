@@ -16,6 +16,7 @@ import {
   isConversationSuperseded,
 } from './conversationOwnership.mjs'
 import { createReadyCoordinator } from './readyCoordinator.mjs'
+import { settleRequestMessage } from './requestDemux.mjs'
 import { createSelectionVersionOwner } from './selectionVersion.mjs'
 import { createSessionShell } from './sessionShell.js'
 import { createSubmitGate, isComposerSubmitDisabled } from './submitGate.mjs'
@@ -50,8 +51,8 @@ function request(type, data = {}, onSend = () => {}) {
       pending.delete(id)
       reject(Error('KohakuTerrarium request timed out'))
     }, 30000)
-    pending.set(id, { resolve, reject, timer })
-    vscode.postMessage({ type, id, ...data })
+    pending.set(id, { resolve, reject, timer, type })
+    vscode.postMessage({ type, requestId: id, ...data })
   })
 }
 
@@ -248,7 +249,12 @@ const App = {
         }
       },
       async applyFailure(cause, isCurrent) {
-        if (isCurrent()) error.value = cause.message
+        if (!isCurrent()) return
+        available.value = false
+        chat.unbindFromInstance()
+        currentSession.value = null
+        sessions.value = []
+        error.value = cause.message
       },
     })
 
@@ -432,13 +438,7 @@ const App = {
           })
         return
       }
-      if (message?.id && pending.has(message.id)) {
-        const promise = pending.get(message.id)
-        pending.delete(message.id)
-        clearTimeout(promise.timer)
-        if (message.type === 'error') promise.reject(Error(message.error))
-        else promise.resolve(message.data)
-      }
+      settleRequestMessage(pending, message)
     }
     window.addEventListener('message', receiveHostMessage)
     onBeforeUnmount(() => {

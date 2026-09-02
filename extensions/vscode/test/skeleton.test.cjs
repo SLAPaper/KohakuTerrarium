@@ -146,17 +146,17 @@ test('fixed protocol accepts only shell messages and rejects host capabilities f
   const { allowedMessage } = require('../src/host/protocol.cjs')
 
   for (const message of [
-    { type: 'ready', id: 1 },
-    { type: 'session.list', id: 2 },
-    { type: 'session.create', id: 3 },
+    { type: 'ready', requestId: 1 },
+    { type: 'session.list', requestId: 2 },
+    { type: 'session.create', requestId: 3 },
   ]) {
     assert.equal(allowedMessage(message), true)
   }
 
   for (const message of [
-    { type: 'session.create', id: 4, token: 'secret' },
-    { type: 'session.create', id: 5, configPath: 'C:/secret/config' },
-    { type: 'session.create', id: 6, pwd: 'C:/workspace' },
+    { type: 'session.create', requestId: 4, token: 'secret' },
+    { type: 'session.create', requestId: 5, configPath: 'C:/secret/config' },
+    { type: 'session.create', requestId: 6, pwd: 'C:/workspace' },
     { type: 'unknown', id: 7 },
     { type: 'ready' },
   ]) {

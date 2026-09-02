@@ -34,9 +34,11 @@ function hasText(value) {
 
 function allowedMessage(message) {
   if (!message || typeof message !== 'object' || Array.isArray(message)) return false
-  if (!ALLOWED.has(message.type) || !Number.isSafeInteger(message.id) || message.id < 1) {
-    return false
-  }
+  if (!ALLOWED.has(message.type) || Object.hasOwn(message, 'id')) return false
+  const socketMessage = message.type.startsWith('ws.')
+  const identifier = socketMessage ? message.socketId : message.requestId
+  if (!Number.isSafeInteger(identifier) || identifier < 1) return false
+  if (socketMessage ? Object.hasOwn(message, 'requestId') : Object.hasOwn(message, 'socketId')) return false
   if (FORBIDDEN_FIELDS.some((field) => Object.hasOwn(message, field))) return false
 
   switch (message.type) {
@@ -52,7 +54,7 @@ function allowedMessage(message) {
       return hasText(message.data) && Number.isSafeInteger(message.sendId) && message.sendId > 0
     case 'context.compact':
     case 'context.clear':
-      return Object.keys(message).every((field) => field === 'type' || field === 'id')
+      return Object.keys(message).every((field) => field === 'type' || field === 'requestId')
     default:
       return true
   }

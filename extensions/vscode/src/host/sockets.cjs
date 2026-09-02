@@ -9,32 +9,34 @@ class SocketOwners {
     return this.generation
   }
 
-  open(generation, id, factory, view) {
-    if (generation !== this.generation) return null
-    this.sockets.get(id)?.close()
+  open(generation, socketId, factory, view) {
+    if (generation !== this.generation) {
+      view.postMessage({ type: 'ws.closed', socketId, code: 1008 })
+      return null
+    }
+    this.sockets.get(socketId)?.close()
     let socket
     try {
       socket = factory()
     } catch (error) {
-      view.postMessage({ type: 'ws.error', id })
-      view.postMessage({ type: 'ws.closed', id, code: 1011 })
+      view.postMessage({ type: 'ws.closed', socketId, code: 1011 })
       throw error
     }
-    this.sockets.set(id, socket)
-    const owned = () => this.generation === generation && this.sockets.get(id) === socket
-    socket.onopen = () => owned() && view.postMessage({ type: 'ws.opened', id })
-    socket.onmessage = (event) => owned() && view.postMessage({ type: 'ws.frame', id, data: String(event.data) })
+    this.sockets.set(socketId, socket)
+    const owned = () => this.generation === generation && this.sockets.get(socketId) === socket
+    socket.onopen = () => owned() && view.postMessage({ type: 'ws.opened', socketId })
+    socket.onmessage = (event) => owned() && view.postMessage({ type: 'ws.frame', socketId, data: String(event.data) })
     socket.onerror = () => {
       if (!owned()) return
-      view.postMessage({ type: 'ws.error', id })
-      this.sockets.delete(id)
-      view.postMessage({ type: 'ws.closed', id, code: 1011 })
+      view.postMessage({ type: 'ws.error', socketId })
+      this.sockets.delete(socketId)
+      view.postMessage({ type: 'ws.closed', socketId, code: 1011 })
       socket.close()
     }
     socket.onclose = (event) => {
       if (!owned()) return
-      this.sockets.delete(id)
-      view.postMessage({ type: 'ws.closed', id, code: event.code })
+      this.sockets.delete(socketId)
+      view.postMessage({ type: 'ws.closed', socketId, code: event.code })
     }
     return socket
   }
@@ -47,10 +49,16 @@ class SocketOwners {
     return true
   }
 
-  closeSocket(generation, id) {
-    if (generation !== this.generation) return false
+  closeSocket(generation, id, view = null) {
+    if (generation !== this.generation) {
+      view?.postMessage({ type: 'ws.closed', socketId: id, code: 1008 })
+      return false
+    }
     const socket = this.sockets.get(id)
-    if (!socket) return false
+    if (!socket) {
+      view?.postMessage({ type: 'ws.closed', socketId: id, code: 1000 })
+      return false
+    }
     socket.onclose?.({ code: 1000 })
     socket.close()
     return true

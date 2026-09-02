@@ -16,7 +16,7 @@ export class BridgeWebSocket {
     this.id = BridgeWebSocket.nextId++
     this.pendingSends = new Map()
     BridgeWebSocket.sockets.set(this.id, this)
-    BridgeWebSocket.post({ type: 'ws.open', id: this.id })
+    BridgeWebSocket.post({ type: 'ws.open', socketId: this.id })
   }
 
   send(data) {
@@ -36,14 +36,14 @@ export class BridgeWebSocket {
       frame: data,
       cancel: (error) => BridgeWebSocket.cancelSend(this, sendId, error),
     })
-    BridgeWebSocket.post({ type: 'ws.send', id: this.id, sendId, data })
+    BridgeWebSocket.post({ type: 'ws.send', socketId: this.id, sendId, data })
   }
 
   close() {
     if (this.readyState >= BridgeWebSocket.CLOSING) return
     this.readyState = BridgeWebSocket.CLOSING
     this.rejectPending(Error('Chat socket closed'))
-    BridgeWebSocket.post({ type: 'ws.close', id: this.id })
+    BridgeWebSocket.post({ type: 'ws.close', socketId: this.id })
   }
 
   rejectPending(error) {
@@ -106,7 +106,8 @@ export class BridgeWebSocket {
   }
 
   static receive(message) {
-    const socket = this.sockets.get(message.id)
+    if (!message || typeof message !== 'object' || Array.isArray(message)) return false
+    const socket = this.sockets.get(message.socketId)
     if (!socket) return
     if (message.type === 'ws.opened') {
       socket.readyState = this.OPEN
@@ -116,10 +117,16 @@ export class BridgeWebSocket {
     } else if (message.type === 'ws.closed') {
       socket.readyState = this.CLOSED
       socket.rejectPending(Error('Chat socket closed'))
-      this.sockets.delete(message.id)
+      this.sockets.delete(message.socketId)
       socket.onclose?.({ code: message.code || 1000, target: socket })
     } else if (message.type === 'ws.error') {
-      socket.onerror?.({ target: socket })
+      socket.onerror?.({ target: socket, error: message.error })
+      if (socket.readyState === this.CONNECTING || socket.readyState === this.CLOSING) {
+        socket.readyState = this.CLOSED
+        socket.rejectPending(Error(message.error || 'Chat socket failed'))
+        this.sockets.delete(message.socketId)
+        socket.onclose?.({ code: 1011, target: socket })
+      }
     } else if (message.type === 'ws.send.result') {
       this.settleSend(socket, message)
     } else if (message.type === 'ws.send.error') {

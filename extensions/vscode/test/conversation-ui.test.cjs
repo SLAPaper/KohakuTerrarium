@@ -152,6 +152,15 @@ test('VS Code windows transcript rendering and separates structural from tail ob
   assert.doesNotMatch(webview, /onScroll:\s*\(\(/)
 })
 
+test('ready failure clears stale runtime UI ownership', () => {
+  const webview = read(path.join(root, 'src', 'webview', 'index.js'))
+
+  assert.match(
+    webview,
+    /async applyFailure\(cause, isCurrent\) \{[\s\S]*available\.value = false[\s\S]*chat\.unbindFromInstance\(\)[\s\S]*currentSession\.value = null[\s\S]*sessions\.value = \[\][\s\S]*error\.value = cause\.message/,
+  )
+})
+
 test('shared conversation CSS is the only message visual source used by both hosts', () => {
   const sharedCss = path.join(frontend, 'components', 'chat', 'shared', 'conversation-message.css')
   const dashboard = read(path.join(frontend, 'components', 'chat', 'ChatMessage.vue'))

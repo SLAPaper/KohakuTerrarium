@@ -185,10 +185,10 @@ for (const staleOutcome of ['resolve', 'reject']) {
       },
     })
 
-    const stale = receiveMessage({ type: 'ready', id: 1 })
+    const stale = receiveMessage({ type: 'ready', requestId: 1 })
     assert.equal(builds.length, 1)
     await commands.get('kohakuterrarium.useAutomaticDiscovery')()
-    const replacement = receiveMessage({ type: 'ready', id: 2 })
+    const replacement = receiveMessage({ type: 'ready', requestId: 2 })
     assert.equal(builds.length, 2)
 
     if (staleOutcome === 'resolve') {
@@ -198,7 +198,7 @@ for (const staleOutcome of ['resolve', 'reject']) {
     }
     await stale
 
-    const shared = receiveMessage({ type: 'ready', id: 3 })
+    const shared = receiveMessage({ type: 'ready', requestId: 3 })
     assert.equal(builds.length, 2, 'the pending replacement build remains the shared promise')
     builds[1].resolve({ endpoint: 'http://127.0.0.1:8001', token: '', source: 'automatic' })
     await Promise.all([replacement, shared])

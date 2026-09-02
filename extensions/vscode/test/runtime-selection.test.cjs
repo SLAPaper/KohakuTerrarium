@@ -21,7 +21,7 @@ test('stale selection reconciliation cannot overwrite a concurrent explicit sele
 
   const selecting = host.handle({
     type: 'session.select',
-    id: 20,
+    requestId: 20,
     session: 'graph-b',
     creatureId: 'creature-beta',
   })
@@ -60,7 +60,7 @@ test('stale missing-selection reconciliation cannot clear a concurrent explicit 
 
   const selecting = host.handle({
     type: 'session.select',
-    id: 21,
+    requestId: 21,
     session: 'graph-b',
     creatureId: 'creature-beta',
   })
@@ -88,11 +88,11 @@ test('selection serializes reconcile after a pending explicit selection', async 
 
   const selecting = host.handle({
     type: 'session.select',
-    id: 30,
+    requestId: 30,
     session: 'graph-b',
     creatureId: 'creature-beta',
   })
-  const reconciling = host.handle({ type: 'session.reconcile', id: 31 })
+  const reconciling = host.handle({ type: 'session.reconcile', requestId: 31 })
   await Promise.resolve()
   assert.equal(updates.length, 0)
 
@@ -101,7 +101,7 @@ test('selection serializes reconcile after a pending explicit selection', async 
     creatures: [{ creature_id: 'creature-beta', name: 'beta' }],
   })
   await selecting
-  assert.equal(posts.at(-1).id, 30)
+  assert.equal(posts.at(-1).requestId, 30)
   assert.equal(state.selection.session, 'graph-b')
   const selectedGeneration = host.generation
   listed.resolve([
@@ -113,13 +113,13 @@ test('selection serializes reconcile after a pending explicit selection', async 
   ])
   await reconciling
 
-  assert.equal(posts.at(-1).id, 31)
+  assert.equal(posts.at(-1).requestId, 31)
   assert.equal(state.selection.session, 'graph-b')
   assert.equal(host.generation, selectedGeneration)
   assert.equal(sockets.beginCount, selectedGeneration)
   assert.equal(updates.length, 1)
-  assert.equal(posts.find((post) => post.id === 30).data.selectionVersion, 1)
-  assert.equal(posts.find((post) => post.id === 31).data.selectionVersion, 1)
+  assert.equal(posts.find((post) => post.requestId === 30).data.selectionVersion, 1)
+  assert.equal(posts.find((post) => post.requestId === 31).data.selectionVersion, 1)
 })
 
 test('selection serializes reconcile after a pending stop', async () => {
@@ -140,11 +140,11 @@ test('selection serializes reconcile after a pending stop', async () => {
 
   const stopping = host.handle({
     type: 'session.stop',
-    id: 32,
+    requestId: 32,
     session: 'graph-a',
     creatureId: 'creature-alpha',
   })
-  const reconciling = host.handle({ type: 'session.reconcile', id: 33 })
+  const reconciling = host.handle({ type: 'session.reconcile', requestId: 33 })
   await Promise.resolve()
   assert.equal(listCalls, 0)
   stopped.resolve({ status: 'stopped' })
@@ -162,11 +162,11 @@ test('a rejected selection operation does not poison the queue', async () => {
 
   const failed = host.handle({
     type: 'session.select',
-    id: 34,
+    requestId: 34,
     session: 'graph-missing',
     creatureId: 'creature-missing',
   })
-  const cleared = host.handle({ type: 'session.clearSelection', id: 35 })
+  const cleared = host.handle({ type: 'session.clearSelection', requestId: 35 })
   activated.reject(Error('active failed'))
 
   await assert.rejects(failed, /active failed/)
@@ -174,7 +174,7 @@ test('a rejected selection operation does not poison the queue', async () => {
   assert.equal(state.selection, null)
   assert.deepEqual(posts.at(-1), {
     type: 'session.clearSelection.result',
-    id: 35,
+    requestId: 35,
     data: { ok: true, selectionVersion: 0, readyId: 'ready-B' },
   })
 })
@@ -277,11 +277,11 @@ test('session.reconcile returns the authoritative selection for explicit recover
   }
   client.listOpen = async () => [{ runtimeId: 'graph-new', isLive: true, creatures: [{ id: 'creature-beta', name: 'beta' }] }]
 
-  await host.handle({ type: 'session.reconcile', id: 13 })
+  await host.handle({ type: 'session.reconcile', requestId: 13 })
 
   assert.deepEqual(posts.at(-1), {
     type: 'session.reconcile.result',
-    id: 13,
+    requestId: 13,
     data: {
       selection: {
         session: 'graph-new',
@@ -314,8 +314,8 @@ test('history and interrupt always use the persisted selected target', async () 
     return { ok: true }
   }
 
-  await host.handle({ type: 'http.history', id: 3, session: 'graph-selected', creature: 'beta' })
-  await host.handle({ type: 'http.interrupt', id: 4, session: 'graph-selected', creature: 'beta' })
+  await host.handle({ type: 'http.history', requestId: 3, session: 'graph-selected', creature: 'beta' })
+  await host.handle({ type: 'http.interrupt', requestId: 4, session: 'graph-selected', creature: 'beta' })
 
   assert.deepEqual(calls, [
     ['history', 'graph-selected', 'beta'],
@@ -329,18 +329,18 @@ test('context actions bind fixed commands to the current Host selection', async 
   const { client, host, posts, state } = harness()
   state.selection = { session: 'graph-live', creature: 'beta', targetCreatureId: 'creature-beta' }
 
-  await host.handle({ type: 'context.compact', id: 50 })
-  await host.handle({ type: 'context.clear', id: 51 })
+  await host.handle({ type: 'context.compact', requestId: 50 })
+  await host.handle({ type: 'context.clear', requestId: 51 })
 
   assert.deepEqual(client.commandCalls, [
     { session: 'graph-live', creature: 'beta', command: 'compact', args: '' },
     { session: 'graph-live', creature: 'beta', command: 'clear', args: '--force' },
   ])
   assert.deepEqual(
-    posts.map(({ type, id }) => ({ type, id })),
+    posts.map(({ type, requestId }) => ({ type, requestId })),
     [
-      { type: 'context.compact.result', id: 50 },
-      { type: 'context.clear.result', id: 51 },
+      { type: 'context.compact.result', requestId: 50 },
+      { type: 'context.clear.result', requestId: 51 },
     ],
   )
 })
@@ -356,7 +356,7 @@ test('context actions preserve the backend response payload exactly', async () =
   state.selection = { session: 'graph-live', creature: 'beta', targetCreatureId: 'creature-beta' }
   client.creatureCommand = async () => payload
 
-  await host.handle({ type: 'context.compact', id: 53 })
+  await host.handle({ type: 'context.compact', requestId: 53 })
 
   assert.strictEqual(posts[0].data, payload)
 })
@@ -367,7 +367,7 @@ test('context action fails closed when selection ownership changes during reques
   state.selection = { session: 'graph-live', creature: 'beta', targetCreatureId: 'creature-beta' }
   client.creatureCommand = () => command.promise
 
-  const pending = host.handle({ type: 'context.compact', id: 52 })
+  const pending = host.handle({ type: 'context.compact', requestId: 52 })
   await Promise.resolve()
   state.selection = { session: 'other', creature: 'other', targetCreatureId: 'other' }
   command.resolve({ ok: true })

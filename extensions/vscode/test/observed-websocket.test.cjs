@@ -29,19 +29,19 @@ test('observed production Bridge WebSocket sees backend frames before chat store
   const ObservedWebSocket = createObservedWebSocket(BridgeWebSocket, (frame) => observed.push(frame))
   const socket = new ObservedWebSocket('ws://bridge')
   socket.onmessage = (event) => handled.push(JSON.parse(event.data))
-  BridgeWebSocket.receive({ type: 'ws.opened', id: socket.id })
+  BridgeWebSocket.receive({ type: 'ws.opened', socketId: socket.id })
 
   const first = { type: 'user_input', source: 'worker', event_id: 'event-1' }
   BridgeWebSocket.receive({
     type: 'ws.frame',
-    id: socket.id,
+    socketId: socket.id,
     data: JSON.stringify(first),
   })
   socket.onmessage = null
   const second = { type: 'processing_start', source: 'worker' }
   BridgeWebSocket.receive({
     type: 'ws.frame',
-    id: socket.id,
+    socketId: socket.id,
     data: JSON.stringify(second),
   })
 

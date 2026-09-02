@@ -16,6 +16,20 @@ function fakeSocket() {
   }
 }
 
+test('stale generation opens and closes emit a terminal close envelope', () => {
+  const messages = []
+  const owners = new SocketOwners()
+  const generation = owners.begin()
+  const view = { postMessage: (message) => messages.push(message) }
+
+  assert.equal(owners.open(generation - 1, 9, fakeSocket, view), null)
+  assert.equal(owners.closeSocket(generation - 1, 10, view), false)
+  assert.deepEqual(messages, [
+    { type: 'ws.closed', socketId: 9, code: 1008 },
+    { type: 'ws.closed', socketId: 10, code: 1008 },
+  ])
+})
+
 test('socket owners ignore stale callbacks and preserve a reused id owner', () => {
   const messages = []
   const owners = new SocketOwners()
@@ -33,8 +47,8 @@ test('socket owners ignore stale callbacks and preserve a reused id owner', () =
 
   assert.equal(first.closeCount, 1)
   assert.deepEqual(messages, [
-    { type: 'ws.opened', id: 1 },
-    { type: 'ws.frame', id: 1, data: 'current' },
+    { type: 'ws.opened', socketId: 1 },
+    { type: 'ws.frame', socketId: 1, data: 'current' },
   ])
   assert.equal(owners.send(generation, 1, 'input'), true)
   assert.deepEqual(second.sent, ['input'])
@@ -49,7 +63,7 @@ test('closing a generation notifies the Bridge, closes sockets, and rejects futu
 
   owners.closeGeneration(generation)
 
-  assert.deepEqual(messages, [{ type: 'ws.closed', id: 3, code: 1000 }])
+  assert.deepEqual(messages, [{ type: 'ws.closed', socketId: 3, code: 1000 }])
   assert.equal(socket.closeCount, 1)
   assert.equal(owners.send(generation, 3, 'input'), false)
 })
@@ -65,8 +79,8 @@ test('asynchronous socket errors emit error and close exactly once', () => {
   socket.onclose?.({ code: 1006 })
 
   assert.deepEqual(messages, [
-    { type: 'ws.error', id: 6 },
-    { type: 'ws.closed', id: 6, code: 1011 },
+    { type: 'ws.error', socketId: 6 },
+    { type: 'ws.closed', socketId: 6, code: 1011 },
   ])
   assert.equal(owners.send(generation, 6, 'input'), false)
 })
@@ -89,10 +103,16 @@ test('failed socket creation emits a deterministic error and close frame', () =>
     /connect failed/,
   )
 
-  assert.deepEqual(messages, [
-    { type: 'ws.error', id: 4 },
-    { type: 'ws.closed', id: 4, code: 1011 },
-  ])
+  assert.deepEqual(messages, [{ type: 'ws.closed', socketId: 4, code: 1011 }])
+})
+
+test('local close without an owner still emits a terminal close frame', () => {
+  const messages = []
+  const owners = new SocketOwners()
+  const generation = owners.begin()
+
+  assert.equal(owners.closeSocket(generation, 7, { postMessage: (message) => messages.push(message) }), false)
+  assert.deepEqual(messages, [{ type: 'ws.closed', socketId: 7, code: 1000 }])
 })
 
 test('local close emits a deterministic close frame before releasing ownership', () => {
@@ -104,6 +124,6 @@ test('local close emits a deterministic close frame before releasing ownership',
 
   assert.equal(owners.closeSocket(generation, 5), true)
 
-  assert.deepEqual(messages, [{ type: 'ws.closed', id: 5, code: 1000 }])
+  assert.deepEqual(messages, [{ type: 'ws.closed', socketId: 5, code: 1000 }])
   assert.equal(owners.send(generation, 5, 'input'), false)
 })

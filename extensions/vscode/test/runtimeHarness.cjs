@@ -64,8 +64,8 @@ function harness() {
       this.beginCount++
       return this.beginCount
     },
-    open(generation, id, factory) {
-      socketCalls.push({ generation, id, socket: factory() })
+    open(generation, socketId, factory) {
+      socketCalls.push({ generation, socketId, socket: factory() })
     },
     send() {
       return true

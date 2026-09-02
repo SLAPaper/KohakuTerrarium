@@ -177,18 +177,18 @@ class RuntimeHost {
         const result = await this.clearSelection()
         this.post({
           type: 'session.clearSelection.result',
-          id: message.id,
+          requestId: message.requestId,
           data: { ok: true, selectionVersion: result.selectionVersion, readyId: this.runtimeEpoch },
         })
         return
       }
       case 'session.reconcile': {
         const data = await this.reconcileSelection()
-        this.post({ type: 'session.reconcile.result', id: message.id, data: { ...data, readyId: this.runtimeEpoch } })
+        this.post({ type: 'session.reconcile.result', requestId: message.requestId, data: { ...data, readyId: this.runtimeEpoch } })
         return
       }
       case 'session.list': {
-        this.post({ type: 'session.list.result', id: message.id, data: await this.client.listOpen() })
+        this.post({ type: 'session.list.result', requestId: message.requestId, data: await this.client.listOpen() })
         return
       }
       case 'session.create': {
@@ -202,7 +202,7 @@ class RuntimeHost {
           name: 'VS Code Session',
         })
         const data = normalizeActive(created)
-        this.post({ type: 'session.create.result', id: message.id, data })
+        this.post({ type: 'session.create.result', requestId: message.requestId, data })
         return
       }
       case 'session.resume': {
@@ -218,14 +218,14 @@ class RuntimeHost {
           config_name: resumed.session_name,
         })
         data.savedName = resumed.session_name ?? message.savedName
-        this.post({ type: 'session.resume.result', id: message.id, data })
+        this.post({ type: 'session.resume.result', requestId: message.requestId, data })
         return
       }
       case 'session.select': {
         const result = await this.enqueueSelectionOperation(() => this.selectOwned(message))
         this.post({
           type: 'session.select.result',
-          id: message.id,
+          requestId: message.requestId,
           data: { ...result.selection, selectionVersion: result.selectionVersion, readyId: this.runtimeEpoch },
         })
         return
@@ -234,7 +234,7 @@ class RuntimeHost {
         const result = await this.enqueueSelectionOperation(() => this.stopOwned(message))
         this.post({
           type: 'session.stop.result',
-          id: message.id,
+          requestId: message.requestId,
           data: { ok: true, selectionVersion: result.selectionVersion, readyId: this.runtimeEpoch },
         })
         return
@@ -243,7 +243,7 @@ class RuntimeHost {
         const selected = this.requireSelection(message)
         this.post({
           type: 'http.history.result',
-          id: message.id,
+          requestId: message.requestId,
           data: await this.client.history(selected.session, selected.creature),
         })
         return
@@ -252,7 +252,7 @@ class RuntimeHost {
         const selected = this.requireSelection(message)
         this.post({
           type: 'http.interrupt.result',
-          id: message.id,
+          requestId: message.requestId,
           data: await this.client.interrupt(selected.session, selected.creature),
         })
         return
@@ -262,7 +262,7 @@ class RuntimeHost {
         const capability = message.contextCapability || this.acquireContextCommand()
         if (!capability) throw Error('Select a Creature before managing context')
         const data = await this.enqueueSelectionOperation(() => this.contextCommandOwned(message, capability))
-        this.post({ type: `${message.type}.result`, id: message.id, data })
+        this.post({ type: `${message.type}.result`, requestId: message.requestId, data })
         return
       }
       case 'ws.open': {
@@ -271,25 +271,25 @@ class RuntimeHost {
         const route = `/ws/sessions/${encode(selected.session)}/creatures/${encode(selected.creature)}/chat`
         this.sockets.open(
           this.generation,
-          message.id,
+          message.socketId,
           () => this.socketFactory(`${this.webSocketBase}${route}`, this.token ? [`kt-token.${this.token}`] : []),
           { postMessage: this.post },
         )
         return
       }
       case 'ws.send':
-        if (!this.sockets.send(this.generation, message.id, message.data)) {
+        if (!this.sockets.send(this.generation, message.socketId, message.data)) {
           throw Error('Chat socket is not open')
         }
         this.post({
           type: 'ws.send.result',
-          id: message.id,
+          socketId: message.socketId,
           sendId: message.sendId,
           readyId: this.runtimeEpoch,
         })
         return
       case 'ws.close':
-        this.sockets.closeSocket(this.generation, message.id)
+        this.sockets.closeSocket(this.generation, message.socketId, { postMessage: this.post })
         return
       default:
         throw Error(`Unsupported message: ${message.type}`)

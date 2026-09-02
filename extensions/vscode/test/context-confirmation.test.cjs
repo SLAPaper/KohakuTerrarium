@@ -69,7 +69,7 @@ test('clear captures runtime and selection ownership before confirmation', async
   const posts = []
 
   const pending = extension.dispatchContextCommand({
-    message: { type: 'context.clear', id: 7 },
+    message: { type: 'context.clear', requestId: 7 },
     getRuntime: async () => first.runtime,
     isCurrent: (runtime) => runtime === current,
     confirmClear: () => confirmation,
@@ -85,7 +85,7 @@ test('clear captures runtime and selection ownership before confirmation', async
   assert.deepEqual(posts, [
     {
       type: 'context.clear.result',
-      id: 7,
+      requestId: 7,
       data: { cancelled: true, superseded: true },
     },
   ])
@@ -101,12 +101,12 @@ test('clear executes only for the same confirmed ownership and cancel never exec
   }
   await extension.dispatchContextCommand({
     ...args,
-    message: { type: 'context.clear', id: 8 },
+    message: { type: 'context.clear', requestId: 8 },
     confirmClear: async () => true,
   })
   await extension.dispatchContextCommand({
     ...args,
-    message: { type: 'context.clear', id: 9 },
+    message: { type: 'context.clear', requestId: 9 },
     confirmClear: async () => false,
   })
   assert.equal(owned.calls.length, 1)

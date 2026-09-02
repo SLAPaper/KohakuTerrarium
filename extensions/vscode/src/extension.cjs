@@ -117,13 +117,13 @@ async function dispatchContextCommand({ message, getRuntime, isCurrent, confirmC
   const contextCapability = ownedRuntime.acquireContextCommand()
   if (!contextCapability) throw Error('Select a Creature before managing context')
   if (message.type === 'context.clear' && !(await confirmClear())) {
-    await post({ type: 'context.clear.result', id: message.id, data: { cancelled: true } })
+    await post({ type: 'context.clear.result', requestId: message.requestId, data: { cancelled: true } })
     return
   }
   if (!isCurrent(ownedRuntime) || !ownedRuntime.ownsContextCommand(contextCapability)) {
     await post({
       type: `${message.type}.result`,
-      id: message.id,
+      requestId: message.requestId,
       data: { cancelled: true, superseded: true },
     })
     return
@@ -196,9 +196,10 @@ function activate(context) {
       const sendError = (message, error) => {
         console.error(`KohakuTerrarium ${message.type} failed`, error)
         const safe = publicError(message.type)
+        const webSocketType = message.type === 'ws.send' ? 'ws.send.error' : message.type.startsWith('ws.') ? 'ws.error' : 'error'
         return webview.postMessage({
-          type: message.type === 'ws.send' ? 'ws.send.error' : 'error',
-          id: message.id,
+          type: webSocketType,
+          ...(message.type.startsWith('ws.') ? { socketId: message.socketId } : { requestId: message.requestId }),
           ...(message.type === 'ws.send' ? { sendId: message.sendId } : {}),
           error: safe.message,
           code: safe.code,
@@ -286,19 +287,19 @@ function activate(context) {
             if (runtime) entry.disposeRuntime()
             const attempt = connectionAttempts.begin()
             try {
-              const current = await ensureRuntime(message.id)
+              const current = await ensureRuntime(message.requestId)
               if (!attempt.isCurrent()) {
-                webview.postMessage({ type: 'ready.result', id: message.id, data: { superseded: true } })
+                webview.postMessage({ type: 'ready.result', requestId: message.requestId, data: { superseded: true } })
                 return
               }
               const reconciled = await current.reconcileSelection()
               if (!attempt.isCurrent() || reconciled.superseded) {
-                webview.postMessage({ type: 'ready.result', id: message.id, data: { superseded: true } })
+                webview.postMessage({ type: 'ready.result', requestId: message.requestId, data: { superseded: true } })
                 return
               }
               webview.postMessage({
                 type: 'ready.result',
-                id: message.id,
+                requestId: message.requestId,
                 data: {
                   available: true,
                   automatic: activeConnection.source !== 'manual',
@@ -310,14 +311,9 @@ function activate(context) {
             } catch (error) {
               if (attempt.isCurrent()) {
                 entry.disposeRuntime()
-                webview.postMessage({
-                  type: 'ready.result',
-                  id: message.id,
-                  data: { available: false, automatic: true, selection: null },
-                })
                 sendError(message, error)
               } else {
-                webview.postMessage({ type: 'ready.result', id: message.id, data: { superseded: true } })
+                webview.postMessage({ type: 'ready.result', requestId: message.requestId, data: { superseded: true } })
               }
             }
             return
