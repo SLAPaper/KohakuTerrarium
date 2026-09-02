@@ -118,16 +118,38 @@ test('VS Code binds transcript viewport callbacks to the rendered conversation i
   const webview = read(path.join(root, 'src', 'webview', 'index.js'))
 
   assert.match(webview, /createConversationScrollController/)
-  assert.match(
-    webview,
-    /onViewportReady:\s*\(\(identity\)\s*=>\s*\(viewport\)\s*=>\s*scroll\.onViewportReady\(viewport, identity\)\)\(scrollIdentity\.value\)/,
-  )
-  assert.match(
-    webview,
-    /onScroll:\s*\(\(identity\)\s*=>\s*\(event\)\s*=>\s*scroll\.onScroll\(event, identity\)\)\(\s*scrollIdentity\.value,\s*\)/,
-  )
+  assert.match(webview, /createTranscriptBindings\(\{[\s\S]*scroll\.onViewportReady\(viewport, identity\)/)
+  assert.match(webview, /createTranscriptBindings\(\{[\s\S]*scroll\.onScroll\(event, identity\)/)
+  assert.match(webview, /const transcriptCallbacks = computed\(\(\) => transcriptBindings\.forIdentity\(scrollIdentity\.value\)\)/)
   assert.match(webview, /if \(conversationOwnership\.isCurrent\(submittedOwner\)\)[\s\S]*scroll\.forceFollow\(\)/)
-  assert.match(webview, /messageTailSignature\(messages\.value\)/)
+  assert.match(webview, /const messageTail = computed\(\(\) => createMessageTailSignature\(messages\.value\)\)/)
+  assert.match(webview, /const messageStructure = computed\(\(\) => messageSequenceKey\(messageSequence\.value\)\)/)
+})
+
+test('VS Code windows transcript rendering and separates structural from tail observation', () => {
+  const webview = read(path.join(root, 'src', 'webview', 'index.js'))
+
+  assert.match(webview, /createTranscriptWindow\(\)/)
+  assert.match(webview, /const messageTail = computed\(\(\) => createMessageTailSignature\(messages\.value\)\)/)
+  assert.match(webview, /const messageStructure = computed\(\(\) => messageSequenceKey\(messageSequence\.value\)\)/)
+  assert.equal((webview.match(/createMessageSequence\(messages\.value\)/g) || []).length, 1)
+  assert.match(webview, /const messageSequence = computed\(\(\) => createMessageSequence\(messages\.value\)\)/)
+  assert.match(webview, /watch\(\s*\(\) => \(\{\s*identity: scrollIdentity\.value,\s*sequence: messageSequence\.value,\s*\}\)/s)
+  assert.match(webview, /watch\(\s*\(\) => \(\{\s*identity: scrollIdentity\.value,\s*structure: messageStructure\.value,\s*tail: messageTail\.value,\s*\}\)/s)
+  assert.match(webview, /const transcriptRevision = ref\(0\)/)
+  assert.match(webview, /const transcriptView = computed\(\(\) => \{[\s\S]*transcriptRevision\.value[\s\S]*transcriptWindow\.view/s)
+  assert.match(webview, /transcriptRevision\.value \+= 1/)
+  assert.match(webview, /messages: transcriptView\.value\.messages/)
+  assert.match(webview, /messageOffset: transcriptView\.value\.messageOffset/)
+  assert.match(webview, /previousMessage: transcriptView\.value\.previousMessage/)
+  assert.match(webview, /earlierCount: transcriptView\.value\.earlierCount/)
+  assert.match(webview, /onLoadEarlier: loadEarlierMessages/)
+  assert.match(webview, /function loadEarlierMessages\(\)[\s\S]*scroll\.beforePrepend\(\)[\s\S]*messageChanges\.afterMessagesChange\(scrollIdentity\.value, messageSequence\.value\)/)
+  assert.match(webview, /onViewportReady: transcriptCallbacks\.value\.onViewportReady/)
+  assert.match(webview, /onScroll: transcriptCallbacks\.value\.onScroll/)
+  assert.match(webview, /onReply: transcriptCallbacks\.value\.onReply/)
+  assert.doesNotMatch(webview, /onViewportReady:\s*\(\(/)
+  assert.doesNotMatch(webview, /onScroll:\s*\(\(/)
 })
 
 test('shared conversation CSS is the only message visual source used by both hosts', () => {

@@ -29,6 +29,13 @@ import { createSelectionVersionOwner } from './selectionVersion.mjs'
 import { createSessionShell } from './sessionShell.js'
 import { createSubmitGate, isComposerSubmitDisabled } from './submitGate.mjs'
 import { applyTopologySelection } from './topologySelection.mjs'
+import {
+  createMessageSequence,
+  createMessageTailSignature,
+  createTranscriptBindings,
+  createTranscriptWindow,
+  messageSequenceKey,
+} from './transcriptWindow.mjs'
 import { createViewRenderers } from './viewRenderers.mjs'
 import './style.css'
 
@@ -157,31 +164,16 @@ const App = {
       schedule: (callback) => nextTick(callback),
     })
     const messageChanges = createConversationMessageOrchestrator(scroll)
+    const transcriptWindow = createTranscriptWindow()
+    const transcriptRevision = ref(0)
 
-    function messageSequenceSnapshot(items) {
-      return items.map((message) => ({ id: message.id, eventId: message.eventId }))
-    }
-
-    function messageTailSignature(items) {
-      const last = items[items.length - 1]
-      if (!last) return '0'
-      const contentLength =
-        typeof last.content === 'string'
-          ? last.content.length
-          : Array.isArray(last.content)
-            ? last.content.length
-            : 0
-      const parts = Array.isArray(last.parts)
-        ? last.parts
-            .map((part) =>
-              part.type === 'text'
-                ? `t:${part.content?.length || 0}`
-                : `o:${part.status || ''}:${part.result?.length || 0}:${part.children?.length || 0}`,
-            )
-            .join('|')
-        : ''
-      return `${items.length}:${last.id}:${last.role}:${contentLength}:${parts}`
-    }
+    const messageSequence = computed(() => createMessageSequence(messages.value))
+    const messageTail = computed(() => createMessageTailSignature(messages.value))
+    const messageStructure = computed(() => messageSequenceKey(messageSequence.value))
+    const transcriptView = computed(() => {
+      transcriptRevision.value
+      return transcriptWindow.view(messages.value, scrollIdentity.value, messageSequence.value)
+    })
 
     watch(
       [scrollIdentity, () => messages.value.length],
@@ -191,8 +183,7 @@ const App = {
     watch(
       () => ({
         identity: scrollIdentity.value,
-        sequence: messageSequenceSnapshot(messages.value),
-        tail: messageTailSignature(messages.value),
+        sequence: messageSequence.value,
       }),
       (current, previous) => {
         if (!previous || (current.sequence.length === 0 && previous.sequence.length === 0)) return
@@ -208,12 +199,12 @@ const App = {
     watch(
       () => ({
         identity: scrollIdentity.value,
-        sequence: messageSequenceSnapshot(messages.value),
-        tail: messageTailSignature(messages.value),
+        structure: messageStructure.value,
+        tail: messageTail.value,
       }),
       (current, previous) => {
-        if (previous && (current.tail !== previous.tail || current.identity !== previous.identity))
-          messageChanges.afterMessagesChange(current.identity, current.sequence)
+        if (previous && (current.structure !== previous.structure || current.tail !== previous.tail || current.identity !== previous.identity))
+          messageChanges.afterMessagesChange(current.identity, messageSequence.value)
       },
       { flush: 'post' },
     )
@@ -415,6 +406,20 @@ const App = {
         .catch((cause) => (error.value = cause?.message || String(cause)))
     }
 
+    const transcriptBindings = createTranscriptBindings({
+      onViewportReady: (viewport, identity) => scroll.onViewportReady(viewport, identity),
+      onScroll: (event, identity) => scroll.onScroll(event, identity),
+      onReply: ({ message, actionId, values }) => submitReply(message, actionId, values),
+    })
+    const transcriptCallbacks = computed(() => transcriptBindings.forIdentity(scrollIdentity.value))
+    function loadEarlierMessages() {
+      const complete = scroll.beforePrepend()
+      if (!transcriptWindow.expandEarlier(messages.value, scrollIdentity.value, messageSequence.value)) return
+      transcriptRevision.value += 1
+      nextTick(complete)
+      messageChanges.afterMessagesChange(scrollIdentity.value, messageSequence.value)
+    }
+
     const { actionButton, icon, renderSession, renderSharedText, renderTranscriptMessage } =
       createViewRenderers({
         ConversationMessage,
@@ -524,8 +529,12 @@ const App = {
         status.value ? h('p', { class: 'status', role: 'status', 'aria-live': 'polite' }, status.value) : null,
         h('section', { class: 'chat-region' }, [
           h(ChatTranscriptSection, {
-            messages: messages.value,
-            totalCount: messages.value.length,
+            messages: transcriptView.value.messages,
+            messageOffset: transcriptView.value.messageOffset,
+            previousMessage: transcriptView.value.previousMessage,
+            earlierCount: transcriptView.value.earlierCount,
+            earlierLabel: `Load ${Math.min(transcriptView.value.earlierCount, 400)} earlier messages`,
+            totalCount: transcriptView.value.totalCount,
             emptyTitle: 'No messages yet',
             emptySubtitle: 'Choose a Session and send a message',
             processing: chat.processingByTab[tab.value],
@@ -533,12 +542,10 @@ const App = {
             reconnecting: chat.wsStatus === 'reconnecting',
             reconnectLabel: 'Reconnecting',
             renderMessage: renderTranscriptMessage,
-            onViewportReady: ((identity) => (viewport) =>
-              scroll.onViewportReady(viewport, identity))(scrollIdentity.value),
-            onScroll: ((identity) => (event) => scroll.onScroll(event, identity))(
-              scrollIdentity.value,
-            ),
-            onReply: ({ message, actionId, values }) => submitReply(message, actionId, values),
+            onLoadEarlier: loadEarlierMessages,
+            onViewportReady: transcriptCallbacks.value.onViewportReady,
+            onScroll: transcriptCallbacks.value.onScroll,
+            onReply: transcriptCallbacks.value.onReply,
           }),
         ]),
         h('section', { class: 'composer-region', 'aria-label': 'Message composer' }, [
