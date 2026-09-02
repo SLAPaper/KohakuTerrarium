@@ -53,15 +53,22 @@ test('session.select preserves the old socket generation when persistence fails'
   assert.equal(sockets.beginCount, before)
 })
 
-test('ws.send emits a correlated result only after the socket owner accepts the frame', async () => {
+test('ws.send emits a correlated result only after the socket write callback accepts the frame', async () => {
   const { host, posts, sockets } = harness()
   const calls = []
+  let accept
   sockets.send = (...args) => {
-    calls.push(args)
-    return true
+    calls.push(args.slice(0, 3))
+    return new Promise((resolve) => {
+      accept = resolve
+    })
   }
 
-  await host.handle({ type: 'ws.send', socketId: 7, sendId: 42, data: 'frame' })
+  const pending = host.handle({ type: 'ws.send', socketId: 7, sendId: 42, data: 'frame' })
+  await Promise.resolve()
+  assert.equal(posts.length, 0)
+  accept(true)
+  await pending
 
   assert.deepEqual(calls, [[host.generation, 7, 'frame']])
   assert.deepEqual(posts.at(-1), {
@@ -74,7 +81,7 @@ test('ws.send emits a correlated result only after the socket owner accepts the 
 
 test('ws.send rejection throws without emitting a success result', async () => {
   const { host, posts, sockets } = harness()
-  sockets.send = () => false
+  sockets.send = async () => false
 
   await assert.rejects(host.handle({ type: 'ws.send', socketId: 7, sendId: 43, data: 'frame' }), /not open/)
   assert.equal(

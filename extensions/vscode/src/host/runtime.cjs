@@ -278,7 +278,7 @@ class RuntimeHost {
         return
       }
       case 'ws.send':
-        if (!this.sockets.send(this.generation, message.socketId, message.data)) {
+        if (!(await this.sockets.send(this.generation, message.socketId, message.data))) {
           throw Error('Chat socket is not open')
         }
         this.post({
