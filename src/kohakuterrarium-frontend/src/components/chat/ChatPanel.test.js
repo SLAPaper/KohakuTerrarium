@@ -125,6 +125,291 @@ describe("ChatPanel transcript attachment drops", () => {
   })
 })
 
+describe("ChatPanel disconnected sends", () => {
+  function mountPanel({ tab = "kohaku", wsOpen = false } = {}) {
+    const chat = useChatStore("graph_send")
+    chat._instanceId = "graph_send"
+    chat._instanceGraphId = "graph_send"
+    chat.activeTab = tab
+    chat.tabs = [tab]
+    chat.messagesByTab = { [tab]: [] }
+    chat.processingByTab = { [tab]: false }
+    chat.wsStatus = wsOpen ? "open" : "reconnecting"
+    chat._ws = wsOpen ? { readyState: WebSocket.OPEN, send: vi.fn() } : null
+    const wrapper = mount(ChatPanel, {
+      props: {
+        instance: {
+          id: "graph_send",
+          graph_id: "graph_send",
+          creatures: [{ name: "kohaku", status: "idle" }],
+        },
+      },
+      global: {
+        provide: { chatStore: chat },
+        stubs: { ChatMessage: true, ModelSwitcher: true, SiteChip: true, StatusDot: true },
+      },
+    })
+    return { chat, wrapper }
+  }
+
+  it("keeps the draft when there is no active tab", async () => {
+    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
+    const { chat, wrapper } = mountPanel()
+    chat.activeTab = null
+    await flushPromises()
+
+    await wrapper.find("textarea").setValue("wait for a tab")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+
+    expect(wrapper.find("textarea").element.value).toBe("wait for a tab")
+    expect(error).toHaveBeenCalledWith("Select a chat before sending")
+  })
+
+  it("keeps the draft and attachment when a creature socket is disconnected", async () => {
+    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
+    const { chat, wrapper } = mountPanel()
+    const textarea = wrapper.find("textarea")
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" })
+
+    await textarea.setValue("keep this draft")
+    await wrapper.findComponent({ name: "ChatComposer" }).trigger("drop", {
+      dataTransfer: { files: [file], types: ["Files"] },
+    })
+    await flushPromises()
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+
+    expect(textarea.element.value).toBe("keep this draft")
+    expect(wrapper.findAll(".kt-chat-composer__chip")).toHaveLength(1)
+    expect(localStorage.getItem("kt.chat.draft.graph_send.kohaku")).toBe("keep this draft")
+    expect(chat.messagesByTab.kohaku).toEqual([])
+    expect(error).toHaveBeenCalledWith("Chat is not connected")
+  })
+
+  it("uses the socket state when the connection status is stale", async () => {
+    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
+    const { chat, wrapper } = mountPanel()
+    chat.wsStatus = "open"
+    chat._ws = { readyState: WebSocket.CLOSED, send: vi.fn() }
+
+    await wrapper.find("textarea").setValue("keep stale-status draft")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+
+    expect(wrapper.find("textarea").element.value).toBe("keep stale-status draft")
+    expect(chat.messagesByTab.kohaku).toEqual([])
+    expect(error).toHaveBeenCalledWith("Chat is not connected")
+  })
+
+  it("keeps the draft when the socket closes between the panel and store checks", async () => {
+    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
+    const { chat, wrapper } = mountPanel()
+    let readyStateReads = 0
+    chat.wsStatus = "open"
+    chat._ws = {
+      get readyState() {
+        return readyStateReads++ === 0 ? WebSocket.OPEN : WebSocket.CLOSED
+      },
+      send: vi.fn(),
+    }
+
+    await wrapper.find("textarea").setValue("keep raced draft")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+
+    expect(wrapper.find("textarea").element.value).toBe("keep raced draft")
+    expect(chat.messagesByTab.kohaku).toEqual([])
+    expect(error).toHaveBeenCalledWith("Command failed: Chat is not connected")
+  })
+
+  it("keeps an attached goal message on the websocket path while disconnected", async () => {
+    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
+    const execute = vi.spyOn(terrariumAPI, "executeCreatureCommand")
+    const { chat, wrapper } = mountPanel()
+    chat.commandInventoryByTab = {
+      kohaku: { commands: [{ name: "goal", aliases: [] }], skills: [] },
+    }
+    chat._commandInventoryFetchedAtByTab = { kohaku: Date.now() }
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" })
+
+    await wrapper.find("textarea").setValue("/goal list")
+    await wrapper.findComponent({ name: "ChatComposer" }).trigger("drop", {
+      dataTransfer: { files: [file], types: ["Files"] },
+    })
+    await flushPromises()
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+
+    expect(execute).not.toHaveBeenCalled()
+    expect(wrapper.find("textarea").element.value).toBe("/goal list")
+    expect(wrapper.findAll(".kt-chat-composer__chip")).toHaveLength(1)
+    expect(chat.messagesByTab.kohaku).toEqual([])
+    expect(chat._slashTargetByTab.kohaku).toBeUndefined()
+    expect(chat._pendingCommandResultContextsByTab.kohaku).toBeUndefined()
+    expect(error).toHaveBeenCalledWith("Chat is not connected")
+  })
+
+  it("still sends channel messages and attachments while the creature socket is disconnected", async () => {
+    const sendToChannel = vi.spyOn(terrariumAPI, "sendToChannel").mockResolvedValue({})
+    const { chat, wrapper } = mountPanel({ tab: "ch:general" })
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" })
+
+    await wrapper.find("textarea").setValue("channel update")
+    await wrapper.findComponent({ name: "ChatComposer" }).trigger("drop", {
+      dataTransfer: { files: [file], types: ["Files"] },
+    })
+    await flushPromises()
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+
+    expect(sendToChannel).toHaveBeenCalledWith(
+      "graph_send",
+      "general",
+      [
+        { type: "text", text: "channel update" },
+        {
+          type: "file",
+          file: expect.objectContaining({ name: "notes.txt", content: "notes" }),
+        },
+      ],
+      "human",
+    )
+    expect(wrapper.find("textarea").element.value).toBe("")
+    expect(wrapper.findAll(".kt-chat-composer__chip")).toHaveLength(0)
+    expect(chat.messagesByTab["ch:general"]).toHaveLength(1)
+  })
+
+  it("does not clear a replacement draft after an accepted creature send", async () => {
+    const { chat, wrapper } = mountPanel({ wsOpen: true })
+    let resolveSend
+    const send = vi.spyOn(chat, "send").mockReturnValue(
+      new Promise((resolve) => {
+        resolveSend = resolve
+      }),
+    )
+
+    await wrapper.find("textarea").setValue("first draft")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce())
+    await wrapper.find("textarea").setValue("replacement draft")
+    await wrapper.find("textarea").setValue("first draft")
+    resolveSend()
+    await flushPromises()
+
+    expect(wrapper.find("textarea").element.value).toBe("first draft")
+    expect(localStorage.getItem("kt.chat.draft.graph_send.kohaku")).toBe("first draft")
+  })
+
+  it("does not clear replacement attachments after an accepted creature send", async () => {
+    const { chat, wrapper } = mountPanel({ wsOpen: true })
+    let resolveSend
+    const send = vi.spyOn(chat, "send").mockReturnValue(
+      new Promise((resolve) => {
+        resolveSend = resolve
+      }),
+    )
+    const first = new File(["first"], "first.txt", { type: "text/plain" })
+    const replacement = new File(["replacement"], "replacement.txt", { type: "text/plain" })
+
+    await wrapper.findComponent({ name: "ChatComposer" }).trigger("drop", {
+      dataTransfer: { files: [first], types: ["Files"] },
+    })
+    await flushPromises()
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce())
+    wrapper.vm.attachments = [{ file: replacement, name: replacement.name, kind: "file" }]
+    await flushPromises()
+    resolveSend()
+    await flushPromises()
+
+    expect(wrapper.findAll(".kt-chat-composer__chip")).toHaveLength(1)
+    expect(wrapper.text()).toContain("replacement.txt")
+  })
+
+  it("ignores a second submit while the first dispatch is pending", async () => {
+    const { chat, wrapper } = mountPanel({ wsOpen: true })
+    let resolveSend
+    const send = vi.spyOn(chat, "send").mockReturnValue(
+      new Promise((resolve) => {
+        resolveSend = resolve
+      }),
+    )
+
+    await wrapper.find("textarea").setValue("send once")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce())
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+
+    expect(send).toHaveBeenCalledOnce()
+    resolveSend()
+    await flushPromises()
+  })
+
+  it("surfaces a synchronous creature send failure without clearing the draft", async () => {
+    const error = vi.spyOn(ElMessage, "error").mockImplementation(() => {})
+    const { chat, wrapper } = mountPanel({ wsOpen: true })
+    vi.spyOn(chat, "send").mockImplementation(() => {
+      throw Error("sync send failure")
+    })
+
+    await wrapper.find("textarea").setValue("keep sync-failure draft")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+
+    expect(wrapper.find("textarea").element.value).toBe("keep sync-failure draft")
+    expect(error).toHaveBeenCalledWith("Command failed: sync send failure")
+  })
+
+  it("drops a delayed goal result after a same-id generation change", async () => {
+    let resolveCommand
+    const execute = vi.spyOn(terrariumAPI, "executeCreatureCommand").mockReturnValue(
+      new Promise((resolve) => {
+        resolveCommand = resolve
+      }),
+    )
+    const { chat, wrapper } = mountPanel()
+    chat._instanceGeneration = 4
+    chat.commandInventoryByTab = {
+      kohaku: { commands: [{ name: "goal", aliases: [] }], skills: [] },
+    }
+    chat._commandInventoryFetchedAtByTab = { kohaku: Date.now() }
+
+    await wrapper.find("textarea").setValue("/goal list")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce())
+    chat._instanceGeneration = 5
+    resolveCommand({ output: "stale goals", data: { type: "list", title: "Goals", items: [] } })
+    await flushPromises()
+
+    expect(chat.messagesByTab.kohaku).toEqual([])
+    expect(chat._pendingCommandResultContextsByTab.kohaku).toBeUndefined()
+  })
+
+  it("still dispatches a plain goal command while the creature socket is disconnected", async () => {
+    const execute = vi.spyOn(terrariumAPI, "executeCreatureCommand").mockResolvedValue({
+      output: "Goals",
+      data: { type: "list", title: "Goals", items: [] },
+    })
+    const { chat, wrapper } = mountPanel()
+    chat.commandInventoryByTab = {
+      kohaku: { commands: [{ name: "goal", aliases: [] }], skills: [] },
+    }
+    chat._commandInventoryFetchedAtByTab = { kohaku: Date.now() }
+
+    await wrapper.find("textarea").setValue("/goal list")
+    await wrapper.find('button[aria-label="Send message"]').trigger("click")
+    await flushPromises()
+
+    expect(execute).toHaveBeenCalledWith("graph_send", "kohaku", "goal", "list")
+    expect(wrapper.find("textarea").element.value).toBe("")
+    expect(chat.messagesByTab.kohaku.at(-1)).toMatchObject({
+      role: "command_result",
+      content: "Goals",
+    })
+  })
+})
+
 describe("ChatPanel scroll scheduling", () => {
   function setupScheduler({ nearBottom = true } = {}) {
     const frames = new Map()

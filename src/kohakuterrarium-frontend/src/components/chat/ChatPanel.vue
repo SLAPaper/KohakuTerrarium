@@ -95,7 +95,7 @@
           <span class="text-amber-shadow dark:text-amber-light">{{ t("chat.pendingBanner", { count: pendingCount }) }}</span>
           <button class="ml-auto text-amber hover:underline" @click="scrollToPending">{{ t("chat.pendingShow") }}</button>
         </div>
-        <ChatComposer ref="composerEl" v-model="inputText" v-model:attachments="attachments" :processing="viewProcessing" :compact-mode="isCompact" :managed-submit="true" :max-attachment-bytes="MAX_ATTACHMENT_BYTES" :max-image-bytes="MAX_IMAGE_BYTES" :placeholder="inputPlaceholder" :labels="composerLabels" aria-autocomplete="list" :aria-expanded="slashMenuOpen" aria-controls="slash-command-menu" :aria-activedescendant="slashActiveDescendant" input-role="combobox" :attachment-transform="transformAttachment" @submit="send" @interrupt="chat.interrupt(viewActiveTab)" @compact="triggerCompact" @clear="triggerClear" @error="onAttachmentError" @input="onInputChanged" @keydown="onInputKeydown" @focus="onInputFocus" @blur="onInputBlur" @drag-state="dragOver = $event">
+        <ChatComposer ref="composerEl" v-model="inputText" v-model:attachments="attachments" :processing="viewProcessing" :compact-mode="isCompact" :managed-submit="true" :max-attachment-bytes="MAX_ATTACHMENT_BYTES" :max-image-bytes="MAX_IMAGE_BYTES" :placeholder="inputPlaceholder" :labels="composerLabels" aria-autocomplete="list" :aria-expanded="slashMenuOpen" aria-controls="slash-command-menu" :aria-activedescendant="slashActiveDescendant" input-role="combobox" :attachment-transform="transformAttachment" @update:attachments="onComposerAttachmentsChanged" @submit="send" @interrupt="chat.interrupt(viewActiveTab)" @compact="triggerCompact" @clear="triggerClear" @error="onAttachmentError" @input="onInputChanged" @keydown="onInputKeydown" @focus="onInputFocus" @blur="onInputBlur" @drag-state="dragOver = $event">
           <template #suggestions><SlashCommandMenu :open="slashMenuOpen" :loading="slashInventoryLoading" :entries="slashMatches" :selected-index="slashSelectedIndex" @choose="chooseSlashEntry" @select-index="slashSelectedIndex = $event" /></template>
           <template #attachment-icon="{ attachment }"><span :class="attachment.kind === 'image' ? 'i-carbon-image text-iolite dark:text-iolite-light' : 'i-carbon-document text-aquamarine'" /></template>
           <template #remove-icon><span class="i-carbon-close" /></template>
@@ -126,7 +126,7 @@ import ModelSwitcher from "@/components/chrome/ModelSwitcher.vue"
 import SiteChip from "@/components/cluster/SiteChip.vue"
 import { useDensity } from "@/composables/useDensity"
 import { useSlashCommandCompletion } from "@/composables/useSlashCommandCompletion"
-import { useChatStore } from "@/stores/chat"
+import { _parseSlashCommand, useChatStore } from "@/stores/chat"
 import { useChatTabDrag } from "@/composables/useChatTabDrag"
 import { useI18n } from "@/utils/i18n"
 import { terrariumAPI, agentAPI } from "@/utils/api"
@@ -151,6 +151,8 @@ provide("chatStore", chat)
 const { t } = useI18n()
 const { isCompact } = useDensity()
 const inputText = ref("")
+const composerRevision = ref(0)
+const submitInFlight = ref(false)
 const messagesEl = ref(null)
 const composerEl = ref(null)
 const bubbleEl = ref(null)
@@ -452,6 +454,7 @@ function onInputKeydown(e) {
 }
 
 function onInputChanged() {
+  composerRevision.value += 1
   chat.markSlashTarget(viewActiveTab.value, null)
 }
 
@@ -609,6 +612,10 @@ watch(inputText, () => {
   persistDraft()
 })
 
+function onComposerAttachmentsChanged() {
+  composerRevision.value += 1
+}
+
 function onBubbleDrop(e) {
   fileDragDepth = 0
   dragOver.value = false
@@ -653,110 +660,135 @@ function renameClipboardBlob(file, kind) {
 }
 
 async function send() {
-  if (props.readOnly || (!inputText.value.trim() && attachments.value.length === 0)) return
-  const sendTab = viewActiveTab.value
-  const sendText = inputText.value
-  const sendAttachments = [...attachments.value]
-  const sendInstanceGeneration = chat._instanceGeneration
-  const sendInstanceId = chat._instanceId
-  const sendGraphId = chat._instanceGraphId
-  const sendPropInstanceId = props.instance?.id
-  const sendPropGraphId = props.instance?.graph_id
-  let ownedSlashTarget = chat._slashTargetByTab?.[sendTab]
-  const contextChanged = () => chat._instanceGeneration !== sendInstanceGeneration || chat._instanceId !== sendInstanceId || chat._instanceGraphId !== sendGraphId || props.instance?.id !== sendPropInstanceId || props.instance?.graph_id !== sendPropGraphId || chat.activeTab !== sendTab || viewActiveTab.value !== sendTab || inputText.value !== sendText || attachments.value.length !== sendAttachments.length || attachments.value.some((attachment, index) => attachment !== sendAttachments[index])
-  const clearOwnedSlashTarget = () => {
-    if (chat._slashTargetByTab?.[sendTab] === ownedSlashTarget) {
-      chat.markSlashTarget(sendTab, null)
-    }
-  }
-  if (slashMenuOpen.value && slashMatches.value.length) {
-    chooseSlashEntry(slashMatches.value[slashSelectedIndex.value] || slashMatches.value[0])
-    return
-  }
-  if (props.groupId) onGroupFocus()
-  let slashTarget = null
+  if (submitInFlight.value || props.readOnly || (!inputText.value.trim() && attachments.value.length === 0)) return
+  submitInFlight.value = true
   try {
-    slashTarget = await chat.prepareSlashSend(
-      {
-        key: sendTab,
-        creature: sendTab,
-        type: sendTab?.startsWith("ch:") ? "channel" : "creature",
-      },
-      sendText,
-    )
-  } catch (err) {
-    console.warn("Slash inventory lookup failed; using command fallback:", err)
-  }
-  if (contextChanged()) {
-    clearOwnedSlashTarget()
-    return
-  }
-  chat.markSlashTarget(sendTab, slashTarget)
-  ownedSlashTarget = chat._slashTargetByTab?.[sendTab]
-  let parts
-  try {
-    parts = await buildMessageParts(sendText, sendAttachments)
-  } catch (err) {
-    clearOwnedSlashTarget()
-    throw err
-  }
-  if (contextChanged()) {
-    clearOwnedSlashTarget()
-    return
-  }
-  const inlineCommand = /^\/goal(?:\s|$)/i.test(sendText)
-  const resultContext = inlineCommand ? chat.registerCommandResultContext(sendTab) : chat.captureCommandResultContext(sendTab)
-  if (contextChanged()) {
-    if (inlineCommand) chat.releaseCommandResultContext(sendTab, resultContext)
-    clearOwnedSlashTarget()
-    return
-  }
-  const commandTarget = {
-    sessionId: sendGraphId || sendInstanceId,
-    creatureId: sendTab || "root",
-    tabKey: sendTab,
-    commandText: sendText,
-    inline: inlineCommand,
-    resultContext,
-  }
-  const commandContextChanged = () => chat._instanceGeneration !== sendInstanceGeneration || chat._instanceId !== sendInstanceId || chat._instanceGraphId !== sendGraphId || props.instance?.id !== sendPropInstanceId || props.instance?.graph_id !== sendPropGraphId
-  const outcomePromise = chat.send(parts)
-  inputText.value = ""
-  attachments.value = []
-  persistDraft()
-  isNearBottom.value = true // force scroll after send
-  nextTick(() => composerEl.value?.resetHeight())
-  scheduleScrollToBottom(true)
-  try {
-    const outcome = await outcomePromise
-    if (outcome?.handled === "command") {
-      if (commandContextChanged()) {
-        chat.releaseCommandResultContext(commandTarget.tabKey, commandTarget.resultContext)
-      } else {
-        await surfaceCommandResult(outcome.result, commandTarget)
-      }
-    } else if (commandTarget.inline) {
-      chat.releaseCommandResultContext(commandTarget.tabKey, commandTarget.resultContext)
-    }
-  } catch (err) {
-    console.error("Command failed:", err)
-    if (commandContextChanged()) {
-      chat.releaseCommandResultContext(commandTarget.tabKey, commandTarget.resultContext)
+    const sendTab = viewActiveTab.value
+    if (!sendTab) {
+      ElMessage.error("Select a chat before sending")
       return
     }
-    if (commandTarget.inline) {
-      chat.addCommandResult(
-        commandTarget.tabKey,
-        commandTarget.commandText,
-        {
-          error: err?.response?.data?.detail || err?.message || String(err),
-        },
-        commandTarget.resultContext,
-      )
-      if (viewActiveTab.value === commandTarget.tabKey) scheduleScrollToBottom(true)
-    } else {
-      ElMessage.error(`Command failed: ${err?.message || err}`)
+    const sendText = inputText.value
+    const sendAttachments = [...attachments.value]
+    const sendComposerRevision = composerRevision.value
+    const sendInstanceGeneration = chat._instanceGeneration
+    const sendInstanceId = chat._instanceId
+    const sendGraphId = chat._instanceGraphId
+    const sendPropInstanceId = props.instance?.id
+    const sendPropGraphId = props.instance?.graph_id
+    let ownedSlashTarget = chat._slashTargetByTab?.[sendTab]
+    const contextChanged = () => chat._instanceGeneration !== sendInstanceGeneration || chat._instanceId !== sendInstanceId || chat._instanceGraphId !== sendGraphId || props.instance?.id !== sendPropInstanceId || props.instance?.graph_id !== sendPropGraphId || chat.activeTab !== sendTab || viewActiveTab.value !== sendTab || inputText.value !== sendText || attachments.value.length !== sendAttachments.length || attachments.value.some((attachment, index) => attachment !== sendAttachments[index])
+    const clearOwnedSlashTarget = () => {
+      if (chat._slashTargetByTab?.[sendTab] === ownedSlashTarget) {
+        chat.markSlashTarget(sendTab, null)
+      }
     }
+    if (slashMenuOpen.value && slashMatches.value.length) {
+      chooseSlashEntry(slashMatches.value[slashSelectedIndex.value] || slashMatches.value[0])
+      return
+    }
+    if (props.groupId) onGroupFocus()
+    let slashTarget = null
+    try {
+      slashTarget = await chat.prepareSlashSend(
+        {
+          key: sendTab,
+          creature: sendTab,
+          type: sendTab?.startsWith("ch:") ? "channel" : "creature",
+        },
+        sendText,
+      )
+    } catch (err) {
+      console.warn("Slash inventory lookup failed; using command fallback:", err)
+    }
+    if (contextChanged()) {
+      clearOwnedSlashTarget()
+      return
+    }
+    chat.markSlashTarget(sendTab, slashTarget)
+    ownedSlashTarget = chat._slashTargetByTab?.[sendTab]
+    let parts
+    try {
+      parts = await buildMessageParts(sendText, sendAttachments)
+    } catch (err) {
+      clearOwnedSlashTarget()
+      throw err
+    }
+    if (contextChanged()) {
+      clearOwnedSlashTarget()
+      return
+    }
+    const parsedCommand = _parseSlashCommand(parts)
+    const inlineCommand = parsedCommand?.command === "goal" && (!slashTarget || (slashTarget.type === "command" && slashTarget.name.toLowerCase() === "goal"))
+    if (!parsedCommand && slashTarget) clearOwnedSlashTarget()
+    const resultContext = inlineCommand ? chat.registerCommandResultContext(sendTab) : chat.captureCommandResultContext(sendTab)
+    if (contextChanged()) {
+      if (inlineCommand) chat.releaseCommandResultContext(sendTab, resultContext)
+      clearOwnedSlashTarget()
+      return
+    }
+    const commandTarget = {
+      sessionId: sendGraphId || sendInstanceId,
+      creatureId: sendTab || "root",
+      tabKey: sendTab,
+      commandText: sendText,
+      inline: inlineCommand,
+      resultContext,
+    }
+    const commandContextChanged = () => chat._instanceGeneration !== sendInstanceGeneration || chat._instanceId !== sendInstanceId || chat._instanceGraphId !== sendGraphId || props.instance?.id !== sendPropInstanceId || props.instance?.graph_id !== sendPropGraphId
+    const canUseHttp = sendTab.startsWith("ch:") || inlineCommand
+    const stillOwnsComposer = () => composerRevision.value === sendComposerRevision && chat._instanceGeneration === sendInstanceGeneration && chat._instanceId === sendInstanceId && chat._instanceGraphId === sendGraphId && props.instance?.id === sendPropInstanceId && props.instance?.graph_id === sendPropGraphId && chat.activeTab === sendTab && viewActiveTab.value === sendTab && inputText.value === sendText && attachments.value.length === sendAttachments.length && attachments.value.every((attachment, index) => attachment === sendAttachments[index])
+    if (!canUseHttp && chat._ws?.readyState !== WebSocket.OPEN) {
+      if (inlineCommand) chat.releaseCommandResultContext(sendTab, resultContext)
+      clearOwnedSlashTarget()
+      ElMessage.error("Chat is not connected")
+      return
+    }
+    let outcomePromise
+    try {
+      outcomePromise = chat.send(parts)
+      let outcome = null
+      if (!canUseHttp) outcome = await outcomePromise
+      if (stillOwnsComposer()) {
+        inputText.value = ""
+        attachments.value = []
+        persistDraft()
+        nextTick(() => composerEl.value?.resetHeight())
+      }
+      isNearBottom.value = true // force scroll after send
+      scheduleScrollToBottom(true)
+      if (canUseHttp) outcome = await outcomePromise
+      if (outcome?.handled === "command") {
+        if (commandContextChanged()) {
+          chat.releaseCommandResultContext(commandTarget.tabKey, commandTarget.resultContext)
+        } else {
+          await surfaceCommandResult(outcome.result, commandTarget)
+        }
+      } else if (commandTarget.inline) {
+        chat.releaseCommandResultContext(commandTarget.tabKey, commandTarget.resultContext)
+      }
+    } catch (err) {
+      console.error("Command failed:", err)
+      if (commandContextChanged()) {
+        chat.releaseCommandResultContext(commandTarget.tabKey, commandTarget.resultContext)
+        return
+      }
+      if (commandTarget.inline) {
+        chat.addCommandResult(
+          commandTarget.tabKey,
+          commandTarget.commandText,
+          {
+            error: err?.response?.data?.detail || err?.message || String(err),
+          },
+          commandTarget.resultContext,
+        )
+        if (viewActiveTab.value === commandTarget.tabKey) scheduleScrollToBottom(true)
+      } else {
+        ElMessage.error(`Command failed: ${err?.message || err}`)
+      }
+    }
+  } finally {
+    submitInFlight.value = false
   }
 }
 
