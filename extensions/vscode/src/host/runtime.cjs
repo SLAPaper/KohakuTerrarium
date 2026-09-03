@@ -29,6 +29,7 @@ class RuntimeHost {
     webSocketBase,
     token,
     runtimeEpoch = null,
+    topologyTimeoutMs = 30_000,
   }) {
     this.client = client
     this.state = state
@@ -40,8 +41,14 @@ class RuntimeHost {
     this.webSocketBase = webSocketBase
     this.token = token
     this.runtimeEpoch = runtimeEpoch
+    this.topologyTimeoutMs = topologyTimeoutMs
     this.selectionOperationTail = Promise.resolve()
     this.selectionVersion = 0
+    this.selectionIntentVersion = 0
+    this.pendingSelectionMutations = 0
+    this.topologyReconcileVersion = 0
+    this.disposed = false
+    this.topologyControllers = new Set()
     this.generation = this.sockets.begin()
   }
 
@@ -59,8 +66,14 @@ class RuntimeHost {
     return result
   }
 
+  enqueueSelectionMutation(operation) {
+    this.selectionIntentVersion++
+    this.pendingSelectionMutations++
+    return this.enqueueSelectionOperation(operation).finally(() => this.pendingSelectionMutations--)
+  }
+
   clearSelection() {
-    return this.enqueueSelectionOperation(() => this.clearSelectionOwned())
+    return this.enqueueSelectionMutation(() => this.clearSelectionOwned())
   }
 
   async clearSelectionOwned() {
@@ -74,7 +87,76 @@ class RuntimeHost {
   }
 
   reconcileSelection() {
-    return this.enqueueSelectionOperation(() => this.reconcileSelectionOwned())
+    return this.enqueueSelectionMutation(() => this.reconcileSelectionOwned())
+  }
+
+  async reconcileTopologySelection() {
+    if (this.disposed) return this.supersededTopologySelection()
+    const topologyVersion = ++this.topologyReconcileVersion
+    const current = this.state.selection
+    const selectionVersion = this.selectionVersion
+    const selectionIntentVersion = this.selectionIntentVersion
+    if (!current?.targetCreatureId) {
+      return { selection: null, changed: false, selectionVersion }
+    }
+    let timeout
+    const controller = new AbortController()
+    this.topologyControllers.add(controller)
+    const expired = new Promise((_, reject) => {
+      timeout = setTimeout(() => {
+        controller.abort()
+        reject(Error('Topology reconciliation timed out'))
+      }, this.topologyTimeoutMs)
+    })
+    let sessions
+    try {
+      sessions = await Promise.race([this.client.listOpen({ signal: controller.signal }), expired])
+    } finally {
+      clearTimeout(timeout)
+      this.topologyControllers.delete(controller)
+    }
+    if (!this.ownsTopologySelection(topologyVersion, selectionIntentVersion, selectionVersion, current)) {
+      return this.supersededTopologySelection()
+    }
+    return this.applyTopologySelection(topologyVersion, selectionIntentVersion, selectionVersion, current, sessions)
+  }
+
+  ownsTopologySelection(topologyVersion, selectionIntentVersion, selectionVersion, current) {
+    return (
+      topologyVersion === this.topologyReconcileVersion &&
+      selectionIntentVersion === this.selectionIntentVersion &&
+      selectionVersion === this.selectionVersion &&
+      this.pendingSelectionMutations === 0 &&
+      !this.disposed &&
+      this.state.selection === current
+    )
+  }
+
+  supersededTopologySelection() {
+    return {
+      selection: this.state.selection,
+      changed: false,
+      selectionVersion: this.selectionVersion,
+      superseded: true,
+    }
+  }
+
+  async applyTopologySelection(topologyVersion, selectionIntentVersion, selectionVersion, current, sessions) {
+    const result = this.reconciledSelection(current, sessions)
+    if (!result.changed) {
+      if (!this.ownsTopologySelection(topologyVersion, selectionIntentVersion, selectionVersion, current)) {
+        return this.supersededTopologySelection()
+      }
+      this.selectionVersion++
+      return { ...result, selectionVersion: this.selectionVersion }
+    }
+    const applied = await this.state.updateSelectionIf(result.selection, () =>
+      this.ownsTopologySelection(topologyVersion, selectionIntentVersion, selectionVersion, current),
+    )
+    if (!applied) return this.supersededTopologySelection()
+    this.generation = this.sockets.begin()
+    this.selectionVersion++
+    return { ...result, selectionVersion: this.selectionVersion }
   }
 
   async reconcileSelectionOwned() {
@@ -83,6 +165,10 @@ class RuntimeHost {
       return { selection: null, changed: false, selectionVersion: this.selectionVersion }
     }
     const sessions = await this.client.listOpen()
+    return this.applyReconciledSelection(current, sessions)
+  }
+
+  reconciledSelection(current, sessions) {
     const session = sessions.find(
       (candidate) => candidate.isLive && candidate.creatures.some((creature) => creature.id === current.targetCreatureId),
     )
@@ -100,10 +186,16 @@ class RuntimeHost {
     if (!changed) {
       return { selection: current, changed: false, selectionVersion: this.selectionVersion }
     }
-    await this.state.updateSelection(selection)
+    return { selection, changed: true, selectionVersion: this.selectionVersion }
+  }
+
+  async applyReconciledSelection(current, sessions) {
+    const result = this.reconciledSelection(current, sessions)
+    if (!result.changed) return result
+    await this.state.updateSelection(result.selection)
     this.generation = this.sockets.begin()
     this.selectionVersion++
-    return { selection, changed: true, selectionVersion: this.selectionVersion }
+    return { ...result, selectionVersion: this.selectionVersion }
   }
 
   async selectOwned(message) {
@@ -145,6 +237,7 @@ class RuntimeHost {
   ownsContextCommand(capability) {
     const owned = contextCapabilities.get(capability)
     return (
+      !this.disposed &&
       owned?.runtime === this &&
       owned.runtimeEpoch === this.runtimeEpoch &&
       owned.selected === this.state.selection &&
@@ -222,7 +315,7 @@ class RuntimeHost {
         return
       }
       case 'session.select': {
-        const result = await this.enqueueSelectionOperation(() => this.selectOwned(message))
+        const result = await this.enqueueSelectionMutation(() => this.selectOwned(message))
         this.post({
           type: 'session.select.result',
           requestId: message.requestId,
@@ -231,7 +324,7 @@ class RuntimeHost {
         return
       }
       case 'session.stop': {
-        const result = await this.enqueueSelectionOperation(() => this.stopOwned(message))
+        const result = await this.enqueueSelectionMutation(() => this.stopOwned(message))
         this.post({
           type: 'session.stop.result',
           requestId: message.requestId,
@@ -297,6 +390,11 @@ class RuntimeHost {
   }
 
   dispose() {
+    this.disposed = true
+    this.selectionIntentVersion++
+    this.topologyReconcileVersion++
+    for (const controller of this.topologyControllers) controller.abort()
+    this.topologyControllers.clear()
     this.sockets.closeGeneration(this.generation)
   }
 }

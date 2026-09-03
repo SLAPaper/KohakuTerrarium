@@ -69,8 +69,8 @@ function createClient({ endpoint, token, fetchImpl = fetch }) {
     async diagnostics() {
       return (await request('/api/catalog/server-info/diagnostics')).json()
     },
-    async listOpen() {
-      const body = await (await request('/api/sessions/open')).json()
+    async listOpen(options = {}) {
+      const body = await (await request('/api/sessions/open', options)).json()
       return (Array.isArray(body) ? body : body.sessions || []).map(normalizeSession)
     },
     async createCreature({ configPath, pwd, name }) {

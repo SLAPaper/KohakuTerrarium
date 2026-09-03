@@ -10,15 +10,30 @@ class ConnectionStateWriter {
   }
 
   update(mutator) {
-    const operation = this.queue.then(async () => {
+    return this.enqueue(async () => {
       const current = this.read()
       const next = typeof mutator === 'function' ? mutator(current) : mutator
-      if (next === undefined) return current
+      if (next === undefined) return { applied: false, value: current }
       await this.workspaceState.update(this.key, next)
-      return next
+      return { applied: true, value: next }
     })
-    this.queue = operation.catch(() => {})
-    return operation
+  }
+
+  updateIf(predicate, mutator) {
+    return this.enqueue(async () => {
+      const current = this.read()
+      if (!predicate(current)) return { applied: false, value: current }
+      const next = typeof mutator === 'function' ? mutator(current) : mutator
+      if (next === undefined) return { applied: false, value: current }
+      await this.workspaceState.update(this.key, next)
+      return { applied: true, value: next }
+    })
+  }
+
+  enqueue(operation) {
+    const result = this.queue.then(operation)
+    this.queue = result.catch(() => {})
+    return result
   }
 }
 

@@ -117,8 +117,9 @@ for (const staleOutcome of ['resolve', 'reject']) {
       }
       async update(change) {
         const next = change(this.value)
-        if (next) this.value = next
-        return this.value
+        if (!next) return { applied: false, value: this.value }
+        this.value = next
+        return { applied: true, value: this.value }
       }
     }
     class RuntimeHost {

@@ -10,7 +10,7 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
-function harness() {
+function harness(options = {}) {
   const updates = []
   const posts = []
   const socketCalls = []
@@ -57,6 +57,12 @@ function harness() {
       this.selection = selection
       updates.push(selection)
     },
+    async updateSelectionIf(selection, owns) {
+      if (!owns()) return false
+      this.selection = selection
+      updates.push(selection)
+      return true
+    },
   }
   const sockets = {
     beginCount: 0,
@@ -73,6 +79,7 @@ function harness() {
     closeSocket() {
       return true
     },
+    closeGeneration() {},
   }
   const host = new RuntimeHost({
     client,
@@ -85,6 +92,7 @@ function harness() {
     webSocketBase: 'ws://127.0.0.1:8000',
     token: 'host-secret',
     runtimeEpoch: 'ready-B',
+    topologyTimeoutMs: options.topologyTimeoutMs,
   })
   return { client, host, posts, socketCalls, sockets, state, updates }
 }

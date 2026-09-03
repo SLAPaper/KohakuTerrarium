@@ -361,6 +361,31 @@ test('context actions preserve the backend response payload exactly', async () =
   assert.strictEqual(posts[0].data, payload)
 })
 
+test('disposed runtime rejects a queued context command before backend execution', async () => {
+  const { client, host, state } = harness()
+  state.selection = {
+    session: 'graph-a',
+    graph: 'graph-a',
+    creature: 'alpha',
+    targetCreatureId: 'creature-alpha',
+  }
+  const activated = deferred()
+  client.active = () => activated.promise
+  const selecting = host.handle({
+    type: 'session.select',
+    requestId: 59,
+    session: 'graph-b',
+    creatureId: 'creature-beta',
+  })
+  const context = host.handle({ type: 'context.compact', requestId: 60 })
+
+  host.dispose()
+  activated.resolve({ session_id: 'graph-b', creatures: [{ creature_id: 'creature-beta', name: 'beta' }] })
+  await selecting
+  await assert.rejects(context, /ownership changed/)
+  assert.equal(client.commandCalls.length, 0)
+})
+
 test('context action fails closed when selection ownership changes during request', async () => {
   const { client, host, posts, state } = harness()
   const command = deferred()

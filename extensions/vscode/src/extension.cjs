@@ -220,18 +220,27 @@ function activate(context) {
             selection: current.selection || null,
           }
         })
-        if (runtimeEpoch !== epoch) throw Error('Runtime ownership changed')
+        if (runtimeEpoch !== epoch || !stored.applied) throw Error('Runtime ownership changed')
         activeConnection = connection
         const state = {
-          selection: stored.selection || null,
+          selection: stored.value.selection || null,
           async updateSelection(selection) {
             if (runtimeEpoch !== epoch) throw Error('Runtime ownership changed')
-            await stateWriter.update((current) => {
+            const result = await stateWriter.update((current) => {
               if (runtimeEpoch !== epoch || current.endpoint !== connection.endpoint) return undefined
               return { ...current, selection }
             })
-            if (runtimeEpoch !== epoch) throw Error('Runtime ownership changed')
+            if (runtimeEpoch !== epoch || !result.applied) throw Error('Runtime ownership changed')
             this.selection = selection
+          },
+          async updateSelectionIf(selection, owns) {
+            const result = await stateWriter.updateIf(
+              (current) => runtimeEpoch === epoch && current.endpoint === connection.endpoint && owns(),
+              (current) => ({ ...current, selection }),
+            )
+            if (!result.applied || runtimeEpoch !== epoch) return false
+            this.selection = selection
+            return true
           },
         }
         const createdRuntime = new RuntimeHost({
@@ -255,7 +264,7 @@ function activate(context) {
           token: connection.token,
           onInvalidate: async () => {
             if (runtimeEpoch !== epoch || runtime !== createdRuntime) return
-            const result = await createdRuntime.reconcileSelection()
+            const result = await createdRuntime.reconcileTopologySelection()
             if (runtimeEpoch !== epoch || runtime !== createdRuntime || result.superseded) return
             await webview.postMessage({ type: 'selection.changed', readyId: createdRuntime.runtimeEpoch, data: result })
           },
