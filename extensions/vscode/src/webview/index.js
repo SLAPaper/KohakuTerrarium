@@ -32,6 +32,8 @@ import {
 } from './transcriptWindow.mjs'
 import { createViewRenderers } from './viewRenderers.mjs'
 import './style.css'
+import { installNotificationSurface } from './notifications.mjs'
+import './notifications.css'
 
 const vscode = acquireVsCodeApi()
 const pending = new Map()
@@ -62,6 +64,8 @@ BridgeWebSocket.post = (message) => vscode.postMessage(message)
 
 const App = {
   setup() {
+    const notifications = installNotificationSurface(document)
+    onBeforeUnmount(notifications.dispose)
     const chat = useChatStore()
     const hostAcceptedChat = createHostAcceptedChat({ BridgeWebSocket, chat })
     globalThis.WebSocket = createObservedWebSocket(BridgeWebSocket, hostAcceptedChat.observe)
@@ -217,6 +221,7 @@ const App = {
     let selectionOperationEpoch = 0
     let notificationReadyId = null
     function clearComposerBuckets() {
+      notifications.clear()
       draftBuckets.clearAll()
       attachmentBuckets.clearAll()
       draftRevision.value += 1

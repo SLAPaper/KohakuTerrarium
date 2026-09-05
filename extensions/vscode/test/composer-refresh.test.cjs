@@ -148,6 +148,29 @@ test('real App preserves text and files across pending Refresh, isolates creatur
     assert.notEqual(reset.requestId, pending.requestId)
     await answerReady(reset, 'creature-b')
     assertBuffer('', null)
+    const activeSocket = requests.filter((message) => message.type === 'ws.open').at(-1).socketId
+    receive({
+      type: 'ws.frame',
+      socketId: activeSocket,
+      data: JSON.stringify({
+        type: 'notification',
+        source: 'same-name',
+        event_id: 'toast-error',
+        surface: 'toast',
+        payload: { level: 'error', text: '<img src=x onerror=alert(1)> task failed', duration_ms: 60_000 },
+      }),
+    })
+    await settle()
+    const toast = document.querySelector('.kt-notification[role="alert"]')
+    assert.ok(toast, 'toast ui_event must be visible instead of silently discarded')
+    assert.match(toast.textContent, /task failed/)
+    assert.equal(toast.querySelector('img'), null, 'untrusted notification text is not HTML')
+    assert.equal(toast.getAttribute('aria-live'), 'assertive')
+    const dismiss = toast.querySelector('button[aria-label="Dismiss notification"]')
+    assert.ok(dismiss)
+    dismiss.click()
+    await settle()
+    assert.equal(document.querySelector('.kt-notification'), null)
     async function submitGoal(text) {
       textarea().value = text
       textarea().dispatchEvent(new window.Event('input', { bubbles: true }))

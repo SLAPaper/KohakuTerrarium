@@ -47,6 +47,10 @@ Within an open Webview, Refresh preserves text and files for the same runtime an
 
 Pure-text `/goal ...` uses the selected Creature's command endpoint and shows the command result in the transcript. Text with attachments remains a normal chat message. No arbitrary command or target proxy is exposed. Drafts remain on failure; if a request times out or disconnects after dispatch, the command may still have executed. Check goal status before retrying a mutation.
 
+### Notifications
+
+Toast-surface events appear in the Webview with explicit severity text, a dismiss button, and ARIA status/alert semantics. Hover or keyboard focus suspends dismissal; leaving grants a full reading interval. Escape dismisses a focused notification. Up to five notifications are retained; configuration/endpoint changes and Webview disposal clear them. The existing shared store maps absent or zero `duration_ms` to four seconds, matching Dashboard behavior.
+
 ### Advanced override
 
 Use **KohakuTerrarium: Configure Local Connection Override** only for a nonstandard local port that cannot be discovered. Return to the normal behavior with **KohakuTerrarium: Use Automatic Local Discovery**.
