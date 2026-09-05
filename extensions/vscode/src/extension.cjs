@@ -5,7 +5,7 @@ const WebSocket = require('ws')
 const { createClient, validateCapabilities } = require('./host/client.cjs')
 const { resolveLocalConnection } = require('./host/connection.cjs')
 const { createConnectionAttemptOwner } = require('./host/connectionAttempt.cjs')
-const { discoverInstalledKt, probeCapabilities } = require('./host/localDiscovery.cjs')
+const { discoverInstalledKt, probeCapabilities, verifyKtProbe } = require('./host/localDiscovery.cjs')
 const { publicError } = require('./host/errors.cjs')
 const { allowedMessage, validateEndpoint } = require('./host/protocol.cjs')
 const { RuntimeHost } = require('./host/runtime.cjs')
@@ -35,9 +35,20 @@ async function resolveConnection(context, stored) {
     }
   } else {
     try {
-      discovery = await discoverInstalledKt()
+      discovery = await discoverInstalledKt({
+        selectStrictCandidate: async (candidates) => {
+          const selected = await vscode.window.showQuickPick(
+            candidates.map((candidate) => ({ label: candidate.endpoint, candidate })),
+            {
+              placeHolder: 'Select a trusted local endpoint to send your host token; service identity is not yet verified',
+              ignoreFocusOut: true,
+            },
+          )
+          return selected?.candidate
+        },
+      })
     } catch (error) {
-      if (!stored.endpoint) throw error
+      if (!stored.endpoint || error?.code === 'KT_DISCOVERY_CANCELLED') throw error
       const endpoint = validateEndpoint(stored.endpoint)
       const capabilities = validateCapabilities(await probeCapabilities(endpoint))
       discovery = {
@@ -54,13 +65,16 @@ async function resolveConnection(context, stored) {
     getStoredToken: () => context.secrets.get(TOKEN_KEY),
     promptToken: () =>
       vscode.window.showInputBox({
-        prompt: 'The local KT service requires its host token',
+        prompt: `The local KT service at ${discovery.endpoint} requires its host token`,
         password: true,
         ignoreFocusOut: true,
       }),
     storeToken: (token) => context.secrets.store(TOKEN_KEY, token),
-    verify: async ({ endpoint, token }) => {
-      await createClient({ endpoint, token }).listOpen()
+    verify: async ({ endpoint, token, source, requiresToken }, { signal }) => {
+      if (source === 'probe' && requiresToken && !(await verifyKtProbe(endpoint, 500, token))) {
+        throw Error('KT identity verification failed')
+      }
+      await createClient({ endpoint, token }).listOpen({ signal })
     },
   })
 }

@@ -77,7 +77,7 @@ test('bounded probe continues within a batch after a false identity match', asyn
   assert.deepEqual(verified, ['http://127.0.0.1:8001', 'http://127.0.0.1:8002'])
 })
 
-test('bounded probe rejects strict-token candidates and requires KT diagnostics identity', async () => {
+test('bounded probe defers strict identity verification until credentials are available', async () => {
   const strictCapabilities = {
     schema: 1,
     auth: {
@@ -87,18 +87,17 @@ test('bounded probe rejects strict-token candidates and requires KT diagnostics 
     },
   }
   let diagnostics = 0
-  await assert.rejects(
-    discoverLocalKt({
-      readState: async () => null,
-      ports: [8001],
-      probe: async () => strictCapabilities,
-      verifyProbe: async () => {
-        diagnostics++
-        return true
-      },
-    }),
-    /No supported local KohakuTerrarium service was found/,
-  )
+  const strict = await discoverLocalKt({
+    readState: async () => null,
+    ports: [8001],
+    probe: async () => strictCapabilities,
+    verifyProbe: async () => {
+      diagnostics++
+      return true
+    },
+  })
+  assert.equal(strict.endpoint, 'http://127.0.0.1:8001')
+  assert.equal(strict.requiresToken, true)
   assert.equal(diagnostics, 0)
 
   await assert.rejects(
@@ -110,6 +109,47 @@ test('bounded probe rejects strict-token candidates and requires KT diagnostics 
     }),
     /No supported local KohakuTerrarium service was found/,
   )
+})
+
+test('bounded probe continues after an identity request times out', async () => {
+  const verified = []
+  const result = await discoverLocalKt({
+    readState: async () => null,
+    ports: [8001, 8002],
+    probe: async () => bypassCapabilities,
+    verifyProbe: async (endpoint) => {
+      verified.push(endpoint)
+      if (endpoint.endsWith(':8001')) throw Error('body read timed out')
+      return true
+    },
+  })
+  assert.equal(result.endpoint, 'http://127.0.0.1:8002')
+  assert.deepEqual(verified, ['http://127.0.0.1:8001', 'http://127.0.0.1:8002'])
+})
+
+test('strict fallback selection includes later candidates and cannot select an unrelated endpoint', async () => {
+  const strictCapabilities = {
+    ...bypassCapabilities,
+    auth: { ...bypassCapabilities.auth, host_token: { enabled: true, loopback_bypass: false } },
+  }
+  const options = {
+    readState: async () => null,
+    ports: [8001, 8002, 8003],
+    concurrency: 2,
+    probe: async () => strictCapabilities,
+  }
+  const selected = await discoverLocalKt({
+    ...options,
+    selectStrictCandidate: async (candidates) => {
+      assert.deepEqual(
+        candidates.map((candidate) => candidate.endpoint),
+        ['http://127.0.0.1:8001', 'http://127.0.0.1:8002', 'http://127.0.0.1:8003'],
+      )
+      return candidates[2]
+    },
+  })
+  assert.equal(selected.endpoint, 'http://127.0.0.1:8003')
+  await assert.rejects(discoverLocalKt({ ...options, selectStrictCandidate: async () => ({ endpoint: 'http://remote:80' }) }))
 })
 
 test('strict local auth is discovered without requiring an endpoint prompt', async () => {

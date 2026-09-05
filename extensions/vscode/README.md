@@ -35,7 +35,9 @@ If no daemon is running, start it and press **Refresh**. A foreground `kt web` p
 
 ### Strict local auth
 
-If the local service has host-token auth enabled and `loopback_bypass = false`, the extension reuses the token from VS Code `SecretStorage`. It asks only for the token when no valid token has been saved. The endpoint is still discovered automatically.
+If the local service has host-token auth enabled and `loopback_bypass = false`, the extension reuses the token from VS Code `SecretStorage`. It asks for a token when none is saved, or once to replace a token rejected with HTTP 401. Network errors do not trigger replacement prompts.
+
+When daemon state is unavailable or stale, automatic port discovery lists strict-auth candidates for you to select before reading or sending a stored token. Select only an endpoint you trust: public capabilities advertise an auth policy, not a verified service identity. The extension verifies authenticated KT diagnostics and the session connection before saving a new token. Canceling the selector sends no credentials and does not fall back to an old endpoint. No manual endpoint entry is required.
 
 ### Advanced override
 

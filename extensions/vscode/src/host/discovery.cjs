@@ -55,6 +55,7 @@ async function discoverLocalKt({
   isPidAlive = () => true,
   probe,
   verifyProbe = async () => true,
+  selectStrictCandidate = async (candidates) => candidates[0],
   ports = Array.from({ length: 50 }, (_, index) => 8001 + index),
   concurrency = 8,
 }) {
@@ -70,14 +71,27 @@ async function discoverLocalKt({
     } catch {}
   }
 
+  const strictCandidates = []
   for (let index = 0; index < ports.length; index += concurrency) {
     const endpoints = ports.slice(index, index + concurrency).map((port) => `http://127.0.0.1:${port}`)
     const found = await supportedCandidates(endpoints, probe)
     for (const match of found) {
       const candidate = result(match.endpoint, match.capabilities, 'probe')
-      if (candidate.requiresToken) continue
-      if (await verifyProbe(candidate.endpoint)) return candidate
+      if (candidate.requiresToken) {
+        strictCandidates.push(candidate)
+        continue
+      }
+      try {
+        if (await verifyProbe(candidate.endpoint)) return candidate
+      } catch {}
     }
+  }
+  if (strictCandidates.length) {
+    const selected = await selectStrictCandidate(strictCandidates)
+    if (strictCandidates.includes(selected)) return selected
+    const error = Error('Local KT discovery selection cancelled')
+    error.code = 'KT_DISCOVERY_CANCELLED'
+    throw error
   }
   throw Error('No supported local KohakuTerrarium service was found')
 }

@@ -38,34 +38,42 @@ async function probeCapabilities(endpoint, timeoutMs = 500) {
       redirect: 'error',
     })
     if (!response.ok) throw Error(`KT discovery failed: ${response.status}`)
-    return response.json()
+    return await response.json()
   } finally {
     clearTimeout(timer)
+    controller.abort()
   }
 }
 
-async function verifyKtProbe(endpoint, timeoutMs = 500) {
+async function verifyKtProbe(endpoint, timeoutMs = 500, token = '') {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const response = await fetch(`${endpoint}/api/catalog/server-info/diagnostics`, {
       signal: controller.signal,
       redirect: 'error',
+      headers: token ? { 'X-KT-Host-Token': token } : {},
     })
-    if (!response.ok) return false
+    if (!response.ok) {
+      const error = Error(`KT identity verification failed: ${response.status}`)
+      error.status = response.status
+      throw error
+    }
     const body = await response.json()
     return typeof body?.version === 'string' && Number.isSafeInteger(body?.daemon?.pid) && typeof body?.daemon?.mode === 'string'
   } finally {
     clearTimeout(timer)
+    controller.abort()
   }
 }
 
-function discoverInstalledKt() {
+function discoverInstalledKt({ selectStrictCandidate } = {}) {
   return discoverLocalKt({
     readState: readDaemonState,
     isPidAlive,
     probe: probeCapabilities,
     verifyProbe: verifyKtProbe,
+    selectStrictCandidate,
   })
 }
 

@@ -108,6 +108,37 @@ test('strict local discovery prompts only for a missing token and stores it afte
   assert.deepEqual(stored, ['prompted-secret'])
 })
 
+test('connection verification times out and aborts without saving or replacing a token', async () => {
+  let signal
+  let prompts = 0
+  let saved = 0
+  let finish
+  const late = new Promise((resolve) => {
+    finish = resolve
+  })
+  const options = {
+    discover: async () => strict,
+    getStoredToken: async () => 'stored-secret',
+    promptToken: async () => {
+      prompts++
+      return 'replacement'
+    },
+    storeToken: async () => saved++,
+    timeoutMs: 5,
+    verify: (_connection, options) => {
+      signal = options.signal
+      return late
+    },
+  }
+  await assert.rejects(resolveLocalConnection(options), /timed out/)
+  assert.equal(signal.aborted, true)
+  assert.equal(prompts, 0)
+  assert.equal(saved, 0)
+  finish()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(saved, 0)
+})
+
 test('a rejected or invalid strict token does not create a connection', async () => {
   await assert.rejects(
     resolveLocalConnection({
