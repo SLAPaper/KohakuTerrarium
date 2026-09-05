@@ -40,6 +40,11 @@ function publicError(type) {
         code: 'interrupt_failed',
         message: 'Could not stop the current turn.',
       }
+    case 'goal.execute':
+      return {
+        code: 'goal_command_failed',
+        message: 'Goal command could not be confirmed and may have executed. Check goal status before retrying a mutation.',
+      }
     case 'ws.open':
     case 'ws.send':
     case 'ws.close':

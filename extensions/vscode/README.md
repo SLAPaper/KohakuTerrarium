@@ -43,6 +43,10 @@ When daemon state is unavailable or stale, automatic port discovery lists strict
 
 Within an open Webview, Refresh preserves text and files for the same runtime and Creature ID, including while the request is pending. Draft and attachment caches each retain up to 32 recently used conversations; older inactive buffers are evicted. This bounds retained conversation entries, not aggregate attachment bytes. Changing the service endpoint, changing connection configuration, or closing the Webview clears the caches. Unsent files are not persisted to disk.
 
+### Goal commands
+
+Pure-text `/goal ...` uses the selected Creature's command endpoint and shows the command result in the transcript. Text with attachments remains a normal chat message. No arbitrary command or target proxy is exposed. Drafts remain on failure; if a request times out or disconnects after dispatch, the command may still have executed. Check goal status before retrying a mutation.
+
 ### Advanced override
 
 Use **KohakuTerrarium: Configure Local Connection Override** only for a nonstandard local port that cannot be discovered. Return to the normal behavior with **KohakuTerrarium: Use Automatic Local Discovery**.

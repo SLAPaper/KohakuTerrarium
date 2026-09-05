@@ -1,4 +1,5 @@
 const { normalizeSession } = require('./client.cjs')
+const { executeGoal } = require('./goalCommand.cjs')
 
 const contextCapabilities = new WeakMap()
 
@@ -49,6 +50,8 @@ class RuntimeHost {
     this.topologyReconcileVersion = 0
     this.disposed = false
     this.topologyControllers = new Set()
+    this.pendingGoals = new Set()
+    this.goalTimeoutMs = 25_000
     this.generation = this.sockets.begin()
   }
 
@@ -350,6 +353,11 @@ class RuntimeHost {
         })
         return
       }
+      case 'goal.execute': {
+        const data = await executeGoal(this, message)
+        this.post({ type: 'goal.execute.result', requestId: message.requestId, data })
+        return
+      }
       case 'context.compact':
       case 'context.clear': {
         const capability = message.contextCapability || this.acquireContextCommand()
@@ -395,6 +403,8 @@ class RuntimeHost {
     this.topologyReconcileVersion++
     for (const controller of this.topologyControllers) controller.abort()
     this.topologyControllers.clear()
+    for (const cancel of this.pendingGoals) cancel(Error('Goal runtime disposed; execution outcome may be unknown'))
+    this.pendingGoals.clear()
     this.sockets.closeGeneration(this.generation)
   }
 }

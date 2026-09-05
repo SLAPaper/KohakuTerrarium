@@ -6,6 +6,8 @@ import { useChatStore } from '@/stores/chat'
 
 import { BridgeWebSocket } from './bridge.js'
 import { renderCarbonIcon } from './carbonIcons.mjs'
+import { bindComposerBuffer } from './composerBuffer.mjs'
+import { installGoalBridge } from './goalBridge.mjs'
 import { applyContextCommandOutcome } from './contextCommandResult.mjs'
 import { createHostAcceptedChat, createObservedWebSocket } from './hostAcceptedChat.mjs'
 import { createConversationMessageOrchestrator, createConversationScrollController } from './conversationScroll.mjs'
@@ -73,29 +75,9 @@ const App = {
       creatureId: currentSession.value?.targetCreatureId,
     })
     const draftBuckets = createConversationDrafts(composerOwner)
-    const draftRevision = ref(0)
-    const draft = computed({
-      get: () => {
-        draftRevision.value
-        return draftBuckets.get()
-      },
-      set: (value) => {
-        draftBuckets.set(value)
-        draftRevision.value += 1
-      },
-    })
+    const { model: draft, revision: draftRevision } = bindComposerBuffer(draftBuckets)
     const attachmentBuckets = createConversationAttachments(composerOwner)
-    const attachmentRevision = ref(0)
-    const attachments = computed({
-      get: () => {
-        attachmentRevision.value
-        return attachmentBuckets.get()
-      },
-      set: (value) => {
-        attachmentBuckets.set(value)
-        attachmentRevision.value += 1
-      },
-    })
+    const { model: attachments, revision: attachmentRevision } = bindComposerBuffer(attachmentBuckets)
     const error = ref('')
     const status = ref('')
     const busy = ref(false)
@@ -103,6 +85,7 @@ const App = {
     const sessionsExpanded = ref(false)
     const brandUri = document.querySelector('#app')?.dataset.brandUri || ''
     let reconciliation = Promise.resolve()
+    let pendingReconciliations = 0
     let contextOperation = 0
     const selectionVersions = createSelectionVersionOwner()
     let activeSelectionReadyId = null
@@ -116,6 +99,19 @@ const App = {
       return submitGate.busy(currentConversationOwnership())
     })
     const attachmentTransform = conversationOwnership.transform((file) => file)
+    onBeforeUnmount(
+      installGoalBridge({
+        chat,
+        request,
+        ownership: conversationOwnership,
+        getTarget: currentConversationOwnership,
+        getFence: () => {
+          if (pendingReconciliations) throw Error('Session is reconciling; wait before sending a goal command')
+          if (activeSelectionReadyId !== latestReadyRequestId || !available.value) throw Error('Wait for the current Session to reconnect')
+          return { readyId: activeSelectionReadyId, selectionVersion: selectionVersions.highest() }
+        },
+      }),
+    )
     const selectionRequest = async (type, data) => {
       const result = await request(type, data)
       if (result.readyId !== latestReadyRequestId && result.readyId !== activeSelectionReadyId) return result
@@ -448,11 +444,13 @@ const App = {
         const ownedOperation = selectionOperationEpoch
         const isCurrent = () =>
           ownedOperation === selectionOperationEpoch && eventReadyId === notificationReadyId && notification.isCurrent()
+        pendingReconciliations++
         reconciliation = reconciliation
           .then(() => applySelection(message.data.selection, message.data.changed, isCurrent))
           .catch((cause) => {
             if (isCurrent()) error.value = cause.message
           })
+          .finally(() => pendingReconciliations--)
         return
       }
       settleRequestMessage(pending, message)

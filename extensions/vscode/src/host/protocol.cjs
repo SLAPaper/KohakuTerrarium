@@ -11,6 +11,7 @@ const ALLOWED = new Set([
   'http.interrupt',
   'context.compact',
   'context.clear',
+  'goal.execute',
   'ws.open',
   'ws.send',
   'ws.close',
@@ -52,6 +53,15 @@ function allowedMessage(message) {
       return hasText(message.session) && hasText(message.creature)
     case 'ws.send':
       return hasText(message.data) && Number.isSafeInteger(message.sendId) && message.sendId > 0
+    case 'goal.execute':
+      return (
+        typeof message.args === 'string' &&
+        Number.isSafeInteger(message.readyId) &&
+        message.readyId > 0 &&
+        Number.isSafeInteger(message.selectionVersion) &&
+        message.selectionVersion >= 0 &&
+        Object.keys(message).every((field) => ['type', 'requestId', 'args', 'readyId', 'selectionVersion'].includes(field))
+      )
     case 'context.compact':
     case 'context.clear':
       return Object.keys(message).every((field) => field === 'type' || field === 'requestId')

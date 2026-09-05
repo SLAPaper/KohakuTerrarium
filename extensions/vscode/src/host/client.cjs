@@ -101,12 +101,13 @@ function createClient({ endpoint, token, fetchImpl = fetch }) {
         })
       ).json()
     },
-    async creatureCommand(session, creature, command, args) {
+    async creatureCommand(session, creature, command, args, { signal } = {}) {
       return (
         await request(`/api/sessions/${encode(session)}/creatures/${encode(creature)}/command`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ command, args }),
+          signal,
         })
       ).json()
     },
