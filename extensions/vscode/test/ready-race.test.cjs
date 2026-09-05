@@ -86,6 +86,7 @@ test('webview ignores an older ready failure after a newer success', async () =>
 for (const staleOutcome of ['resolve', 'reject']) {
   test(`host retains replacement runtime promise after stale ${staleOutcome}`, async () => {
     const builds = []
+    const posted = []
     const commands = new Map()
     let provider
     let receiveMessage
@@ -177,7 +178,9 @@ for (const staleOutcome of ['resolve', 'reject']) {
         receiveMessage = callback
         return { dispose() {} }
       },
-      async postMessage() {},
+      async postMessage(message) {
+        posted.push(message)
+      },
     }
     provider.resolveWebviewView({
       webview,
@@ -203,6 +206,17 @@ for (const staleOutcome of ['resolve', 'reject']) {
     assert.equal(builds.length, 2, 'the pending replacement build remains the shared promise')
     builds[1].resolve({ endpoint: 'http://127.0.0.1:8001', token: '', source: 'automatic' })
     await Promise.all([replacement, shared])
+    const connectionId = posted.find((message) => message.type === 'ready.result' && message.data.available)?.data.connectionId
+    assert.equal(typeof connectionId, 'string')
+    assert.doesNotMatch(connectionId, /127\.0\.0\.1|8001|http/)
+    const refreshed = receiveMessage({ type: 'ready', requestId: 4 })
+    builds[2].resolve({ endpoint: 'http://127.0.0.1:8001', token: '', source: 'automatic' })
+    await refreshed
+    assert.equal(posted.at(-1).data.connectionId, connectionId)
+    const switched = receiveMessage({ type: 'ready', requestId: 5 })
+    builds[3].resolve({ endpoint: 'http://127.0.0.1:8002', token: '', source: 'automatic' })
+    await switched
+    assert.notEqual(posted.at(-1).data.connectionId, connectionId)
     disposeView()
   })
 }

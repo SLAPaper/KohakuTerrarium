@@ -190,6 +190,7 @@ function activate(context) {
       let runtimePromise = null
       let topology = null
       let activeConnection = null
+      let composerConnection = { endpoint: null, id: null }
       let epoch = 0
       const connectionAttempts = createConnectionAttemptOwner()
       const entry = {
@@ -236,6 +237,9 @@ function activate(context) {
         })
         if (runtimeEpoch !== epoch || !stored.applied) throw Error('Runtime ownership changed')
         activeConnection = connection
+        if (composerConnection.endpoint !== connection.endpoint) {
+          composerConnection = { endpoint: connection.endpoint, id: crypto.randomUUID() }
+        }
         const state = {
           selection: stored.value.selection || null,
           async updateSelection(selection) {
@@ -280,7 +284,12 @@ function activate(context) {
             if (runtimeEpoch !== epoch || runtime !== createdRuntime) return
             const result = await createdRuntime.reconcileTopologySelection()
             if (runtimeEpoch !== epoch || runtime !== createdRuntime || result.superseded) return
-            await webview.postMessage({ type: 'selection.changed', readyId: createdRuntime.runtimeEpoch, data: result })
+            await webview.postMessage({
+              type: 'selection.changed',
+              readyId: createdRuntime.runtimeEpoch,
+              connectionId: composerConnection.id,
+              data: result,
+            })
           },
         })
         if (runtimeEpoch !== epoch) {
@@ -326,6 +335,7 @@ function activate(context) {
                 data: {
                   available: true,
                   automatic: activeConnection.source !== 'manual',
+                  connectionId: composerConnection.id,
                   selection: reconciled.selection,
                   selectionVersion: reconciled.selectionVersion,
                   readyId: current.runtimeEpoch,

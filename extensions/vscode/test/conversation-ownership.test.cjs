@@ -39,17 +39,99 @@ test('accepted attachments are scoped by Session and Creature and restored on re
   assert.equal(buckets.get(), fromA)
 })
 
-test('runtime epoch replacement fails closed while a stable epoch preserves attachments', () => {
+test('runtime refresh preserves stable conversation attachments and drafts', () => {
   let state = { readyId: 1, runtimeId: 'session-a', creatureId: 'root' }
   const buckets = createConversationAttachments(() => state)
   const accepted = [{ name: 'a.txt' }]
+  const drafts = createConversationDrafts(() => state)
+  drafts.set('mid-typing')
   buckets.set(accepted)
   assert.equal(buckets.get(), accepted)
 
   state = { ...state }
   assert.equal(buckets.get(), accepted)
   state = { ...state, readyId: 2 }
-  assert.deepEqual(buckets.get(), [])
+  assert.equal(buckets.get(), accepted)
+  assert.equal(drafts.get(), 'mid-typing')
+})
+
+test('buckets evict the least recently used conversation and release all state on disposal', () => {
+  let state = { readyId: 1, runtimeId: 'a', creatureId: 'root' }
+  const attachments = createConversationAttachments(() => state, { maxBuckets: 2 })
+  const drafts = createConversationDrafts(() => state, { maxBuckets: 2 })
+  const ownerA = attachments.capture()
+  attachments.set([{ name: 'a' }])
+  drafts.set('a')
+  state = { ...state, runtimeId: 'b' }
+  const ownerB = attachments.capture()
+  attachments.set([{ name: 'b' }])
+  drafts.set('b')
+  attachments.get(ownerA)
+  drafts.get(ownerA)
+  state = { ...state, runtimeId: 'c' }
+  attachments.set([{ name: 'c' }])
+  drafts.set('c')
+  assert.deepEqual(attachments.get(ownerB), [])
+  assert.equal(drafts.get(ownerB), '')
+  assert.deepEqual(attachments.get(ownerA), [{ name: 'a' }])
+  attachments.clearAll()
+  drafts.clearAll()
+  assert.deepEqual(attachments.get(ownerA), [])
+  assert.equal(drafts.get(ownerA), '')
+  attachments.set([{ name: 'new' }])
+  drafts.set('new')
+  attachments.dispose()
+  drafts.dispose()
+  attachments.set([{ name: 'late' }], ownerA)
+  drafts.set('late', ownerA)
+  assert.deepEqual(attachments.get(ownerA), [])
+  assert.equal(drafts.get(ownerA), '')
+})
+
+test('late attachment confirmation does not promote an inactive bucket for eviction', () => {
+  let state = { readyId: 1, runtimeId: 'a', creatureId: 'root' }
+  const buckets = createConversationAttachments(() => state, { maxBuckets: 2 })
+  const submitted = { name: 'submitted' }
+  buckets.set([submitted, { name: 'a-later' }])
+  const a = buckets.capture()
+  state = { ...state, runtimeId: 'b' }
+  buckets.set([{ name: 'b' }])
+  const b = buckets.capture()
+  buckets.removeSubmitted([submitted], a)
+  state = { ...state, runtimeId: 'c' }
+  buckets.set([{ name: 'c' }])
+  assert.deepEqual(buckets.get(a), [])
+  assert.deepEqual(buckets.get(b), [{ name: 'b' }])
+})
+
+test('dispose fences asynchronous conversion before dispatch even for the same owner', async () => {
+  const { ownership } = fixture()
+  const conversion = deferred()
+  let sends = 0
+  const pending = ownership.dispatch(async (assertCurrent) => {
+    await conversion.promise
+    assertCurrent()
+    sends++
+  })
+  ownership.dispose()
+  conversion.resolve()
+  await assert.rejects(pending, isConversationSuperseded)
+  assert.equal(sends, 0)
+})
+
+test('late send confirmation after refresh cannot clear a newly edited identical draft', () => {
+  let state = { readyId: 1, runtimeId: 'a', creatureId: 'root' }
+  const drafts = createConversationDrafts(() => state)
+  drafts.set('same text')
+  const submitted = drafts.capture()
+  state = { ...state, readyId: 2 }
+  drafts.set('different')
+  drafts.set('same text')
+  assert.equal(drafts.clearSubmitted('same text', submitted), false)
+  assert.equal(drafts.get(), 'same text')
+  const latest = drafts.capture()
+  assert.equal(drafts.clearSubmitted('same text', latest), true)
+  assert.equal(drafts.get(), '')
 })
 
 test('clear only removes the captured conversation bucket', () => {

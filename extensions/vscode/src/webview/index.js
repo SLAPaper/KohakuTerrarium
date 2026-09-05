@@ -106,12 +106,7 @@ const App = {
     let contextOperation = 0
     const selectionVersions = createSelectionVersionOwner()
     let activeSelectionReadyId = null
-    const currentConversationOwnership = () => ({
-      readyId: latestReadyRequestId,
-      runtimeId: currentSession.value?.session?.runtimeId,
-      creatureId: currentSession.value?.targetCreatureId,
-      name: currentSession.value?.target,
-    })
+    const currentConversationOwnership = () => ({ ...composerOwner(), name: currentSession.value?.target })
     const conversationOwnership = createConversationOwnership(currentConversationOwnership)
     const submitGate = createSubmitGate()
     const submitRevision = ref(0)
@@ -222,16 +217,33 @@ const App = {
       })
 
     let latestReadyRequestId = null
+    let composerConnectionId = null
+    let selectionOperationEpoch = 0
+    let notificationReadyId = null
+    function clearComposerBuckets() {
+      draftBuckets.clearAll()
+      attachmentBuckets.clearAll()
+      draftRevision.value += 1
+      attachmentRevision.value += 1
+    }
+    function acceptComposerConnection(connectionId) {
+      if (composerConnectionId !== connectionId) clearComposerBuckets()
+      composerConnectionId = connectionId
+    }
     const readyCoordinator = createReadyCoordinator({
       requestReady: () =>
         request('ready', {}, (id) => {
           latestReadyRequestId = id
+          notificationReadyId = id
+          selectionOperationEpoch++
           attachmentRevision.value += 1
           draftRevision.value += 1
         }),
       async applyReady(result, isCurrent) {
         if (result.available === true) {
+          acceptComposerConnection(result.connectionId)
           activeSelectionReadyId = result.readyId
+          notificationReadyId = result.readyId
           const versioned = selectionVersions.acceptBaseline(activeSelectionReadyId, result.selectionVersion)
           const readyVersion = result.selectionVersion
           await applySelection(result.selection, true, () => isCurrent() && (!versioned || selectionVersions.highest() === readyVersion))
@@ -242,6 +254,9 @@ const App = {
         if (available.value) {
           error.value = ''
         } else {
+          selectionOperationEpoch++
+          activeSelectionReadyId = null
+          notificationReadyId = null
           chat.unbindFromInstance()
           currentSession.value = null
           sessions.value = []
@@ -250,6 +265,9 @@ const App = {
       },
       async applyFailure(cause, isCurrent) {
         if (!isCurrent()) return
+        selectionOperationEpoch++
+        activeSelectionReadyId = null
+        notificationReadyId = null
         available.value = false
         chat.unbindFromInstance()
         currentSession.value = null
@@ -321,16 +339,14 @@ const App = {
       const submittedText = text
       const submitted = [...submittedAttachments]
       const submittedOwner = attachmentBuckets.capture()
+      const submittedDraft = draftBuckets.capture()
       try {
         await conversationOwnership.dispatch(async (assertCurrent) => {
           const content = submitted.length ? await buildMessageParts(submittedText, submitted) : submittedText
           assertCurrent()
           return hostAcceptedChat.send(content)
         })
-        if (draftBuckets.get(submittedOwner) === submittedText) {
-          draftBuckets.clear(submittedOwner)
-          draftRevision.value += 1
-        }
+        if (draftBuckets.clearSubmitted(submittedText, submittedDraft)) draftRevision.value += 1
         attachmentBuckets.removeSubmitted(submitted, submittedOwner)
         attachmentRevision.value += 1
         if (conversationOwnership.isCurrent(submittedOwner)) {
@@ -412,6 +428,7 @@ const App = {
     const receiveHostMessage = ({ data: message }) => {
       BridgeWebSocket.receive(message)
       if (message?.type === 'configuration.changed') {
+        clearComposerBuckets()
         BridgeWebSocket.disposeAll(Error('KohakuTerrarium configuration changed'))
         rejectPending(Error('KohakuTerrarium configuration changed'))
         chat.unbindFromInstance()
@@ -424,13 +441,13 @@ const App = {
       if (message?.type === 'selection.changed') {
         const eventReadyId = message.readyId ?? activeSelectionReadyId
         const pendingRuntime = eventReadyId === latestReadyRequestId
-        if (!pendingRuntime && eventReadyId !== activeSelectionReadyId) return
+        if (notificationReadyId === null || eventReadyId !== notificationReadyId) return
         const notification = selectionVersions.beginNotification(eventReadyId, message.data.selectionVersion, pendingRuntime)
         if (!notification) return
-        const ownedReadyId = message.readyId
+        if (message.connectionId !== undefined) acceptComposerConnection(message.connectionId)
+        const ownedOperation = selectionOperationEpoch
         const isCurrent = () =>
-          notification.isCurrent() &&
-          (ownedReadyId === undefined || ownedReadyId === activeSelectionReadyId || ownedReadyId === latestReadyRequestId)
+          ownedOperation === selectionOperationEpoch && eventReadyId === notificationReadyId && notification.isCurrent()
         reconciliation = reconciliation
           .then(() => applySelection(message.data.selection, message.data.changed, isCurrent))
           .catch((cause) => {
@@ -442,6 +459,9 @@ const App = {
     }
     window.addEventListener('message', receiveHostMessage)
     onBeforeUnmount(() => {
+      conversationOwnership.dispose()
+      draftBuckets.dispose()
+      attachmentBuckets.dispose()
       window.removeEventListener('message', receiveHostMessage)
       readyCoordinator.invalidate()
       BridgeWebSocket.disposeAll(Error('KohakuTerrarium webview disposed'))
@@ -483,7 +503,7 @@ const App = {
                 disabled: busy.value,
                 onClick: () => {
                   error.value = ''
-                  reconciliation = reconciliation.then(reconcileSessions).catch((cause) => (error.value = cause.message))
+                  reconcileSessions().catch((cause) => (error.value = cause.message))
                 },
               }),
             ]),
