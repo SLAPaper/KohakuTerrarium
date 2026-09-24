@@ -5,6 +5,7 @@ Modify past messages, regenerate responses, and replay conversation branches.
 
 import asyncio
 
+from kohakuterrarium.core.agent_lifecycle import wait_for_turn_completion
 from kohakuterrarium.core.agent_message_history import (
     live_user_turns as _live_user_turns,
     max_branch_id_for_turn as _max_branch_id_for_turn,
@@ -22,7 +23,10 @@ from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.llm.message import normalize_content_parts
 from kohakuterrarium.session.history import replay_conversation
-from kohakuterrarium.session.raw_history import UserMessageSelector
+from kohakuterrarium.session.raw_history import (
+    UserMessageSelector,
+    append_user_event_pair,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -106,6 +110,7 @@ class AgentMessagesMixin:
 
     async def _regenerate_tail_response(self, *, request_id: str | None) -> None:
         """Regenerate the current tail while holding the mutation lock."""
+        await self._wait_for_history_finalization()
         self._ensure_history_mutation_idle()
         self._ensure_rerun_available()
         conv = self.controller.conversation
@@ -134,21 +139,14 @@ class AgentMessagesMixin:
             # opening a sibling branch of the SAME turn, so the path
             # of prior turns is unchanged.
             ppath = [tuple(p) for p in getattr(self, "_parent_branch_path", [])]
-            self.session_store.append_event(
+            await self.session_store.run(
+                append_user_event_pair,
+                self.session_store,
                 self.config.name,
-                "user_input",
                 {"content": prev_content},
-                turn_index=self._turn_index,
-                branch_id=self._branch_id,
-                parent_branch_path=ppath,
-            )
-            self.session_store.append_event(
-                self.config.name,
-                "user_message",
-                {"content": prev_content},
-                turn_index=self._turn_index,
-                branch_id=self._branch_id,
-                parent_branch_path=ppath,
+                self._turn_index,
+                self._branch_id,
+                ppath,
             )
         self._branch_request_id = request_id
         try:
@@ -203,6 +201,7 @@ class AgentMessagesMixin:
         truncation target resolves correctly even when the user has
         switched to an older subtree in the UI.
         """
+        await self._wait_for_history_finalization()
         self._ensure_history_mutation_idle()
         self._ensure_rerun_available()
         # Canonical persisted targets reconstruct original context before
@@ -289,21 +288,14 @@ class AgentMessagesMixin:
         self._parent_branch_path = cur_path
         if self.session_store is not None:
             ppath = [tuple(p) for p in cur_path]
-            self.session_store.append_event(
+            await self.session_store.run(
+                append_user_event_pair,
+                self.session_store,
                 self.config.name,
-                "user_input",
                 {"content": new_content},
-                turn_index=self._turn_index,
-                branch_id=self._branch_id,
-                parent_branch_path=ppath,
-            )
-            self.session_store.append_event(
-                self.config.name,
-                "user_message",
-                {"content": new_content},
-                turn_index=self._turn_index,
-                branch_id=self._branch_id,
-                parent_branch_path=ppath,
+                self._turn_index,
+                self._branch_id,
+                ppath,
             )
         self._branch_request_id = request_id
         try:
@@ -315,6 +307,7 @@ class AgentMessagesMixin:
     async def rewind_to(self, message_idx: int) -> None:
         """Drop messages from ``message_idx`` onward without re-running."""
         async with self._get_message_mutation_lock():
+            await self._wait_for_history_finalization()
             self._ensure_history_mutation_idle()
             conv = self.controller.conversation
             removed = conv.truncate_from(message_idx)
@@ -338,6 +331,16 @@ class AgentMessagesMixin:
             lock = asyncio.Lock()
             self._message_mutation_lock = lock
         return lock
+
+    async def _wait_for_history_finalization(self) -> None:
+        """Wait for cancellation or finalization, never for an actively generating turn."""
+        if (
+            getattr(self, "_interrupt_requested", False)
+            or getattr(self, "_processing_task", None) is None
+        ):
+            await wait_for_turn_completion(
+                self, getattr(self, "_turn_completion", None)
+            )
 
     def _ensure_history_mutation_idle(self) -> None:
         """Reject destructive history changes while another turn can observe it."""

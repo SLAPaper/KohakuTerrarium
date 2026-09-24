@@ -153,14 +153,21 @@ The aggregator appends tool-list, framework hints, env info, and `CLAUDE.md` aut
 
 ## Skill mode: dynamic vs static
 
-- `skill_mode: dynamic` (default): tools show up in the prompt as one-line descriptions. The controller loads full docs on demand with the `info` framework command.
-- `skill_mode: static`: all tool docs are inlined upfront (larger system prompt, fewer round-trips).
+- `tool_doc_mode: standard` (default): tools reach the model as a name, a one-line description, and a parameter schema. The controller loads full docs on demand with the `info` tool.
+- `tool_doc_mode: full`: every tool's usage tier is inlined upfront (larger prompt, fewer round-trips). Set `doc_mode: full` on a single `tools:` entry to pay it for one tool only.
 
 Use `dynamic` unless you want a fixed, auditable prompt.
 
 Procedural skills are separate from tool docs. Discovered package skills default
 disabled until the creature opts them in with `skills:`; the prompt only gets a
 byte-budgeted skill index, not every full `SKILL.md` body.
+
+Skills with matching `paths` filters also add a short working-directory hint.
+That hint stays identical through the user's tool calls and background
+completions, preserving the history prefix for incremental Responses requests.
+The next user input refreshes it; changed or disabled matches can then require
+one full-history request. The hint is request context, not a saved conversation
+message.
 
 ## Tool format
 

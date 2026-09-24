@@ -15,6 +15,15 @@ The dashboard uses a configurable binary split tree: every pane is either a leaf
 
 See also: [Serving](serving.md) for how to open the dashboard.
 
+## Dashboard refresh preference
+
+The Dashboard's auto-refresh selector remembers Off, 5s (default), 15s, or
+60s through the shared UI preference storage, across tab switches and app
+restarts. Opening the Dashboard always loads current data once; Off disables
+its subsequent periodic refreshes. Leaving the Dashboard stops its timer.
+The shell's running-instance poll and the statistics card's metrics poll
+remain independent of this selector.
+
 ## Core concepts
 
 - **Panel**: a single-responsibility view (Chat, Files, Activity, State,
@@ -36,16 +45,25 @@ See also: [Serving](serving.md) for how to open the dashboard.
 
 | Shortcut | Preset | Layout |
 |----------|--------|--------|
-| Ctrl+1 | Chat Focus | chat \| status-dashboard (top) + state (bottom) |
+| Ctrl+1 | Chat Focus | chat \| status (top) + creature state (bottom) |
 | Ctrl+2 | Workspace | files \| editor+terminal \| chat+activity |
 | Ctrl+3 | Multi-creature | creatures \| chat \| activity+state |
 | Ctrl+4 | Canvas | chat \| canvas+activity |
 | Ctrl+5 | Debug | chat+state (top) / debug (bottom) |
 | Ctrl+6 | Settings | settings (full screen) |
 
-The instance page auto-selects Chat Focus for creatures and
-Multi-creature for terrariums. The last-used preset per instance is
-remembered in localStorage.
+Every freshly opened instance lands on Chat Focus, whatever its shape:
+the Status rail carries the creature list, so a multi-creature graph is
+operable without switching layouts. The Creatures tab on that rail
+exists only once the graph has more than one creature; it shows the
+member count and glows when the graph grows while you are looking
+elsewhere. A solo session shows no creature chrome at all.
+Multi-creature stays available on Ctrl+3 for the wide layout. The last-used preset per instance is remembered in
+localStorage and always wins over the default.
+
+The panel picker and the palette list each panel with a one-line
+description; the two legacy aliases (`file-tree`, `editor-status`) are
+resolvable by the legacy presets but are never offered.
 
 ## Edit mode
 
@@ -99,15 +117,35 @@ Prefix routing: `>` commands (default), `@` mentions, `#` sessions,
 The main conversation interface. Supports message edit+rerun,
 regenerate, tool call accordion, sub-agent nesting.
 
-### Activity (tabbed)
-Three tabs: Session (id, cwd, creatures/channels), Tokens (in/out/cache
-+ context bar with compact threshold), Jobs (running tool calls with
-stop button).
+### Status (tabbed rail)
+Five tabs: Session (agent, model, provider, session id, status),
+Creatures (only for a graph with more than one creature: every member
+with focus-on-click, start / stop, and a per-creature model switch,
+plus the channels; the rail icon carries the member count), Tokens (in/out/cache + context bar with compact
+threshold), Jobs (running tool calls with stop button), Modules (the
+full modules surface).
 
-### State (tabbed)
-Four tabs: Scratchpad (key-value pairs from the agent's working memory),
-Tool History (all tool calls from the session), Memory (FTS5 search over
-session events), Compaction (history of context compactions).
+### Overview
+The same session identity, token usage, and running jobs as one dense
+scroll with no tabs. Not in any default preset; pick it from the panel
+picker when you prefer everything on screen at once.
+
+### Jobs
+Model, context bar, and running jobs only. Used by the Settings preset.
+
+### Creature State (tabbed)
+Four tabs: Drives (the focused creature's drives with the same
+management as the full Drives panel: pause, resume, wake, cancel,
+complete, progress notes, and a New goal form; a scope toggle shows the
+whole graph, and "Open full panel" opens the Drives panel as a drawer),
+Scratchpad (key-value pairs from the agent's working memory), Memory
+(FTS5 search over session events), Compaction (history of context
+compactions).
+
+### Drives
+Every drive in the session grouped by assignee, with the full record
+detail. Reachable from the panel picker, the header badge, and the
+Creature State panel's "Open full panel".
 
 ### Files
 File tree with refresh + a "Touched" view showing files the agent
@@ -124,6 +162,17 @@ Auto-detects long code blocks (15+ lines) and `##canvas##` markers from
 assistant messages. Shows syntax-highlighted code with line numbers,
 rendered markdown, or sandboxed HTML. Copy and download buttons in the
 tab strip.
+
+Use the `canvas_image` tool to publish a local image file. Completed image
+publications appear even when the tool finishes in the background; older
+results can also be recovered from their image output when preview metadata
+is absent.
+
+Closing a file/tool preview with ×, or clearing the canvas, remembers the
+dismissed publications in this browser for that session across refreshes.
+A new tool publication can show the file again, including when its image
+contents are unchanged. Saved dismissal records contain compact revision
+fingerprints rather than image data or document bodies.
 
 ### Terminal
 xterm.js terminal connected to a PTY shell (bash/PowerShell) in the

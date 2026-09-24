@@ -9,6 +9,7 @@ Resolved absolute paths are the identity boundary, preventing editable package
 links or overlapping local directories from producing duplicate entries.
 """
 
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -101,14 +102,20 @@ def _build_package_root_map() -> dict[str, str]:
 def to_ref(path: Path, package_roots: dict[str, str]) -> str:
     """Render package-contained paths as portable ``@pkg/...`` references.
 
-    Paths outside installed packages remain filesystem paths.
+    Paths outside installed packages remain filesystem paths.  Matching is by
+    path component, and the longest root wins, so a package whose name extends
+    a sibling's (``kt-biome-extended`` under ``kt-biome``) resolves to its own
+    reference rather than the sibling's.
     """
-    resolved = str(path.resolve())
-    for root, name in package_roots.items():
-        if resolved.startswith(root):
-            rel = resolved[len(root) :].lstrip("/").lstrip("\\").replace("\\", "/")
-            return f"@{name}/{rel}"
-    return str(path)
+    resolved = path.resolve()
+    best: str | None = None
+    for root in package_roots:
+        if resolved.is_relative_to(root) and (best is None or len(root) > len(best)):
+            best = root
+    if best is None:
+        return str(path)
+    rel = resolved.relative_to(best).as_posix()
+    return f"@{package_roots[best]}/{rel}" if rel != "." else f"@{package_roots[best]}"
 
 
 def _parse_creature_detail(config_dir: Path) -> CatalogEntry | None:
@@ -279,6 +286,14 @@ def scan_catalog() -> list[CatalogEntry]:
                     _add_terrarium(child, source="local")
 
     return [r for r in results if r.name]
+
+
+def scan_worker_creatures() -> list[dict]:
+    """Discover installed and local creatures on the current worker."""
+    roots = [p for p in os.environ.get("KT_CREATURES_DIRS", "").split(",") if p.strip()]
+    roots.extend(str(Path.cwd() / name) for name in ("creatures", "agents"))
+    roots.extend(str(Path(pkg["path"]) / "creatures") for pkg in list_packages())
+    return scan_creatures_in_dirs(dedupe_dirs(roots))
 
 
 def scan_creatures_in_dirs(base_dirs: list[Path]) -> list[dict]:

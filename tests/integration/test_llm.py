@@ -5,10 +5,9 @@ does NOT need a live network service: the profile / preset / backend
 config system, ``api_keys`` storage, the native tool-schema builder, and
 the multimodal ``Message`` / ``ContentPart`` types.
 
-The live provider clients (``openai.py``, ``anthropic_provider.py``,
-``codex_*.py``, ``litellm_provider.py``) are CARVED OUT — they require
-real endpoints. What is exercised here is the abstraction surface that
-``bootstrap/llm.py`` drives before it ever constructs a provider:
+Live endpoint checks are excluded. The multimodal workflow also exercises
+the real OpenAI SDK with in-memory HTTP and loopback WebSocket transports;
+the remaining workflows exercise the abstraction surface that ``bootstrap/llm.py`` drives:
 
     resolve_controller_llm()  -> LLMProfile
     get_api_key()             -> str
@@ -29,12 +28,32 @@ Why these collaborators are real:
     reset so resolution is deterministic with no installed packages.
 """
 
+import base64
+import io
+import json
+import time
 from typing import Any
 
+import httpx
 import pytest
+from openai import APIStatusError
+from PIL import Image
+from websockets import serve
 
+from kohakuterrarium import Terrarium
+from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.llm import antigravity_auth as agy_auth
+from kohakuterrarium.session.history import (
+    replay_conversation,
+    normalize_resumable_events,
+)
+from kohakuterrarium.bootstrap.llm import _create_from_profile
+from kohakuterrarium.builtins.tools.grok_image_gen import GrokImageGenTool
+from kohakuterrarium.builtins.tools.read import ReadTool
 from kohakuterrarium.core.registry import Registry
+from kohakuterrarium.core.tool_output import normalize_tool_result
 from kohakuterrarium.llm import api_keys as ak
+from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm import backends as backends_mod
 from kohakuterrarium.llm import presets as presets_mod
 from kohakuterrarium.llm.backends import (
@@ -50,6 +69,10 @@ from kohakuterrarium.llm.base import (
     ToolSchema,
 )
 from kohakuterrarium.llm.codex_auth import CodexTokens
+from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
+from kohakuterrarium.llm.grok_auth import GrokToken, GrokTokens
+from kohakuterrarium.llm.grok_image_gen import GrokImageClient
+from kohakuterrarium.llm.grok_media import GrokMediaClient
 from kohakuterrarium.llm.message import (
     AssistantMessage,
     FilePart,
@@ -64,6 +87,7 @@ from kohakuterrarium.llm.message import (
     make_multimodal_content,
     messages_to_dicts,
 )
+from kohakuterrarium.llm.openai import OpenAIProvider
 from kohakuterrarium.llm.presets import iter_all_presets, resolve_alias
 from kohakuterrarium.llm.profile_types import LLMBackend, LLMPreset, LLMProfile
 from kohakuterrarium.llm.profiles import (
@@ -80,6 +104,7 @@ from kohakuterrarium.llm.profiles import (
     save_profile,
     set_default_model,
 )
+from kohakuterrarium.llm.recovery import RetryPolicy
 from kohakuterrarium.llm.tools import build_provider_native_tools, build_tool_schemas
 from kohakuterrarium.llm.variations import (
     apply_patch_map,
@@ -88,7 +113,13 @@ from kohakuterrarium.llm.variations import (
     normalize_variation_selections,
     parse_variation_selector,
 )
-from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
+from kohakuterrarium.modules.tool.base import (
+    BaseTool,
+    ExecutionMode,
+    ToolContext,
+    ToolResult,
+)
+from kohakuterrarium.session.store import SessionStore
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -655,6 +686,21 @@ class TestLlmIntegration:
         assert codex_profile.backend_type == "codex"
         # bootstrap/llm.py branches on backend_type == "codex" -> CodexOAuthProvider.
 
+        daybreak_profile = resolve_controller_llm({}, llm="gpt-daybreak-blue-latest")
+        assert daybreak_profile is not None
+        assert daybreak_profile.name == "gpt-daybreak-blue-latest"
+        assert daybreak_profile.model == "gpt-daybreak-blue-latest"
+        assert daybreak_profile.provider == "codex"
+        assert daybreak_profile.backend_type == "codex"
+        assert daybreak_profile.max_context == 1_000_000
+        assert daybreak_profile.max_output == 128_000
+        assert daybreak_profile.reasoning_effort == "medium"
+        daybreak_provider = _create_from_profile(daybreak_profile)
+        assert isinstance(daybreak_provider, CodexOAuthProvider)
+        assert daybreak_provider.model == "gpt-daybreak-blue-latest"
+        assert daybreak_provider.reasoning_effort == "medium"
+        assert daybreak_provider._websocket_mode is False
+
         # 5. A built-in anthropic preset resolves to the anthropic backend.
         claude_profile = resolve_controller_llm({}, llm="anthropic/claude-opus-4.7")
         assert claude_profile is not None
@@ -848,8 +894,9 @@ class TestLlmIntegration:
         by_name = {s.name: s for s in schemas}
         assert set(by_name) == {"read", "translate", "researcher"}
 
-        # ``read`` uses the builtin schema, with ``run_in_background``
-        # injected by the builder onto every tool.
+        # ``read`` uses the builtin schema verbatim: it returns in
+        # milliseconds, so it declares no background support and the builder
+        # adds no ``run_in_background`` argument.
         read_schema = by_name["read"]
         assert isinstance(read_schema, ToolSchema)
         assert read_schema.parameters == {
@@ -858,14 +905,6 @@ class TestLlmIntegration:
                 "path": {"type": "string", "description": "File path to read"},
                 "offset": {"type": "integer", "description": "Line offset (optional)"},
                 "limit": {"type": "integer", "description": "Max lines (optional)"},
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": (
-                        "If true, run without waiting for it to finish. No result is "
-                        "available immediately, and starting it does not give you "
-                        "another turn to act."
-                    ),
-                },
             },
             "required": ["path"],
         }
@@ -891,14 +930,6 @@ class TestLlmIntegration:
                     "type": "string",
                     "description": "Target language code",
                 },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": (
-                        "If true, run without waiting for it to finish. No result is "
-                        "available immediately, and starting it does not give you "
-                        "another turn to act."
-                    ),
-                },
             },
             "required": ["text", "target_lang"],
         }
@@ -912,22 +943,14 @@ class TestLlmIntegration:
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": (
-                        "Each task-subagent call is a fresh, context-isolated "
-                        "invocation. It cannot resume or inherit conversation history "
-                        "from previous calls. Provide a complete, self-contained task "
-                        "that includes the original goal, current state, work already "
-                        "completed, what remains, and any relevant paths, errors, or "
-                        "findings. Never use shorthand such as 'continue the previous "
-                        "task'."
-                    ),
+                    "description": "Complete, self-contained task description.",
                 },
+                # Sub-agents run in background by default, so the flag stays;
+                # its full semantics live once in the execution-model block.
                 "run_in_background": {
                     "type": "boolean",
                     "description": (
-                        "If true (default), run without waiting for it to finish. No "
-                        "result is available immediately, and starting it does not "
-                        "give you another turn to act. If false, wait for the result "
+                        "Default true. Set false to wait for the result "
                         "before continuing."
                     ),
                 },
@@ -936,8 +959,8 @@ class TestLlmIntegration:
         }
 
         # --- a tool with no schema at all -> the generic single-
-        # ``content`` fallback, with run_in_background injected. And a
-        # provider-native tool -> SKIPPED from the function schema list.
+        # ``content`` fallback. And a provider-native tool -> SKIPPED from
+        # the function schema list.
         registry.register_tool(_NoSchemaTool())
         registry.register_tool(_ProviderNativeTool())
         schemas2 = build_tool_schemas(registry)
@@ -951,14 +974,6 @@ class TestLlmIntegration:
                 "content": {
                     "type": "string",
                     "description": "Input content for the tool",
-                },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": (
-                        "If true, run without waiting for it to finish. No result is "
-                        "available immediately, and starting it does not give you "
-                        "another turn to act."
-                    ),
                 },
             },
         }
@@ -981,14 +996,6 @@ class TestLlmIntegration:
                     "type": "string",
                     "description": "Input content for the tool",
                 },
-                "run_in_background": {
-                    "type": "boolean",
-                    "description": (
-                        "If true, run without waiting for it to finish. No result is "
-                        "available immediately, and starting it does not give you "
-                        "another turn to act."
-                    ),
-                },
             },
         }
         # ...and every other tool's schema is unaffected by its neighbour.
@@ -1002,7 +1009,7 @@ class TestLlmIntegration:
         bad_call = NativeToolCall(id="c2", name="read", arguments="{not json")
         assert bad_call.parsed_arguments() == {"_raw": "{not json"}
 
-    async def test_multimodal_message_round_trip_workflow(self):
+    async def test_multimodal_message_round_trip_workflow(self, tmp_path, monkeypatch):
         """Build a full multimodal conversation and assert exact wire shape.
 
         The controller assembles ``Message`` objects (system + multimodal
@@ -1265,6 +1272,637 @@ class TestLlmIntegration:
         # The provider-native metadata the agent-start validator reads.
         assert provider.provider_name == "minimal"
         assert provider.provider_native_tools == frozenset({"image_gen"})
+
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), "red").save(image_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        source = tmp_path / "image%20name.png"
+        source.write_bytes(image_bytes)
+        (tmp_path / "image name.png").write_bytes(b"wrong file")
+        context = ToolContext(agent_name="vision", session=None, working_dir=tmp_path)
+        read_result = await ReadTool().execute({"path": source.name}, context=context)
+        assert read_result.success
+        file_reference = read_result.output[1].url
+        assert file_reference == source.resolve().as_uri()
+
+        requests = []
+
+        def respond(request):
+            requests.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(
+                200, json={"data": [{"b64_json": encoded, "mime_type": "image/png"}]}
+            )
+
+        async def no_refresh(**kwargs):
+            return None
+
+        monkeypatch.setattr(GrokTokens, "ensure_fresh_cli", no_refresh)
+        monkeypatch.setattr(
+            GrokTokens,
+            "load_candidates",
+            lambda: [GrokToken(access_token="test", source="test")],
+        )
+        monkeypatch.setattr(artifact_resolve, "_session_dir", lambda: tmp_path)
+        media = GrokMediaClient(transport=httpx.MockTransport(respond))
+        tool = GrokImageGenTool(client=GrokImageClient(media=media))
+        generated = await tool.execute({"prompt": "a red square"})
+        assert generated.success
+        store = SessionStore(tmp_path / "media.kohakutr")
+        try:
+            normalized, _ = normalize_tool_result(
+                tool, generated, max_output=0, artifact_store=store
+            )
+            artifact_reference = normalized.output[0].url
+            assert artifact_reference.startswith("/api/sessions/media/artifacts/")
+            for reference in (file_reference, artifact_reference):
+                edited = await tool.execute(
+                    {"prompt": "add a border", "action": "edit", "image_url": reference}
+                )
+                assert edited.success
+                assert edited.output[0].url == f"data:image/png;base64,{encoded}"
+                assert requests[-1][0] == "/v1/images/edits"
+                assert requests[-1][1]["image"] == {
+                    "url": f"data:image/png;base64,{encoded}",
+                    "type": "image_url",
+                }
+
+            missing_reference = (tmp_path / "missing.png").as_uri()
+            chat_messages = [
+                UserMessage(
+                    [
+                        TextPart("Compare these images"),
+                        ImagePart(url=file_reference),
+                        ImagePart(url=artifact_reference),
+                        ImagePart(url=missing_reference),
+                    ]
+                )
+            ]
+            original_wire = messages_to_dicts(chat_messages)
+            chat_requests = []
+
+            def chat_response(request):
+                chat_requests.append(json.loads(request.content))
+                if len(chat_requests) <= 2:
+                    message = (
+                        "Cannot load local files without --allowed-local-media-path"
+                        if len(chat_requests) == 1
+                        else "temporary outage"
+                    )
+                    return httpx.Response(
+                        500 if len(chat_requests) == 1 else 503,
+                        json={"error": {"message": message}},
+                        headers={"retry-after-ms": "1"},
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "comparison",
+                        "model": "test",
+                        "created": 0,
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "same red square",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    },
+                )
+
+            async with OpenAIProvider(
+                api_key="test-key",
+                model="test",
+                retry_policy=RetryPolicy(max_retries=1, base_delay=0, jitter=0),
+            ) as chat_provider:
+                initial_client = chat_provider._client
+                chat_provider._client = initial_client.with_options(
+                    http_client=httpx.AsyncClient(
+                        transport=httpx.MockTransport(chat_response)
+                    )
+                )
+                await initial_client.close()
+                with pytest.raises(APIStatusError, match="allowed-local-media-path"):
+                    await chat_provider.chat_complete(chat_messages)
+                assert len(chat_requests) == 1
+                response = await chat_provider.chat_complete(chat_messages)
+                assert response.content == "same red square"
+                assert len(chat_requests) == 3
+                assert chat_requests[0] == chat_requests[1] == chat_requests[2]
+                sent_parts = chat_requests[0]["messages"][0]["content"]
+                assert len(sent_parts) == 3
+                assert [part["image_url"]["url"] for part in sent_parts[1:]] == [
+                    f"data:image/png;base64,{encoded}",
+                    f"data:image/png;base64,{encoded}",
+                ]
+                assert messages_to_dicts(chat_messages) == original_wire
+        finally:
+            store.close()
+        assert len(requests) == 3
+
+        responses_requests = []
+        reasoning_item = {
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "Inspect the file first."}],
+        }
+        call_item = {
+            "type": "function_call",
+            "call_id": "read1",
+            "name": "read",
+            "arguments": json.dumps({"path": source.name}),
+        }
+        call_items = [call_item, {**call_item, "call_id": "read2"}]
+
+        def responses_response(request):
+            body = json.loads(request.content)
+            assert request.url.path == "/v1/responses"
+            assert body["model"] in {
+                "slurm/ds",
+                "kimi-k2",
+                "glm-5",
+                "deepseek-flash",
+                "gpt-6-astra",
+            }
+            assert "responses_reasoning_replay" not in body
+            assert body["tools"][0]["name"] == "read"
+            responses_requests.append(body)
+            if len(responses_requests) == 1:
+                events = [
+                    {
+                        "type": "response.reasoning_text.delta",
+                        "item_id": "think1",
+                        "delta": "Inspect ",
+                    },
+                    {
+                        "type": "response.reasoning_text.done",
+                        "item_id": "think1",
+                        "text": "Inspect the file first.",
+                    },
+                    {
+                        "type": "response.output_item.done",
+                        "item": {"id": "think1", **reasoning_item},
+                    },
+                    *[
+                        {"type": "response.output_item.done", "item": item}
+                        for item in call_items
+                    ],
+                ]
+            else:
+                expected = (
+                    [reasoning_item, *call_items]
+                    if body["model"] != "gpt-6-astra"
+                    else call_items
+                )
+                output_offset = 1 + len(expected)
+                assert body["input"][1:output_offset] == expected
+                for item, call_id in zip(
+                    body["input"][output_offset : output_offset + 2], ("read1", "read2")
+                ):
+                    assert item["type"] == "function_call_output"
+                    assert item["call_id"] == call_id
+                    assert (
+                        item["output"][1]["image_url"]
+                        == f"data:image/png;base64,{encoded}"
+                    )
+                events = [
+                    {"type": "response.output_text.delta", "delta": "A red square."}
+                ]
+            events.append(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "response1", "output": []},
+                }
+            )
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content="".join(
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                    for event in events
+                ),
+            )
+
+        responses_provider = CodexOAuthProvider(
+            model="slurm/ds",
+            api_key="test-key",
+            base_url="https://responses.test/v1",
+            extra_body={"responses_reasoning_replay": True},
+        )
+        await responses_provider.ensure_authenticated()
+        initial_client = responses_provider._client
+        responses_provider._client = initial_client.with_options(
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(responses_response)
+            )
+        )
+        await initial_client.close()
+        try:
+            read_tool = ReadTool()
+            read_registry = Registry()
+            read_registry.register_tool(read_tool)
+            response_tools = build_tool_schemas(read_registry)
+            conversation = Conversation()
+            conversation.append("user", "Inspect the file")
+            first = await responses_provider.chat_complete(
+                conversation.to_messages(), tools=response_tools
+            )
+            assert first.content == ""
+            calls = responses_provider.last_tool_calls
+            assert [(call.id, call.name) for call in calls] == [
+                ("read1", "read"),
+                ("read2", "read"),
+            ]
+            conversation.append(
+                "assistant",
+                first.content,
+                extra_fields=responses_provider.last_assistant_extra_fields,
+                tool_calls=[
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        },
+                    }
+                    for call in calls
+                ],
+            )
+            for call in calls:
+                result = await read_tool.execute(
+                    call.parsed_arguments(), context=context
+                )
+                assert result.success
+                conversation.append("tool", result.output, tool_call_id=call.id)
+            second = await responses_provider.chat_complete(
+                conversation.to_messages(), tools=response_tools
+            )
+            assert second.content == "A red square."
+            conversation.append("assistant", second.content)
+            session_path = tmp_path / "reasoning.kohakutr"
+            reasoning_store = SessionStore(session_path)
+            try:
+                reasoning_store.save_conversation("reader", conversation.to_messages())
+            finally:
+                reasoning_store.close()
+            reasoning_store = SessionStore(session_path)
+            try:
+                restored = Conversation()
+                for message in dicts_to_messages(
+                    reasoning_store.load_conversation("reader")
+                ):
+                    restored.append_message(message)
+            finally:
+                reasoning_store.close()
+            restored.append("user", "Continue")
+            third = await responses_provider.chat_complete(
+                restored.to_messages(), tools=response_tools
+            )
+            assert third.content == "A red square."
+            assert len(responses_requests) == 3
+            assert responses_requests[2]["input"][-1]["content"] == [
+                {"type": "input_text", "text": "Continue"}
+            ]
+            saved_history = restored.to_messages()
+            codex = responses_provider.with_model("gpt-6-astra")
+            codex.extra_body["responses_reasoning_replay"] = False
+            switched = await codex.chat_complete(
+                restored.to_messages(), tools=response_tools
+            )
+            assert switched.content == "A red square."
+            assert restored.to_messages() == saved_history
+            switched_back = await responses_provider.chat_complete(
+                restored.to_messages(), tools=response_tools
+            )
+            assert switched_back.content == "A red square."
+            assert [request["model"] for request in responses_requests[-2:]] == [
+                "gpt-6-astra",
+                "slurm/ds",
+            ]
+            edited = restored.to_messages()
+            edited[1]["reasoning_content"] = "Recheck the saved image."
+            reasoning_item["content"][0]["text"] = "Recheck the saved image."
+            for target in ("slurm/ds", "kimi-k2", "glm-5", "deepseek-flash"):
+                alias = responses_provider.with_model(target)
+                if target == "deepseek-flash":
+                    alias.extra_body.pop("responses_reasoning_replay")
+                reply = await alias.chat_complete(edited, tools=response_tools)
+                assert reply.content == "A red square."
+                assert responses_requests[-1]["input"][1] == reasoning_item
+            assert restored.to_messages() == saved_history
+        finally:
+            await responses_provider.close()
+
+        large_text = "x" * (1024 * 1024 + 1)
+        ws_submissions = []
+
+        async def ws_response(socket):
+            while len(ws_submissions) < 4:
+                turn = len(ws_submissions)
+                ws_submissions.append(json.loads(await socket.recv()))
+                if turn == 1:
+                    socket.transport.abort()
+                    return
+                text = large_text if turn == 0 else "continued"
+                response_id = f"ws-response-{turn}"
+                for offset in range(0, len(text), 512 * 1024):
+                    await socket.send(
+                        json.dumps(
+                            {
+                                "type": "response.output_text.delta",
+                                "delta": text[offset : offset + 512 * 1024],
+                            }
+                        )
+                    )
+                await socket.send(
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": response_id,
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [
+                                            {"type": "output_text", "text": text}
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+            await socket.wait_closed()
+
+        async with serve(ws_response, "127.0.0.1", 0, max_size=None) as server:
+            port = server.sockets[0].getsockname()[1]
+            for provider_type in (OpenAIProvider, CodexOAuthProvider):
+                ws_submissions.clear()
+                ws_provider = provider_type(
+                    api_key="test",
+                    model="vision",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    extra_body={
+                        "websocket_mode": True,
+                        "websocket_connection_options": {
+                            "max_queue": 1,
+                            "ping_timeout": None,
+                            "compression": None,
+                        },
+                    },
+                )
+                ws_history = messages_to_dicts(
+                    [UserMessage([TextPart("Inspect"), ImagePart(url=file_reference)])]
+                )
+                try:
+                    if isinstance(ws_provider, CodexOAuthProvider):
+                        await ws_provider.ensure_authenticated()
+                    if not hasattr(ws_provider._client.responses, "connect"):
+                        continue
+                    chunks = [
+                        chunk
+                        async for chunk in ws_provider.chat(
+                            ws_history,
+                            extra_body={
+                                "websocket_connection_options": {"max_size": 1}
+                            },
+                        )
+                    ]
+                    assert "".join(chunks) == large_text
+                    assert "websocket_connection_options" not in ws_submissions[0]
+                    assert ws_submissions[0]["input"][0]["content"] == [
+                        {"type": "input_text", "text": "Inspect"},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{encoded}",
+                        },
+                    ]
+                    ws_history.extend(
+                        [
+                            {"role": "assistant", "content": large_text},
+                            {"role": "user", "content": "Continue"},
+                        ]
+                    )
+                    chunks = [chunk async for chunk in ws_provider.chat(ws_history)]
+                    assert chunks == ["continued"]
+                    assert len(ws_submissions) == 3
+                    assert ws_submissions[1]["previous_response_id"] == "ws-response-0"
+                    assert ws_submissions[1]["input"] == [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Continue"}],
+                        }
+                    ]
+                    assert "previous_response_id" not in ws_submissions[2]
+                    assert ws_submissions[2]["input"] == [
+                        *ws_submissions[0]["input"],
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": large_text}],
+                        },
+                        *ws_submissions[1]["input"],
+                    ]
+                    ws_history.extend(
+                        [
+                            {"role": "assistant", "content": "continued"},
+                            {"role": "user", "content": "Continue again"},
+                        ]
+                    )
+                    assert [chunk async for chunk in ws_provider.chat(ws_history)] == [
+                        "continued"
+                    ]
+                    assert len(ws_submissions) == 4
+                    assert ws_submissions[3]["previous_response_id"] == "ws-response-2"
+                    assert ws_submissions[3]["input"] == [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "Continue again"}
+                            ],
+                        }
+                    ]
+                finally:
+                    await ws_provider.close()
+
+        # A real agent executes a signed Google tool round and resumes its history.
+        for is_claude in (False, True):
+            with monkeypatch.context() as agy_patch:
+                agy_patch.setattr(
+                    agy_auth,
+                    "read_sources",
+                    lambda: [
+                        agy_auth.BorrowedCredential(
+                            "offline-agy", time.time() + 3600, "test"
+                        )
+                    ],
+                )
+                submissions = []
+
+                def agy_http(request):
+                    if request.url.path.endswith("loadCodeAssist"):
+                        return httpx.Response(
+                            200, json={"cloudaicompanionProject": "offline-project"}
+                        )
+                    body = json.loads(request.content)
+                    submissions.append(body)
+                    assert body["model"] == (
+                        "claude-sonnet-4-6" if is_claude else "gemini-3.8-flash-tiered"
+                    )
+                    assert body["request"]["generationConfig"] == {
+                        "maxOutputTokens": (
+                            (3906 if is_claude else 4096)
+                            if len(submissions) == 4
+                            else (64000 if is_claude else 65536)
+                        ),
+                        "thinkingConfig": {
+                            "includeThoughts": True,
+                            **(
+                                {"thinkingBudget": 1024}
+                                if is_claude
+                                else {"thinkingLevel": "MEDIUM"}
+                            ),
+                        },
+                    }
+                    if len(submissions) == 1:
+                        parts = [
+                            {
+                                "functionCall": {
+                                    "id": "server-scratchpad-1",
+                                    "name": "scratchpad",
+                                    "args": {
+                                        "action": "set",
+                                        "key": "agy",
+                                        "value": "preserved",
+                                    },
+                                },
+                                "thoughtSignature": "opaque-signature",
+                            }
+                        ]
+                        if is_claude:
+                            parts[0].pop("thoughtSignature")
+                            parts = [
+                                {"text": ""},
+                                {"text": "Use ", "thought": True},
+                                {"text": "scratchpad.", "thought": True},
+                                {
+                                    "text": "",
+                                    "thought": True,
+                                    "thoughtSignature": "opaque-signature",
+                                },
+                                *parts,
+                                {"text": ""},
+                            ]
+                    elif len(submissions) == 4:
+                        parts = [{"text": "AGY_COMPACT_SUMMARY"}]
+                    else:
+                        history_parts = [
+                            part
+                            for message in body["request"]["contents"]
+                            for part in message["parts"]
+                        ]
+                        if len(submissions) <= 3:
+                            assert any(
+                                part.get("thoughtSignature") == "opaque-signature"
+                                for part in history_parts
+                            )
+                            if is_claude:
+                                assert {
+                                    "text": "Use scratchpad.",
+                                    "thought": True,
+                                    "thoughtSignature": "opaque-signature",
+                                } in history_parts
+                                assert not any(
+                                    part.get("text") == "" for part in history_parts
+                                )
+                            responses = [
+                                part["functionResponse"]
+                                for part in history_parts
+                                if "functionResponse" in part
+                            ]
+                            assert [response["id"] for response in responses] == [
+                                "server-scratchpad-1"
+                            ]
+                        else:
+                            assert any(
+                                "AGY_COMPACT_SUMMARY" in part.get("text", "")
+                                for part in history_parts
+                            )
+                        parts = [{"text": "AGY_OK"}]
+                    data = {
+                        "response": {
+                            "candidates": [
+                                {"content": {"parts": parts}, "finishReason": "STOP"}
+                            ]
+                        }
+                    }
+                    return httpx.Response(
+                        200, text="data: " + json.dumps(data) + "\n\n"
+                    )
+
+                agy = _create_from_profile(
+                    get_profile(
+                        "google-antigravity/claude-sonnet-4-6"
+                        if is_claude
+                        else "google-antigravity/gemini-3.8-flash@reasoning=medium"
+                    )
+                )
+                agy._transport = httpx.MockTransport(agy_http)
+                assert agy._profile_max_context == (250000 if is_claude else 1048576)
+                config = tmp_path / "agy.yaml"
+                config.write_text(
+                    "name: agy_probe\nsystem_prompt: offline\ninput: {type: none}\noutput: {type: stdout}\ntools: [{name: scratchpad, type: builtin}]\n"
+                )
+                async with Terrarium(
+                    session_dir=tmp_path / f"agy-sessions-{is_claude}"
+                ) as engine:
+                    creature = await engine.add_creature(
+                        str(config), llm=agy, io="headless", start=True
+                    )
+                    result = await creature.run("remember", timeout=10)
+                    assert result.text == "AGY_OK"
+                    assert creature.agent.scratchpad.get("agy") == "preserved"
+                    events = creature.agent.session_store.get_events("agy_probe")
+                    replay = replay_conversation(normalize_resumable_events(events))
+                    signed = [
+                        message for message in replay if message.get("tool_calls")
+                    ]
+                    assert any(
+                        part.get("thoughtSignature") == "opaque-signature"
+                        for part in signed[0]["_kt_antigravity_content"]["parts"]
+                    )
+                    session_path = creature.agent.session_store.path
+                resumed = await Terrarium.resume(str(session_path), llm=agy)
+                try:
+                    worker = resumed.list_creatures()[0]
+                    assert (await worker.run("continue", timeout=10)).text == "AGY_OK"
+                    compact = worker.agent.compact_manager
+                    compact.config.keep_recent_turns = 1
+                    assert compact.trigger_compact()
+                    await compact.wait_for_current()
+                    assert compact._last_summary_error == ""
+                    assert compact._compact_count == 1
+                    snapshot = worker.agent.session_store.load_conversation("agy_probe")
+                    assert any(
+                        "AGY_COMPACT_SUMMARY" in (message.get("content") or "")
+                        for message in snapshot
+                    )
+                finally:
+                    await resumed.__aexit__(None, None, None)
+                compacted = await Terrarium.resume(str(session_path), llm=agy)
+                try:
+                    worker = compacted.list_creatures()[0]
+                    assert (
+                        await worker.run("after compact", timeout=10)
+                    ).text == "AGY_OK"
+                finally:
+                    await compacted.__aexit__(None, None, None)
+                assert len(submissions) == 5
 
     def test_api_key_storage_and_resolution_workflow(self):
         """Store + retrieve an API key, then assert the resolver override.

@@ -1400,23 +1400,29 @@ class TestTerrariumIntegration:
         root_creature = engine.get_creature("root")
         await engine._runtime_prompt.refresh_creature(root_creature)
         root_prompt = root_creature.agent.get_system_prompt()
-        assert "## Live Group" in root_prompt
+        assert "## Working with the group" in root_prompt
         assert "privileged" in root_prompt
         assert "findings" in root_prompt
         assert "<!-- runtime-graph -->" in root_prompt
         # A second refresh replaces (not stacks) the block.
         await engine._runtime_prompt.refresh_creature(root_creature)
-        assert root_creature.agent.get_system_prompt().count("## Live Group") == 1
+        assert (
+            root_creature.agent.get_system_prompt().count("## Working with the group")
+            == 1
+        )
         # The non-privileged scout's block names its recipe wiring.
         scout_creature = engine.get_creature("scout")
         await engine._runtime_prompt.refresh_creature(scout_creature)
         scout_prompt = scout_creature.agent.get_system_prompt()
-        assert "## Live Group" in scout_prompt
+        assert "## Working with the group" in scout_prompt
         assert "findings" in scout_prompt
         # The writer's block names its single recipe wire too.
         writer_creature = engine.get_creature("writer")
         await engine._runtime_prompt.refresh_creature(writer_creature)
-        assert writer_creature.agent.get_system_prompt().count("## Live Group") == 1
+        assert (
+            writer_creature.agent.get_system_prompt().count("## Working with the group")
+            == 1
+        )
 
         # --- output-wiring resolver: ROOT_TARGET + delivery edge cases ---
         # The resolver's ``root`` magic target resolves to the graph's
@@ -1534,6 +1540,35 @@ class TestTerrariumIntegration:
             wprompt = worker.agent.get_system_prompt()
             assert "send_channel" in wprompt
             assert "group_spawn_child" not in wprompt
+
+            # ── graph prose is gated on graph state, both directions ──
+            # The block is spliced by a debounced, event-driven refresh, so
+            # recompute explicitly rather than racing it.
+            await engine._runtime_prompt.refresh_creature(root)
+            await engine._runtime_prompt.refresh_creature(worker)
+            prompt = root.agent.get_system_prompt()
+            wprompt = worker.agent.get_system_prompt()
+            # The privileged root gets the growth block; a plain member does not.
+            assert "## Growing the group" in prompt
+            assert "## Growing the group" not in wprompt
+
+            # A creature with no channels and no wires costs zero bytes for
+            # either block — a registered send tool is not evidence of a graph.
+            solo = await engine.add_creature(
+                _agent_config("solo", tmp_path), creature_id="solo"
+            )
+            await engine._runtime_prompt.refresh_creature(solo)
+            sprompt = solo.agent.get_system_prompt()
+            assert "## Working with the group" not in sprompt
+            assert "## Growing the group" not in sprompt
+            assert "Internal Channels" not in sprompt
+
+            # Wiring it in makes the block appear, without a rebuild by hand.
+            await engine.connect("solo", "worker", channel="tasks")
+            await engine._runtime_prompt.refresh_creature(solo)
+            wired = solo.agent.get_system_prompt()
+            assert "## Working with the group" in wired
+            assert "`tasks`" in wired
 
     @pytest.mark.timeout(120)
     async def test_drive_runtime_local_mvp(self, patched_llm, tmp_path):
@@ -1803,6 +1838,7 @@ class TestTerrariumIntegration:
 
         engine = Terrarium(
             pwd=str(tmp_path),
+            session_dir=str(tmp_path / "sessions"),
             drive_config=DriveRuntimeConfig(enabled=True),
             drive_registrations=default_registrations(),
         )
@@ -1831,6 +1867,11 @@ class TestTerrariumIntegration:
                 initial_status=DriveStatus.WAITING,
             )
 
+            for creature in (alice, bob):
+                await creature.agent._session_output.write_stream(
+                    f"merge-{creature.name}"
+                )
+
             # MERGE: the real engine drains B's Drive rows into the survivor.
             result = await engine.connect("alice", "bob", channel="ab")
             assert result.delta_kind == "merge"
@@ -1842,6 +1883,19 @@ class TestTerrariumIntegration:
             # The non-survivor source graph's manager was dropped (§6.6).
             other = bob_gid0 if survivor == alice_gid0 else alice_gid0
             assert engine.drives.peek_manager(other) is None
+
+            merged_store = engine._session_stores[survivor]
+            for creature in (alice, bob):
+                events = await merged_store.run(merged_store.get_events, creature.name)
+                assert [
+                    e["content"]
+                    for e in events
+                    if e["type"] == "text_chunk"
+                    and e["content"].startswith(("merge-", "split-"))
+                ] == [f"merge-{creature.name}"]
+                await creature.agent._session_output.write_stream(
+                    f"split-{creature.name}"
+                )
 
             # SPLIT: each assigned Drive follows its assignee's child graph.
             disc = await engine.disconnect("alice", "bob", channel="ab")
@@ -1855,6 +1909,16 @@ class TestTerrariumIntegration:
             assert await amgr.get_drive(db.drive_id) is None
             assert await bmgr.get_drive(db.drive_id) is not None
             assert await bmgr.get_drive(da.drive_id) is None
+
+            for store in set(engine._session_stores.values()):
+                for creature in (alice, bob):
+                    events = await store.run(store.get_events, creature.name)
+                    assert [
+                        e["content"]
+                        for e in events
+                        if e["type"] == "text_chunk"
+                        and e["content"].startswith(("merge-", "split-"))
+                    ] == [f"merge-{creature.name}", f"split-{creature.name}"]
 
     @pytest.mark.timeout(120)
     async def test_drive_delivery_waits_for_startup_trigger(

@@ -91,14 +91,17 @@ tools:
 tools:
   - name: web_search
     backend: duckduckgo
+    codex_model: gpt-5.6-luna
     deepseek_model: deepseek-v4-flash
     fallback: none
 ```
 
-`web_search` 默认使用无需 Key 的 DuckDuckGo。若要启用 DeepSeek，先执行
-`kt config key set deepseek`，再在 Creature 配置中设置
-`backend: deepseek`，或通过 `/module set web_search backend deepseek`
-切换当前 Creature。
+`web_search` 默认仍使用无需 Key 的 DuckDuckGo。若要明确使用 Codex
+订阅托管搜索，先执行 `kt login codex`，再设置 `backend: codex`，或通过
+`/module set web_search backend codex` 切换；此后端独立于当前 Creature
+的主模型。若要使用 DeepSeek，先执行 `kt config key set deepseek`，再选择
+`backend: deepseek`。为明确选择的 Codex 或 DeepSeek 后端设置
+`fallback: duckduckgo`，可在临时故障时回退。
 
 本地 custom 模块：
 
@@ -284,9 +287,9 @@ tool_format: native         # provider 原生的 function calling
 ## 怎么选 dynamic 或 static skill mode？
 
 ```yaml
-skill_mode: dynamic   # 默认：`info` 框架指令会在需要时才载完整文件
+tool_doc_mode: standard   # 默认：`info` 框架指令会在需要时才载完整文件
 # 或
-skill_mode: static    # 完整工具文件直接塞进 system prompt
+tool_doc_mode: full    # 完整工具文件直接塞进 system prompt
 ```
 
 ## 怎么让Creature 没有用户输入也能持续工作？

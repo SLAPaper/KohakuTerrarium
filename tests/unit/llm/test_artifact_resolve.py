@@ -9,8 +9,11 @@ identity no-op when nothing needs resolving (the common hot path).
 
 import base64
 
+import pytest
+
 from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm.artifact_resolve import (
+    file_reference_path,
     resolve_artifact_url,
     resolve_message_image_urls,
 )
@@ -50,6 +53,58 @@ class TestResolveArtifactUrl:
         monkeypatch.setattr(artifact_resolve, "_session_dir", lambda: tmp_path)
         url = "/api/sessions/sid/artifacts/nope.png"
         assert resolve_artifact_url(url) == url
+
+
+class TestFileReferences:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "image%20name.png",
+            "image%25name.png",
+            "image%2Fname.png",
+            "a b.png",
+            "图片.png",
+        ],
+    )
+    def test_file_reference_preserves_exact_filename(self, tmp_path, name):
+        pic = tmp_path / name
+        pic.write_bytes(b"expected image")
+        url = pic.resolve().as_uri()
+
+        assert file_reference_path(url) == pic.resolve()
+        assert resolve_artifact_url(url) == (
+            "data:image/png;base64," + base64.b64encode(b"expected image").decode()
+        )
+
+    def test_file_reference_does_not_read_decoded_neighbor(self, tmp_path):
+        pic = tmp_path / "image%20name.png"
+        pic.write_bytes(b"expected image")
+        (tmp_path / "image name.png").write_bytes(b"wrong image")
+
+        assert resolve_artifact_url(pic.resolve().as_uri()) == (
+            "data:image/png;base64," + base64.b64encode(b"expected image").decode()
+        )
+
+    def test_file_reference_inlined_from_disk(self, tmp_path):
+        pic = tmp_path / "a b.png"
+        pic.write_bytes(b"PNGDATA")
+        out = resolve_artifact_url(pic.resolve().as_uri())
+        assert out == "data:image/png;base64," + base64.b64encode(b"PNGDATA").decode()
+
+    def test_missing_file_reference_falls_back_to_original(self, tmp_path):
+        url = (tmp_path / "gone.png").resolve().as_uri()
+        assert resolve_artifact_url(url) == url
+
+    def test_file_reference_path_parsing(self, tmp_path):
+        pic = tmp_path / "a b.png"
+        assert file_reference_path(pic.resolve().as_uri()) == pic.resolve()
+        assert file_reference_path("file://host/share/x.png") is None
+        assert file_reference_path("https://example.com/x.png") is None
+        assert file_reference_path(None) is None
+
+    @pytest.mark.parametrize("authority", ["host", "127.0.0.1", "user@localhost"])
+    def test_remote_authority_is_not_a_local_media_reference(self, authority):
+        assert file_reference_path(f"file://{authority}/share/x.png") is None
 
 
 class TestResolveMessageImageUrls:
@@ -108,3 +163,49 @@ class TestResolveMessageImageUrls:
         ]
         # A text part that merely *contains* the path is not rewritten.
         assert resolve_message_image_urls(msgs) is msgs
+
+    def test_missing_file_reference_is_not_sent(self, tmp_path):
+        url = (tmp_path / "gone.png").resolve().as_uri()
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ],
+            }
+        ]
+        out = resolve_message_image_urls(msgs)
+        assert out is not msgs
+        assert [p.get("type") for p in out[0]["content"]] == ["text"]
+        assert url not in str(out)
+        assert msgs[0]["content"][1]["image_url"]["url"] == url
+
+    def test_missing_artifact_url_is_not_sent(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(artifact_resolve, "_session_dir", lambda: tmp_path)
+        url = "/api/sessions/sid/artifacts/nope.png"
+        msgs = [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": url}}],
+            }
+        ]
+        out = resolve_message_image_urls(msgs)
+        assert out[0]["content"] == []
+        assert url not in str(out)
+
+    def test_existing_file_reference_still_inlined(self, tmp_path):
+        pic = tmp_path / "kept.png"
+        pic.write_bytes(b"PNGDATA")
+        url = pic.resolve().as_uri()
+        msgs = [
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": url}}],
+            }
+        ]
+        out = resolve_message_image_urls(msgs)
+        assert out[0]["content"][0]["image_url"]["url"].startswith(
+            "data:image/png;base64,"
+        )
+        assert msgs[0]["content"][0]["image_url"]["url"] == url

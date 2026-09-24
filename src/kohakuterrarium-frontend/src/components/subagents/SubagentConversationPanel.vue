@@ -37,27 +37,12 @@
 
           <div v-else-if="item.kind === 'user'" class="ml-auto max-w-[85%] rounded-lg bg-warm-100 dark:bg-warm-800/80 border border-warm-200/60 dark:border-warm-700/60 px-2.5 py-1.5 min-w-0">
             <div class="text-[9px] uppercase tracking-wide text-warm-400 mb-0.5">user</div>
-            <div v-if="item.parts" class="flex flex-col gap-1 text-body">
-              <template v-for="(part, pi) in item.parts" :key="pi">
-                <MarkdownRenderer v-if="part.type === 'text' && part.text" :content="part.text" />
-                <img v-else-if="part.type === 'image_url'" :src="part.image_url?.url" class="tool-inline-image" />
-              </template>
-            </div>
-            <div v-else class="text-body"><MarkdownRenderer :content="item.content" /></div>
+            <ConversationMessage :message="item.message" :render-text="renderText" bare />
           </div>
 
           <div v-else class="max-w-[92%] min-w-0">
             <div class="text-[9px] uppercase tracking-wide text-warm-400 mb-0.5">assistant</div>
-            <div v-if="item.parts" class="flex flex-col gap-1 text-body">
-              <template v-for="(part, pi) in item.parts" :key="pi">
-                <MarkdownRenderer v-if="part.type === 'text' && part.text" :content="part.text" />
-                <img v-else-if="part.type === 'image_url'" :src="part.image_url?.url" class="tool-inline-image" />
-              </template>
-            </div>
-            <div v-else-if="item.content" class="text-body"><MarkdownRenderer :content="item.content" /></div>
-            <div v-if="item.toolCalls.length" class="flex flex-col gap-1.5 mt-1.5 min-w-0">
-              <ToolCallBlock v-for="call in item.toolCalls" :key="call.id" :tc="call" :depth="depth + 1" :expanded="expandedTools.has(call.id)" @toggle="toggleTool(call.id)" />
-            </div>
+            <ConversationMessage :message="item.message" :render-text="renderText" bare />
           </div>
         </div>
         <div v-if="!blocks.length" class="text-[11px] text-warm-400 italic">{{ t("chat.subagent.empty") }}</div>
@@ -72,13 +57,16 @@
 </template>
 
 <script setup>
-import { computed, defineAsyncComponent, onMounted, onUnmounted, ref, watch } from "vue"
+import { computed, h, onMounted, onUnmounted, ref, watch } from "vue"
 
-import MarkdownRenderer from "@/components/common/MarkdownRenderer.vue"
+import { createVisibilityInterval } from "@/composables/useVisibilityInterval"
 import { sessionAPI, terrariumAPI } from "@/utils/api"
+import { extractReasoning } from "@/utils/chatReasoning"
 import { useI18n } from "@/utils/i18n"
 
-const ToolCallBlock = defineAsyncComponent(() => import("@/components/chat/ToolCallBlock.vue"))
+import MarkdownRenderer from "../../public/chat/MarkdownRenderer.vue"
+import { usePlatformOrigin } from "../../public/chat/platformOrigin.js"
+import ConversationMessage from "../chat/shared/ConversationMessage.js"
 
 const props = defineProps({
   sessionId: { type: String, required: true },
@@ -96,6 +84,16 @@ const props = defineProps({
 defineEmits(["back"])
 
 const { t } = useI18n()
+// The shared platform-origin seam (installed by the host) owns the origin the
+// panel's Markdown links resolve against; the Dashboard keeps the browser
+// origin, the VS Code webview installs an explicit value.
+const platformOrigin = usePlatformOrigin()
+const markdownOrigin = computed(() => (platformOrigin !== undefined ? platformOrigin : typeof window !== "undefined" ? window.location.origin : null))
+
+function renderText(content, breaks = false) {
+  return h(MarkdownRenderer, { content, breaks, origin: markdownOrigin.value })
+}
+
 const loading = ref(false)
 const error = ref("")
 const messages = ref([])
@@ -104,7 +102,6 @@ const canReceive = ref(false)
 const sendText = ref("")
 const sending = ref(false)
 const expandedSystem = ref(new Set())
-const expandedTools = ref(new Set())
 const stage = ref("conversation")
 const selectorAvailable = ref(false)
 let timer = null
@@ -134,8 +131,8 @@ function messageText(message) {
     .join("\n")
 }
 
-function messageParts(message) {
-  return Array.isArray(message?.content) ? message.content : null
+function contentParts(message) {
+  return Array.isArray(message?.content) ? message.content : []
 }
 
 function parseArgs(raw) {
@@ -146,6 +143,79 @@ function parseArgs(raw) {
   } catch {
     return { raw }
   }
+}
+
+// Turn one raw conversation message into the render-message shape the shared
+// ConversationMessage consumes, so sub-agent transcripts render through the
+// same leaf as the main chat instead of a reduced native fallback.
+function assistantRenderMessage(message, resultById, index) {
+  const callById = new Map()
+  const tools = (message?.tool_calls || []).map((call, callIndex) => {
+    const tool = {
+      type: "tool",
+      id: call.id || `sa_${index}_${callIndex}`,
+      name: call.function?.name || "tool",
+      kind: "tool",
+      args: parseArgs(call.function?.arguments),
+      status: "done",
+      result: call.id != null ? resultById[call.id] || "" : "",
+      children: [],
+    }
+    if (call.id != null) callById.set(call.id, tool)
+    return tool
+  })
+
+  const segments = Array.isArray(message?._kt_assistant_segments) ? message._kt_assistant_segments : []
+  const content = messageText(message)
+  const parts = []
+  const placed = new Set()
+  for (const segment of segments) {
+    if (!segment || typeof segment !== "object") continue
+    if (segment.type === "reasoning") {
+      const part = {
+        type: "reasoning",
+        id: `sa_${index}_r${parts.length}`,
+        source: segment.source || "reasoning",
+        text: segment.text || "",
+      }
+      if (segment.signature) part.signature = segment.signature
+      parts.push(part)
+    } else if (segment.type === "text" && segment.text) {
+      parts.push({ type: "text", id: `sa_${index}_c${parts.length}`, content: segment.text })
+    } else if (segment.type === "tool_call_ref" && callById.has(segment.call_id)) {
+      const tool = callById.get(segment.call_id)
+      placed.add(tool.id)
+      parts.push(tool)
+    }
+  }
+  if (!segments.length) {
+    // Pre-segment transcripts keep provider reasoning in extra fields only.
+    for (const entry of extractReasoning(message)) {
+      parts.push({
+        type: "reasoning",
+        id: `sa_${index}_r${parts.length}`,
+        source: entry.label,
+        text: entry.text,
+      })
+    }
+    if (content) parts.push({ type: "text", id: `sa_${index}_c${parts.length}`, content })
+  }
+  // Segments can under-report calls: ``as_list`` drops a ref whose ``call_id``
+  // never resolved, while the call itself still lands in ``tool_calls``.
+  for (const tool of tools) {
+    if (!placed.has(tool.id)) parts.push(tool)
+  }
+  for (const part of contentParts(message)) {
+    if (part.type === "image_url") {
+      parts.push({
+        type: "image_url",
+        id: `sa_${index}_img${parts.length}`,
+        image_url: part.image_url,
+        meta: part.meta,
+      })
+    }
+  }
+  return { role: "assistant", content, parts }
 }
 
 const blocks = computed(() => {
@@ -163,24 +233,20 @@ const blocks = computed(() => {
       return
     }
     if (message?.role === "user") {
-      items.push({ kind: "user", content: messageText(message), parts: messageParts(message) })
+      const parts = contentParts(message)
+      items.push({
+        kind: "user",
+        message: {
+          role: "user",
+          content: messageText(message),
+          contentParts: parts.length ? parts : undefined,
+        },
+      })
       return
     }
-    const toolCalls = (message?.tool_calls || []).map((call, callIndex) => ({
-      type: "tool",
-      id: call.id || `sa_${messageIndex}_${callIndex}`,
-      name: call.function?.name || "tool",
-      kind: "tool",
-      args: parseArgs(call.function?.arguments),
-      status: "done",
-      result: call.id != null ? resultById[call.id] || "" : "",
-      children: [],
-    }))
     items.push({
       kind: "assistant",
-      content: messageText(message),
-      parts: messageParts(message),
-      toolCalls,
+      message: assistantRenderMessage(message, resultById, messageIndex),
     })
   })
   return items
@@ -191,13 +257,6 @@ function toggleSystem(index) {
   if (next.has(index)) next.delete(index)
   else next.add(index)
   expandedSystem.value = next
-}
-
-function toggleTool(id) {
-  const next = new Set(expandedTools.value)
-  if (next.has(id)) next.delete(id)
-  else next.add(id)
-  expandedTools.value = next
 }
 
 function identifier() {
@@ -235,7 +294,6 @@ async function selectCandidate(candidate) {
   loading.value = true
   error.value = ""
   expandedSystem.value = new Set()
-  expandedTools.value = new Set()
   try {
     const data = await sessionAPI.getSubagentConversation(props.sessionId, {
       parent: candidate.parent,
@@ -254,7 +312,83 @@ async function selectCandidate(candidate) {
   }
 }
 
-async function loadConversation({ silent = false } = {}) {
+// Single-flight conversation reads, keyed to the panel's request generation.
+//
+// Why generation-aware rather than one global promise chain: when the target
+// changes (the props watcher) or the panel unmounts, the previous
+// generation's read may still be in flight. A single chain would make the new
+// target's read wait behind that abandoned read, so the panel would sit on its
+// spinner until the old request settles — or forever, if it never does. A read
+// is therefore only ever serialized behind another read of the SAME generation.
+//
+// Within one generation at most one read is outstanding. A silent poll tick
+// that overlaps an in-flight read is coalesced into it (the visibility poller
+// also skips its own pending tick). A NON-silent refresh — the mount/target
+// load, or the post-send refresh — is never dropped: it is held in a single
+// pending slot and issued as a fresh read once the in-flight read settles, so
+// it observes the state produced by the change that requested it. At most one
+// pending refresh is retained (a bounded slot, not an unbounded queue).
+let inflight = null // { generation, promise }
+let pendingRefresh = null // { generation, opts, promise, resolve, reject }
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+function startRead(generation, opts) {
+  // Issue synchronously so an idle panel's first read (including the poller's
+  // visibility catch-up tick) is not pushed a microtask later.
+  const promise = Promise.resolve(doLoadConversation(opts))
+  const entry = { generation, promise }
+  inflight = entry
+  const clear = () => {
+    if (inflight === entry) inflight = null
+  }
+  promise.then(clear, clear)
+  return promise
+}
+
+function flushPendingRefresh() {
+  const pending = pendingRefresh
+  pendingRefresh = null
+  if (!pending) return
+  if (disposed || pending.generation !== requestGeneration) {
+    // Superseded by a newer target or a dispose: the newer load (or nothing)
+    // owns the next read, so this refresh must not fire late.
+    pending.resolve()
+    return
+  }
+  // Re-enter the single-flight entry point so the same-generation rules still
+  // apply (a poll tick may have started the next read meanwhile).
+  loadConversation(pending.opts).then(pending.resolve, pending.reject)
+}
+
+function loadConversation(opts = {}) {
+  if (disposed) return Promise.resolve()
+  const generation = requestGeneration
+  if (inflight && inflight.generation === generation) {
+    // A poll tick overlapping an in-flight read is skipped, matching the
+    // poller's own back-pressure — it must not fork a second request.
+    if (opts.silent) return inflight.promise
+    // A user-initiated refresh cannot be served by a read that began before
+    // the change it is refreshing for; hold one pending read that starts once
+    // the in-flight read settles. Repeated refreshes collapse into it.
+    if (!pendingRefresh) {
+      pendingRefresh = { generation, opts, ...deferred() }
+      inflight.promise.then(flushPendingRefresh, flushPendingRefresh)
+    }
+    return pendingRefresh.promise
+  }
+  return startRead(generation, opts)
+}
+
+async function doLoadConversation({ silent = false } = {}) {
   if (!props.sessionId || !props.parent) {
     if (!silent) error.value = t("chat.subagent.unavailable")
     return
@@ -316,16 +450,23 @@ function isLive() {
 }
 
 function stopPolling() {
-  if (timer) clearInterval(timer)
+  if (timer) timer.stop()
   timer = null
 }
 
 function startPolling() {
   if (timer || !props.live || !isLive()) return
-  timer = setInterval(() => {
-    if (isLive()) loadConversation({ silent: true })
-    else stopPolling()
+  timer = createVisibilityInterval(() => {
+    if (!isLive()) {
+      stopPolling()
+      return
+    }
+    // Returning the promise lets the interval skip ticks while a slow
+    // conversation read is in flight: this is the hottest poll in the
+    // app (1.5 s) and every request reopens the session store.
+    return loadConversation({ silent: true })
   }, 1500)
+  timer.start()
 }
 
 watch(
@@ -346,7 +487,6 @@ watch([() => props.sessionId, () => props.parent, () => props.jobId, () => props
   selectorAvailable.value = false
   stage.value = "conversation"
   expandedSystem.value = new Set()
-  expandedTools.value = new Set()
   loadConversation().then(() => {
     if (!disposed) startPolling()
   })
@@ -359,5 +499,11 @@ onMounted(async () => {
 onUnmounted(() => {
   disposed = true
   stopPolling()
+  // Release anyone awaiting a queued refresh: it must never run after dispose.
+  if (pendingRefresh) {
+    const pending = pendingRefresh
+    pendingRefresh = null
+    pending.resolve()
+  }
 })
 </script>

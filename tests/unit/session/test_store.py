@@ -1,11 +1,20 @@
 """Unit tests for :mod:`kohakuterrarium.session.store`."""
 
+import gc
+import os
+import threading
 from pathlib import Path
 
 import pytest
 
+import kohakuterrarium.session.store as store_mod
 from kohakuterrarium.errors import SessionLockedError
 from kohakuterrarium.session.store import SessionStore, iter_kv_keys
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 # ── helpers ───────────────────────────────────────────────────────
 
@@ -59,6 +68,32 @@ def test_max_event_id_matches_full_scan(tmp_path):
         assert store.max_event_id("b") > expected
     finally:
         store.close()
+
+
+def test_max_event_id_survives_legacy_missing_counter_slot(tmp_path):
+    # Old session files carry no counters:max_event_id. The reopen
+    # fallback must full-scan event VALUES and report the true max — a
+    # silent 0 would let the resume fast path skip a stale tail.
+    from kohakuvault import KVault
+
+    path = tmp_path / "legacy.kohakutr"
+    store = SessionStore(str(path))
+    store.append_event("a", "text", {"content": "one"})
+    store.append_event("a", "text", {"content": "two"})
+    store.close()
+    state = KVault(str(path), table="state")
+    try:
+        state.delete("counters:max_event_id")
+    finally:
+        state.close()
+
+    reopened = SessionStore(str(path))
+    try:
+        expected = max(e["event_id"] for e in reopened.get_events("a"))
+        assert expected == 2
+        assert reopened.max_event_id("a") == 2
+    finally:
+        reopened.close()
 
 
 def test_append_persists_event_counter_for_reopen(tmp_path):
@@ -138,6 +173,19 @@ class TestSessionStoreConstruction:
         try:
             assert s._flush_every_n_events == 10
             assert s._flush_every_n_seconds == 5.0
+        finally:
+            s.close()
+
+    def test_file_uri_opens_the_named_store(self, tmp_path, monkeypatch):
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        monkeypatch.chdir(cwd)
+        real = (tmp_path / "real" / "s.kohakutr").resolve()
+        s = SessionStore(real.as_uri())
+        try:
+            assert Path(s.path).resolve() == real
+            assert real.is_file()
+            assert not (cwd / "file:").exists()
         finally:
             s.close()
 
@@ -985,7 +1033,7 @@ class TestInitMetaTerrariumFields:
 # -- discover_attached_agents key filtering -----------------------
 
 
-class TestDiscoverAttachedAgents:
+class TestDiscoverAttachedAgentsNamespaceShapes:
     def test_well_formed_attached_namespace_discovered(self, tmp_path):
         s = _store(tmp_path)
         try:
@@ -1252,6 +1300,84 @@ class TestWriterLock:
         # Lock is free -> a fresh writer-locked open succeeds (no leak).
         w = SessionStore(p, writer_lock=True)
         w.close()
+
+
+# ── Partial-open cleanup ─────────────────────────────────────────
+
+
+class TestPartialOpenCleanup:
+    """A construction failure releases every table opened before it."""
+
+    def test_tables_opened_before_failure_are_closed(self, tmp_path, monkeypatch):
+        opened: list = []
+        real_kvault = store_mod.KVault
+
+        class RecordingKVault(real_kvault):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                opened.append(self)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("fts open failed")
+
+        monkeypatch.setattr(store_mod, "KVault", RecordingKVault)
+        monkeypatch.setattr(store_mod, "TextVault", _boom)
+        threads_before = threading.active_count()
+        with pytest.raises(RuntimeError):
+            SessionStore(tmp_path / "s.kohakutr")
+        assert len(opened) == 8
+        assert all(table._closed for table in opened)
+        assert not any(hasattr(table, "_inner") for table in opened)
+        assert threading.active_count() == threads_before
+
+    def test_counter_restore_failure_closes_every_table(self, tmp_path, monkeypatch):
+        opened: list = []
+        real_kvault = store_mod.KVault
+
+        class RecordingKVault(real_kvault):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                opened.append(self)
+
+        def _boom(self):
+            raise RuntimeError("counter restore failed")
+
+        monkeypatch.setattr(store_mod, "KVault", RecordingKVault)
+        monkeypatch.setattr(SessionStore, "_restore_counters", _boom)
+        threads_before = threading.active_count()
+        with pytest.raises(RuntimeError):
+            SessionStore(tmp_path / "s.kohakutr")
+        assert len(opened) == 8
+        assert all(table._closed for table in opened)
+        assert threading.active_count() == threads_before
+
+    @pytest.mark.skipif(resource is None, reason="RLIMIT_NOFILE is POSIX-only")
+    def test_failed_open_leaves_no_descriptors_behind(self, tmp_path):
+        path = tmp_path / "s.kohakutr"
+        SessionStore(path).close()
+
+        def open_fds() -> int:
+            return len(os.listdir("/dev/fd"))
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        burned: list[int] = []
+        limit = open_fds() + 40
+        resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+        try:
+            gc.collect()
+            while open_fds() < limit - 12:
+                burned.append(os.open(os.devnull, os.O_RDONLY))
+            fds_before = open_fds()
+            threads_before = threading.active_count()
+            with pytest.raises(Exception):
+                SessionStore(path)
+            gc.collect()
+            assert open_fds() == fds_before
+            assert threading.active_count() == threads_before
+        finally:
+            for fd in burned:
+                os.close(fd)
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 # ── Companion closers (generic sidecar hook; no Drive knowledge) ───

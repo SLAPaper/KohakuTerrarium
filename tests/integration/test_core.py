@@ -24,12 +24,15 @@ side effect (conversation contents, tool output text, engine state).
 """
 
 import asyncio
+import re
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
+from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
 from kohakuterrarium.builtins.tools.stop_task import StopTaskTool
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.core.config_types import (
@@ -44,7 +47,18 @@ from kohakuterrarium.core.events import (
     create_tool_complete_event,
     create_user_input_event,
 )
+from kohakuterrarium.core.turn import TurnCapture
 from kohakuterrarium.llm.message import FilePart, ImagePart, TextPart
+from kohakuterrarium.llm.artifact_resolve import (
+    file_reference_path,
+    resolve_artifact_url,
+)
+from kohakuterrarium.llm.base import NativeToolCall
+from kohakuterrarium.llm.codex_format import to_responses_input
+from kohakuterrarium.session.raw_history import UserMessageSelector
+from kohakuterrarium.session.reader import SessionReader
+from kohakuterrarium.skills.registry import Skill
+from kohakuterrarium.terrarium.service import LocalTerrariumService
 from kohakuterrarium.modules.plugin.base import BasePlugin, PluginBlockError
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.tool.base import (
@@ -63,6 +77,42 @@ from kohakuterrarium.testing.output import OutputRecorder
 # ---------------------------------------------------------------------------
 # Deterministic tool stubs — real BaseTool subclasses, no faked methods.
 # ---------------------------------------------------------------------------
+
+
+class _HistoryReplayLLM(ScriptedLLM):
+    """Supply native/text tool calls and a cancellable response for history workflows."""
+
+    def __init__(self, native):
+        super().__init__(["OK"])
+        self.native = native
+        self.started = asyncio.Event()
+        self.last_tool_calls = []
+
+    async def chat(self, messages, **kwargs):
+        normalized = self._normalize_messages(messages)
+        self.call_log.append(normalized)
+        self.call_count += 1
+        for item in to_responses_input(normalized):
+            if item.get("type") == "function_call":
+                assert re.fullmatch(r"[a-zA-Z0-9_-]+", item["name"])
+        self.last_tool_calls = []
+        if self.call_count == 1:
+            if self.native:
+                self.last_tool_calls = [
+                    NativeToolCall(
+                        "call_history_1",
+                        "scratchpad",
+                        '{"action":"set","key":"history","value":"preserved"}',
+                    )
+                ]
+                yield ""
+            else:
+                yield "[/scratchpad]@@action=set\n@@key=history\n@@value=preserved\n[scratchpad/]"
+        elif self.call_count == 3:
+            self.started.set()
+            await asyncio.Event().wait()
+        else:
+            yield "OK"
 
 
 class _EchoTool(BaseTool):
@@ -467,7 +517,7 @@ class TestCoreIntegration:
     """Each method runs one complete ``core/`` feature workflow."""
 
     async def test_full_turn_cycle_with_direct_and_background_tools(
-        self, make_creature
+        self, make_creature, tmp_path
     ):
         """Engine-hosted creature: input -> controller loop -> DIRECT tool
         dispatch + result feedback -> a second turn dispatches a
@@ -494,6 +544,11 @@ class TestCoreIntegration:
             ]
         )
         agent = creature.agent
+        (tmp_path / "example.py").write_text("pass\n")
+        agent.executor._working_dir = tmp_path
+        agent.skills.add(
+            Skill("inspect", "Inspect Python", "Instructions", paths=["*.py"])
+        )
         echo, slowbg = _EchoTool(), _SlowBackgroundTool()
         fail_tool, boom_tool = _FailingTool(), _RaisingTool()
         snap_tool = _MultimodalTool()
@@ -529,6 +584,11 @@ class TestCoreIntegration:
             assert "echoed:ping-rewritten" in convo_text
             # The controller looped exactly twice for turn 1 (call, wrap-up).
             assert agent.llm.call_count == 2
+            hint = agent.skill_path_scanner.format_hint([agent.skills.get("inspect")])
+            assert [
+                [m["content"] for m in call if m.get("content") == hint]
+                for call in agent.llm.call_log
+            ] == [[hint], [hint]]
 
             # --- Turn 2 + 3: background tool promote + completion -------
             # A BACKGROUND tool is promoted immediately, so turn 2 is a
@@ -546,6 +606,11 @@ class TestCoreIntegration:
                     break
                 await asyncio.sleep(0.02)
             assert "background acknowledged" in _assistant_text(agent)
+            assert all(
+                sum(m.get("content") == hint for m in call) == 1
+                for call in agent.llm.call_log[:4]
+            )
+            agent.skills.disable("inspect")
             bg_convo = " ".join(
                 m.get_text_content()
                 for m in agent.controller.conversation.get_messages()
@@ -807,8 +872,80 @@ class TestCoreIntegration:
             assert "ephemeral reply" in out_cb
             assert "ephemeral reply" in "".join(captured)
 
+            # Canvas previews must survive direct-to-background promotion,
+            # reach live output, and remain available after a session reload.
+            session_path = tmp_path / "canvas.kohakutr"
+            await engine.attach_session(creature.graph_id, session_path)
+            agent.workspace.set(tmp_path)
+            canvas_tool = CanvasImageTool()
+            agent.add_tool(canvas_tool)
+            canvas_events = TurnCapture()
+            agent.output_router.add_secondary(canvas_events)
+            expected_previews = []
+            for mode in ("direct", "background"):
+                image_path = tmp_path / f"{mode}.png"
+                Image.new("RGB", (2, 2), color="blue").save(image_path)
+                bg_arg = "@@run_in_background=true\n" if mode == "background" else ""
+                canvas_llm = ScriptedLLM(
+                    [
+                        f"[/canvas_image]@@path={image_path}\n{bg_arg}[canvas_image/]",
+                        f"{mode} canvas acknowledged",
+                    ]
+                )
+                agent.llm = agent.controller.llm = canvas_llm
+                await _drain_chat(creature, f"{mode} canvas")
+                for _ in range(100):
+                    if _assistant_text(agent) == f"{mode} canvas acknowledged":
+                        break
+                    await asyncio.sleep(0.02)
+                assert _assistant_text(agent) == f"{mode} canvas acknowledged"
+                completions = [
+                    event
+                    for event in canvas_events.activities
+                    if event.kind == "tool_done"
+                    and event.metadata.get("job_id", "").startswith("canvas_image_")
+                ]
+                assert (
+                    len(completions) == len(expected_previews) + 1
+                ), canvas_events.activities
+                completion = completions[-1].metadata
+                image_part = next(
+                    part for part in completion["result"] if part["type"] == "image_url"
+                )
+                url = image_part["image_url"]["url"]
+                expected = {
+                    "kind": "image",
+                    "file_path": str(image_path.resolve()),
+                    "lang": "png",
+                    "content": url,
+                    "bytes": image_path.stat().st_size,
+                    "truncated": False,
+                }
+                assert completion["canvas_preview"] == expected
+                expected_previews.append(expected)
+                artifact = (
+                    agent.session_store.artifacts_dir / url.split("/artifacts/", 1)[1]
+                )
+                assert artifact.read_bytes() == image_path.read_bytes()
+                start = next(
+                    event
+                    for event in canvas_events.activities
+                    if event.kind == "tool_start"
+                    and event.metadata.get("job_id") == completion["job_id"]
+                )
+                assert start.metadata["background"] is (mode == "background")
+
         # Engine __aexit__ stopped the creature.
         assert creature.is_running is False
+        with SessionReader(session_path) as reader:
+            canvas_results = [
+                event
+                for event in reader.events("solo")
+                if event["type"] == "tool_result" and event["name"] == "canvas_image"
+            ]
+            assert [
+                event["canvas_preview"] for event in canvas_results
+            ] == expected_previews
 
         # --- A separate EPHEMERAL creature: conversation resets per turn.
         # ``ephemeral=True`` flips ``ControllerConfig.ephemeral`` so the
@@ -1281,7 +1418,7 @@ class TestCoreIntegration:
             )
             assert "background-kaboom" in (bgboom_result.error or "")
 
-    async def test_history_ops(self, make_creature):
+    async def test_history_ops(self, make_creature, tmp_path):
         """One workflow over the three history operations: run a turn,
         ``regenerate_last_response`` opens a new branch, ``edit_and_rerun``
         replaces the user message and re-runs, ``rewind_to`` drops the
@@ -1531,6 +1668,79 @@ class TestCoreIntegration:
                 call["id"] for call in replay_announcement.tool_calls
             }
 
+        for mode in ("native", "bracket"):
+            folder = tmp_path / mode
+            folder.mkdir()
+            config = folder / "config.yaml"
+            config.write_text(
+                f"name: history_probe\nsystem_prompt: offline\ntool_format: {mode}\n"
+                "input: {type: none}\noutput: {type: stdout}\n"
+                "tools:\n  - {name: scratchpad, type: builtin}\n"
+            )
+            llm = _HistoryReplayLLM(mode == "native")
+            async with Terrarium(session_dir=folder / "sessions") as engine:
+                creature = await engine.add_creature(
+                    str(config), llm=llm, io="headless", pwd=folder, start=True
+                )
+                service = LocalTerrariumService(engine)
+                agent = creature.agent
+                assert (await creature.run("seed", timeout=5)).ok
+                assert agent.scratchpad.get("history") == "preserved"
+                pending = asyncio.create_task(
+                    creature.run("original", timeout=5, raise_on_error=False)
+                )
+                await asyncio.wait_for(llm.started.wait(), 2)
+                await service.interrupt(creature.creature_id)
+                await pending
+                assert not agent.is_processing
+                assert not (await service.chat_history(creature.creature_id))[
+                    "is_processing"
+                ]
+                events = agent.session_store.get_events(agent.config.name)
+                target = [e for e in events if e["type"] == "user_message"][-1]
+                recorded_call = next(e for e in events if e["type"] == "tool_call")
+                assert recorded_call["name"] == "scratchpad"
+                expected_id = (
+                    "call_history_1" if llm.native else recorded_call["call_id"]
+                )
+                selector = UserMessageSelector(
+                    target["event_id"], target["turn_index"], target["branch_id"]
+                )
+                result = await service.edit_message(
+                    creature.creature_id, 0, "edited", target=selector
+                )
+                assert result["branch_id"] == 2
+                calls = [
+                    call
+                    for message in llm.last_messages
+                    for call in message.get("tool_calls") or []
+                ]
+                assert [(call["id"], call["function"]["name"]) for call in calls] == [
+                    (expected_id, "scratchpad")
+                ]
+                assert any(
+                    m.get("tool_call_id") == expected_id for m in llm.last_messages
+                )
+                assert (await creature.run("followup", timeout=5)).text == "OK"
+                session_path = agent.session_store.path
+            resumed = await Terrarium.resume(
+                str(session_path), llm=ScriptedLLM(["resumed OK"])
+            )
+            async with resumed:
+                restored = resumed.list_creatures()[0]
+                assert (
+                    await restored.run("after resume", timeout=5)
+                ).text == "resumed OK"
+                messages = restored.agent.controller.conversation.to_messages()
+                calls = [
+                    call
+                    for message in messages
+                    for call in message.get("tool_calls") or []
+                ]
+                assert [(call["id"], call["function"]["name"]) for call in calls] == [
+                    (expected_id, "scratchpad")
+                ]
+
     async def test_inject_event_and_unified_trigger_model(self, make_creature):
         """The unified ``TriggerEvent`` model: a non-user-input event
         (a synthetic ``tool_complete``) injected straight into the
@@ -1768,13 +1978,22 @@ class TestCoreIntegration:
             image_call_parts = [
                 part for part in image_user_message["content"] if isinstance(part, dict)
             ]
-            assert any(
-                part.get("type") == "image_url"
-                and part.get("image_url", {})
-                .get("url", "")
-                .startswith("data:image/png;base64,")
-                for part in image_call_parts
-            ), image_call_parts
+            # ReadTool hands the image over as a ``file://`` reference (nothing
+            # is copied into the session); the provider boundary inlines it.
+            image_ref = next(
+                (
+                    part["image_url"]["url"]
+                    for part in image_call_parts
+                    if part.get("type") == "image_url"
+                ),
+                None,
+            )
+            assert image_ref is not None, image_call_parts
+            assert image_ref.startswith("file://"), image_ref
+            assert Path(file_reference_path(image_ref)).is_file()
+            assert resolve_artifact_url(image_ref) == (
+                "data:image/png;base64," + png_b64
+            )
             assert not any(
                 "File read failed" in str(part.get("text", ""))
                 for part in image_call_parts

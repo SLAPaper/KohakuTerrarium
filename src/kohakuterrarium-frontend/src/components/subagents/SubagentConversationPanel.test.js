@@ -1,10 +1,40 @@
 import { flushPromises, mount } from "@vue/test-utils"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import SubagentConversationPanel from "./SubagentConversationPanel.vue"
-import { sessionAPI } from "@/utils/api"
+import { sessionAPI, terrariumAPI } from "@/utils/api"
 
 vi.mock("@/utils/i18n", () => ({ useI18n: () => ({ t: (key) => key }) }))
+
+describe("SubagentConversationPanel Markdown links", () => {
+  it("passes the Dashboard origin to transcript Markdown", async () => {
+    vi.spyOn(sessionAPI, "getSubagentConversation").mockResolvedValue({
+      live: false,
+      can_receive: false,
+      messages: [
+        {
+          role: "assistant",
+          content: `[session](${window.location.origin}/sessions/subagent)`,
+        },
+      ],
+    })
+    const wrapper = mount(SubagentConversationPanel, {
+      props: { sessionId: "session-a", parent: "root", name: "explore", live: false },
+      global: {
+        stubs: {
+          MarkdownRenderer: {
+            props: ["content", "origin"],
+            template: `<div class="md" :data-origin="origin">{{ content }}</div>`,
+          },
+          ToolCallBlock: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.get(".md").attributes("data-origin")).toBe(window.location.origin)
+  })
+})
 
 describe("SubagentConversationPanel ambiguity selector", () => {
   beforeEach(() => {
@@ -195,6 +225,66 @@ describe("SubagentConversationPanel ambiguity selector", () => {
     vi.restoreAllMocks()
   })
 
+  it("does not let a superseded target's late failure block or overwrite the new target", async () => {
+    let rejectStale
+    const staleLoad = new Promise((_resolve, reject) => {
+      rejectStale = reject
+    })
+    const getConversation = vi
+      .spyOn(sessionAPI, "getSubagentConversation")
+      .mockImplementationOnce(() => staleLoad)
+      .mockResolvedValueOnce({
+        live: false,
+        can_receive: false,
+        messages: [{ role: "assistant", content: "fresh-b transcript" }],
+      })
+
+    const wrapper = mount(SubagentConversationPanel, {
+      props: {
+        sessionId: "session-a",
+        parent: "root",
+        jobId: "job-a",
+        name: "explore",
+        live: false,
+      },
+      global: {
+        stubs: {
+          MarkdownRenderer: { props: ["content"], template: "<span>{{ content }}</span>" },
+          ToolCallBlock: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    await wrapper.setProps({ jobId: "job-b" })
+    await flushPromises()
+
+    // The new target's read must be issued at once — not queued behind the
+    // abandoned job-a read — and its transcript must win.
+    expect(getConversation).toHaveBeenLastCalledWith("session-a", {
+      parent: "root",
+      jobId: "job-b",
+      name: "explore",
+    })
+    expect(wrapper.text()).toContain("fresh-b transcript")
+
+    // The abandoned read fails LAST: its late error must neither surface nor
+    // overwrite the fresh transcript, and it must not trigger another read.
+    rejectStale(
+      Object.assign(new Error("late failure"), {
+        response: { status: 500, data: { detail: "late boom" } },
+      }),
+    )
+    await flushPromises()
+    expect(wrapper.text()).toContain("fresh-b transcript")
+    expect(wrapper.text()).not.toContain("late boom")
+    expect(wrapper.text()).not.toContain("chat.subagent.unavailable")
+    expect(getConversation).toHaveBeenCalledTimes(2)
+
+    wrapper.unmount()
+    vi.restoreAllMocks()
+  })
+
   it("disables selector entries while a selection is in flight and resets expansion state", async () => {
     let resolveFirst
     const firstPick = new Promise((resolve) => {
@@ -305,5 +395,132 @@ describe("SubagentConversationPanel ambiguity selector", () => {
     expect(wrapper.text()).toContain("ambiguous across members")
     expect(wrapper.find("[data-test='subagent-run-0']").exists()).toBe(false)
     vi.restoreAllMocks()
+  })
+})
+
+describe("SubagentConversationPanel live polling", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it("does not stack conversation reads while the previous one is in flight", async () => {
+    let resolveSlow
+    const slowRead = new Promise((resolve) => {
+      resolveSlow = resolve
+    })
+    const getLive = vi
+      .spyOn(terrariumAPI, "getSubagentConversation")
+      // Mount-time load resolves; every poll read then hangs until the
+      // test releases it, standing in for a backend slower than 1.5 s.
+      .mockResolvedValueOnce({ can_receive: true, messages: [] })
+      .mockImplementation(() => slowRead)
+
+    const wrapper = mount(SubagentConversationPanel, {
+      props: {
+        sessionId: "session-a",
+        parent: "root",
+        name: "explore",
+        live: true,
+        status: "running",
+      },
+      global: {
+        stubs: {
+          MarkdownRenderer: { props: ["content"], template: "<div>{{ content }}</div>" },
+          ToolCallBlock: true,
+        },
+      },
+    })
+    await flushPromises()
+
+    // Three poll ticks land while the first read is unanswered — only
+    // one request may be outstanding, the rest must be skipped.
+    vi.advanceTimersByTime(4500)
+    expect(getLive).toHaveBeenCalledTimes(2) // mount load + first poll
+
+    resolveSlow({ can_receive: true, messages: [] })
+    await flushPromises()
+    vi.advanceTimersByTime(1500)
+    expect(getLive).toHaveBeenCalledTimes(3)
+
+    wrapper.unmount()
+    getLive.mockRestore()
+  })
+})
+
+// The sub-agent transcript renders through the same production
+// ConversationMessage as the main chat, so provider reasoning, part ordering,
+// and non-text parts reach it instead of a reduced native fallback.
+describe("SubagentConversationPanel assistant parity", () => {
+  beforeEach(() => vi.restoreAllMocks())
+
+  const mdStub = { props: ["content"], template: "<div class='md'>{{ content }}</div>" }
+  const toolStub = { props: ["tc"], template: "<div class='tool-stub'>{{ tc.name }}</div>" }
+
+  async function mountTranscript(messages) {
+    vi.spyOn(sessionAPI, "getSubagentConversation").mockResolvedValue({
+      live: false,
+      can_receive: false,
+      messages,
+    })
+    const wrapper = mount(SubagentConversationPanel, {
+      props: { sessionId: "session-a", parent: "root", name: "explore", live: false },
+      global: { stubs: { MarkdownRenderer: mdStub, ToolCallBlock: toolStub } },
+    })
+    await flushPromises()
+    return wrapper
+  }
+
+  it("renders ordered reasoning segments in place", async () => {
+    const wrapper = await mountTranscript([
+      {
+        role: "assistant",
+        content: "the answer",
+        _kt_assistant_segments: [
+          { type: "reasoning", source: "reasoning_content", text: "PRIVATE_THOUGHT" },
+          { type: "text", text: "the answer" },
+        ],
+      },
+    ])
+
+    const text = wrapper.text()
+    expect(text).toContain("Thinking")
+    expect(text).toContain("PRIVATE_THOUGHT")
+    expect(text).toContain("the answer")
+    expect(text.indexOf("PRIVATE_THOUGHT")).toBeLessThan(text.indexOf("the answer"))
+  })
+
+  it("falls back to provider reasoning fields when no segments were recorded", async () => {
+    const wrapper = await mountTranscript([
+      { role: "assistant", content: "the answer", reasoning_content: "LEGACY_THOUGHT" },
+    ])
+
+    const text = wrapper.text()
+    expect(text).toContain("Thinking")
+    expect(text).toContain("LEGACY_THOUGHT")
+    expect(text.indexOf("LEGACY_THOUGHT")).toBeLessThan(text.indexOf("the answer"))
+  })
+
+  it("keeps a tool call that no segment references", async () => {
+    // ``as_list`` drops a tool_call_ref whose call_id never resolved, so a
+    // segment list can carry reasoning while omitting a call the message holds.
+    const wrapper = await mountTranscript([
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: "c1", function: { name: "read_file", arguments: '{"path":"a.py"}' } }],
+        _kt_assistant_segments: [
+          { type: "reasoning", source: "reasoning_content", text: "thinking" },
+          { type: "text", text: "let me read" },
+        ],
+      },
+    ])
+
+    expect(wrapper.text()).toContain("read_file")
   })
 })

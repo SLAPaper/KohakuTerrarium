@@ -37,6 +37,18 @@ The format is append-only for event data and versioned through KohakuVault's aut
 
 Compaction changes the live prompt and writes a fast-resume snapshot, but it does not erase the append-only event log. Studio identifies editable user messages with the persisted `event_id`, `turn_index`, and `branch_id`. Save & Rerun and Regenerate rebuild the new branch from the selected message's original event prefix, ignoring compact summaries and snapshots. The previous branch and every later event remain available for branch navigation and resume. If the locator is missing, ambiguous, points to injected mid-turn input, or conflicts with the selected branch, the operation fails without changing history.
 
+### Older session formats
+
+Some older writers recorded canonical messages with event, turn, and branch IDs
+without updating the session format marker. Migration preserves those event logs,
+snapshots, and compaction references rather than translating them again.
+
+If a session mixes canonical history with legacy history, snapshot-only agents,
+or agents with only observability events, migration refuses before creating a
+destination. Duplicate or invalid event IDs also require explicit repair. The
+original session remains intact; migration does not guess new identities or
+automatically repair a previously migrated file.
+
 ## Where sessions live
 
 ```
@@ -167,6 +179,42 @@ if any member cannot resume or any saved link cannot be restored, the server
 compensates already resumed members, removes partial runtime metadata, preserves
 the original saved lifecycle, and returns a non-success response rather than a
 degraded partial cluster.
+
+## HTTP history pagination
+
+History target endpoints return one bounded page, with a default and maximum
+`limit` of 400 records. Clients upgrading from full-history responses must
+retain `history_page` alongside the records; a response is not the complete log.
+
+- Live creature: `GET /api/sessions/{session_id}/creatures/{creature_id}/history`.
+- Saved target: `GET /api/sessions/{session_name}/history/{target}`.
+- Use `stream=events` (the default) for physical event rows in `events`.
+  Use `stream=snapshot` for conversation message rows in `messages`. Channels
+  return `stream=channel` and place channel records in `messages`.
+
+Saved-session metadata and the available target list come from
+`GET /api/sessions/{session_name}/history`; target pages omit the legacy `meta`
+field.
+
+Start without a cursor. To load older records, send `before` from the oldest
+loaded page; to catch up, send `after` from the newest loaded page. Include the
+returned `history_id` and `stream` on continuations. Cursors are opaque and must
+be URL-encoded, not parsed or replaced with numeric event IDs. Never send both
+`before` and `after`. Continue in each direction while `has_older` or
+`has_newer` is true. If `reset_required` is true, discard that stream's cached
+range and restart without a cursor or history ID.
+
+`paged=false` and non-positive limits, including `limit=0`, now return HTTP 400.
+The live endpoint also rejects `since_event_id`; replace it with the opaque
+`after` cursor. A snapshot-only session may return `stream=snapshot` even when
+an initial events page was requested; always inspect the response stream.
+
+Keep previously loaded pages when refreshing the head of the same history.
+Treat token totals computed from an incomplete loaded range as partial. Large
+records may be previews with `_history_truncated` and `_history_detail`; fetch
+`history/detail` on the live creature endpoint or `{target}/detail` on the saved
+history endpoint with `stream`, `history_id`, and `ref=_history_detail` to expand
+one record. For full offline inspection, use `SessionReader` below.
 
 ## Interrupt and resume workflow
 
@@ -335,7 +383,12 @@ How the index stays in sync without manual refresh:
   every file (the *bootstrap* step) and remembers it succeeded.
 - **`?refresh=true`.** Trigger the same incremental reconcile on
   demand; useful right after copying a backup `.kohakutr` into the
-  session directory.
+  session directory. Refreshes are single-flighted: a request that
+  arrives while a scan is already running queues behind it and skips
+  its own pass only once a scan started *after* the request arrived,
+  so a burst of refreshes costs at most two scans and every refresh
+  still reflects the changes that made the client ask.
+  `?full_rescan=true` keeps its force-reread intent and never skips.
 
 The sidecar is safe to delete: the next listing rebuilds it from
 the `.kohakutr` files. Nothing inside the index is unique state.

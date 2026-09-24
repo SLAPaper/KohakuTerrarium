@@ -2,6 +2,8 @@
 
 import pytest
 
+from kohakuterrarium.llm.antigravity_format import STATE_KEY, signed_state
+
 from kohakuterrarium.session.history import (
     InvalidBranchViewError,
     _coerce_path,
@@ -1108,6 +1110,44 @@ class TestDedupe:
 
 
 class TestNormalizeToolCallEvents:
+    @pytest.mark.parametrize(
+        "normalize", [normalize_tool_call_events, normalize_resumable_events]
+    )
+    def test_display_labels_and_native_identity_survive_replay(self, normalize):
+        events = [
+            {"type": "user_message", "content": "go"},
+            {
+                "type": "tool_call",
+                "name": "web_search[abc123]",
+                "call_id": "web_search_abc123ff",
+                "tool_call_id": "call_provider_1",
+                "tool_call_arguments": '{"query": "exact", "_option": true}',
+                "args": {"query": "exact"},
+            },
+            {
+                "type": "tool_result",
+                "name": "web_search[abc123]",
+                "call_id": "web_search_abc123ff",
+                "output": "found",
+            },
+        ]
+        normalized = normalize(events)
+        replayed = replay_conversation(normalized)
+        call = next(m for m in replayed if m.get("tool_calls"))["tool_calls"][0]
+        result = next(m for m in replayed if m["role"] == "tool")
+        assert call == {
+            "id": "call_provider_1",
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "arguments": '{"query": "exact", "_option": true}',
+            },
+        }
+        assert result["tool_call_id"] == call["id"]
+        assert result["name"] == "web_search"
+        assert events[1]["name"] == "web_search[abc123]"
+        assert normalized[1]["call_id"] == "web_search_abc123ff"
+
     def test_restores_announcement_without_finalizing_unfinished_call(self):
         events = [{"type": "tool_call", "call_id": "c1", "name": "bash", "ts": 1.0}]
 
@@ -1789,3 +1829,21 @@ class TestSelectLiveEventIdsPrefix:
         live = select_live_event_ids(events)
         assert live == {0, 3}
         assert 4 not in live
+
+
+def test_antigravity_state_replay_does_not_attach_empty_round_to_previous():
+    first = {"role": "assistant", "content": "first"}
+    empty = {"role": "assistant", "content": ""}
+    state1 = signed_state(first, [{"text": "first"}], "m", "scope")
+    state2 = signed_state(empty, [{"thoughtSignature": "opaque"}], "m", "scope")
+    messages = replay_conversation(
+        [
+            {"type": "user_message", "content": "a"},
+            {"type": "text_chunk", "content": "first"},
+            {"type": "assistant_reasoning", STATE_KEY: state1},
+            {"type": "user_message", "content": "b"},
+            {"type": "assistant_reasoning", STATE_KEY: state2},
+        ]
+    )
+    assert messages[1][STATE_KEY] == state1
+    assert messages[3] == {**empty, STATE_KEY: state2}

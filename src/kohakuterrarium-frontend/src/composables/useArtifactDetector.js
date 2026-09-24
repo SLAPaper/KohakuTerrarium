@@ -34,9 +34,7 @@ export function useArtifactDetector(scope, options = {}) {
     const tab = chat.activeTab
     if (!tab) return
     const msgs = chat.messagesByTab?.[tab] || []
-    for (const m of msgs) {
-      canvas.scanMessage(m)
-    }
+    canvas.scanMessages(msgs)
   }
 
   // While processing, scan every 2s to catch completed code blocks
@@ -66,7 +64,12 @@ export function useArtifactDetector(scope, options = {}) {
       const msgs = chat.messagesByTab?.[tab] || []
       const last = msgs[msgs.length - 1]
       const lastParts = Array.isArray(last?.parts) ? last.parts.length : 0
-      return [tab, msgs.length, last?.id || "", lastParts, chat.processing].join(":")
+      const toolResults = msgs.flatMap((msg) =>
+        (msg.parts || [])
+          .filter((part) => part.type === "tool")
+          .flatMap((part) => [part.status, part.resultMeta, part.resultParts]),
+      )
+      return [tab, msgs.length, last?.id || "", lastParts, chat.processing, ...toolResults]
     },
     () => scanAll(),
   )

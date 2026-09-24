@@ -109,10 +109,58 @@ jobs:
           node-version: "24"
       - run: npm ci
       - run: npm run format:check
+      - name: Run history and branch regression tests
+        run: >-
+          npm test -- --maxWorkers=4
+          src/utils/api.historyPage.test.js
+          src/stores/historyPaging.test.js
+          src/stores/historyHead.test.js
+          src/stores/historyDetail.test.js
+          src/stores/chat.historyPage
+          src/stores/chat.branch
+          src/stores/chat.editRerunGuards.test.js
+          src/components/chat/ChatPanel.history
+          src/components/chat/chatHistoryExpand.test.js
       - run: npm run build
       - name: Verify frontend build output
         working-directory: .
         run: test -f src/kohakuterrarium/web_dist/index.html
+
+  vscode-extension-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: extensions/vscode/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - name: Install frontend config dependencies
+        working-directory: src/kohakuterrarium-frontend
+        run: npm ci
+      - name: Verify public chat import boundary
+        run: node --test test/chat-ui-boundary.test.cjs
+      - run: npm test
+      - run: npm run build
+      - run: npm run package
+      - name: Verify packaged extension
+        shell: bash
+        run: |
+          shopt -s nullglob
+          packages=(kohakuterrarium-vscode-*.vsix)
+          test "${#packages[@]}" -eq 1
+          test -s "${packages[0]}"
+          node node_modules/@vscode/vsce/vsce ls > "$RUNNER_TEMP/vscode-package-files.txt"
+          grep -Fx 'LICENSE' "$RUNNER_TEMP/vscode-package-files.txt"
+          grep -Fx 'dist/extension.cjs' "$RUNNER_TEMP/vscode-package-files.txt"
+          grep -Fx 'dist/webview.js' "$RUNNER_TEMP/vscode-package-files.txt"
+          grep -Fx 'dist/webview.css' "$RUNNER_TEMP/vscode-package-files.txt"
+          ! grep -E '\.(map|test\.cjs)$|^node_modules/' "$RUNNER_TEMP/vscode-package-files.txt"
 
   package-check:
     runs-on: ubuntu-latest

@@ -51,6 +51,22 @@ Or override at the command line for one run:
 kt run path/to/creature --llm gpt-5.4
 ```
 
+### Daybreak Blue through Codex OAuth
+
+Accounts provisioned for [Daybreak Blue](https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest)
+can select the built-in Codex OAuth preset directly:
+
+```yaml
+controller:
+  llm: gpt-daybreak-blue-latest
+```
+
+Run `kt login codex` before selecting the preset. Daybreak access is scoped to
+the approved identity, workspace, model, and product surface under
+[Trusted Access for Cyber](https://learn.chatgpt.com/docs/cyber-safety).
+The Daybreak Blue alias currently resolves to `gpt-5.6-sol`, so provider
+responses may report that resolved model name.
+
 If you want fully inline settings (no profile file), use `model` + `api_key_env` + `base_url`:
 
 ```yaml
@@ -97,14 +113,17 @@ With options:
 tools:
   - name: web_search
     backend: duckduckgo
+    codex_model: gpt-5.6-luna
     deepseek_model: deepseek-v4-flash
     fallback: none
 ```
 
-`web_search` keeps DuckDuckGo as its no-key default. To opt into DeepSeek,
-run `kt config key set deepseek`, then either set `backend: deepseek` in the
-creature config or switch the live creature with
-`/module set web_search backend deepseek`.
+`web_search` keeps DuckDuckGo as its no-key default. To explicitly use hosted
+Codex subscription search, run `kt login codex`, then set `backend: codex` or
+use `/module set web_search backend codex`; this is independent of the
+creature's active LLM. To use DeepSeek, run `kt config key set deepseek`, then
+select `backend: deepseek`. Set `fallback: duckduckgo` when a transient failure
+of an explicitly selected Codex or DeepSeek backend should fall back.
 
 Custom (local module):
 
@@ -318,9 +337,9 @@ See the Tool format section of the [creatures guide](creatures.md) for the concr
 ## How do I choose dynamic vs static skill mode?
 
 ```yaml
-skill_mode: dynamic   # default; the `info` framework command loads full docs on demand
+tool_doc_mode: standard   # default; `info` loads the full docs on demand
 # or
-skill_mode: static    # full tool docs baked into system prompt
+tool_doc_mode: full       # every tool's usage tier inlined into the prompt
 ```
 
 Procedural skills are a separate layer. Package skills default disabled and are

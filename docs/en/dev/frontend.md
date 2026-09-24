@@ -136,12 +136,17 @@ Panels are registered in `stores/layoutPanels.js` at app startup
 layout.registerPanel({
   id: "chat",
   label: "Chat",
+  description: "The conversation with the focused creature.",
   component: ChatPanel,
 });
 ```
 
 The `component` is wrapped in `markRaw()` internally so Vue reactivity
-doesn't wrap it.
+doesn't wrap it. `description` is the English fallback shown in the
+panel picker and palette; `utils/i18n.js` translates both label and
+description by panel id. Pass `hidden: true` for an alias a legacy
+preset still references but users should never be offered; such panels
+stay resolvable but drop out of `layout.visiblePanelList`.
 
 ### Presets
 
@@ -152,12 +157,14 @@ const CHAT_FOCUS = {
   id: "chat-focus",
   label: "Chat Focus",
   shortcut: "Ctrl+1",
-  tree: hsplit(70, leaf("chat"), vsplit(65, leaf("status-dashboard"), leaf("state"))),
+  tree: hsplit(70, leaf("chat"), vsplit(40, leaf("status-tab"), leaf("state"))),
 };
 ```
 
 Helper functions `hsplit(ratio, left, right)`, `vsplit(ratio, top, bottom)`,
-and `leaf(panelId)` create the tree nodes concisely.
+and `leaf(panelId)` create the tree nodes concisely. `DEFAULT_PRESET_ID`
+names the preset every fresh attach tab lands on; the instance's shape
+never picks a different one.
 
 ### Panel props
 
@@ -208,11 +215,35 @@ File system watcher (watchfiles). Messages:
 4. If the panel needs runtime props (like `instance`), add an entry to
    the route page's `panelProps` computed.
 
+## Canvas publications
+
+The canvas detector observes tool-result replacements as well as transcript
+growth, so a background completion can update an older message while the
+controller is idle. Tool jobs retain their `canvas_preview` metadata in live
+events and persisted history. For earlier records missing that metadata,
+successful `canvas_image` results supply the image and path directly.
+
+Canvas dismissal records are browser-local and scoped by attach target. Tool
+job IDs identify publications across live/replayed messages and relative versus
+resolved path spellings. Message-derived images and text blocks still use
+message IDs, so their dismissal across live-to-history rekeying is best effort.
+
 ## Theme
 
 `stores/theme.js` manages dark/light mode. Components use
 `useThemeStore().dark` reactively. CSS uses `html.dark` class for dark
 mode overrides. UnoCSS `dark:` prefix works throughout.
+
+Studio applies `kt-conversation-host` to its `ChatTranscriptSection` instance
+to supply the shared conversation palette. The shared transcript component
+inherits its host's tokens; it does not establish another palette scope.
+VS Code supplies its own scope and maps tokens to editor theme variables.
+
+For global dark selectors in scoped Vue styles, keep the complete selector
+inside `:global(...)`, for example
+`:global(html.dark .kt-chat-composer__shell)`. Combining
+`:global(.dark) :deep(...)` can compile to a bare `.dark` rule and lose the
+target component selector.
 
 Vditor and xterm.js have their own theme systems; both watch
 `themeStore.dark` and call their respective theme-switch APIs.

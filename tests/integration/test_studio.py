@@ -47,10 +47,27 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.session.embedding import BaseEmbedder
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.studio.identity import grok_subscription
 from kohakuterrarium.studio.persistence import store as _persistence_store_mod
 from kohakuterrarium.studio.sessions import memory_search as _session_memory_mod
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.testing.llm import ScriptedLLM
+
+from tests.helpers.antigravity_usage import install_quota_script, assert_quota
+from kohakuterrarium.studio.identity import antigravity
+
+from tests.helpers.grok_usage_script import (
+    FAKE_ACCESS,
+    assert_billing_request,
+    assert_empty,
+    assert_usage_ok,
+    billing_body,
+    install_billing_script,
+    install_grok_home,
+    patch_cli_version_probe,
+    write_cli_auth,
+    write_metadata_version,
+)
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -981,7 +998,9 @@ class TestStudioIntegration:
             await studio.sessions.stop(team_sid)
             assert studio.sessions.list() == []
 
-    async def test_identity_and_catalog_surface(self, scripted_llm, isolated_paths):
+    async def test_identity_and_catalog_surface(
+        self, scripted_llm, isolated_paths, monkeypatch
+    ):
         """The config + catalog tier — all CRUD round-trips through the façade.
 
         identity.keys  : set / get / list / delete
@@ -1015,6 +1034,7 @@ class TestStudioIntegration:
             assert set(baseline_backends) == {
                 "codex",
                 "grok-subscription",
+                "google-antigravity",
                 "openai",
                 "openrouter",
                 "anthropic",
@@ -1023,6 +1043,10 @@ class TestStudioIntegration:
                 "kimi-code",
                 "glm-coding",
             }
+            assert (
+                baseline_backends["google-antigravity"]["backend_type"]
+                == "google-antigravity"
+            )
             grok = baseline_backends["grok-subscription"]
             assert grok["backend_type"] == "grok-subscription"
             assert grok["provider_native_tools"] == [
@@ -1113,6 +1137,39 @@ class TestStudioIntegration:
             reloaded = studio.identity.ui_prefs.load()
             assert reloaded["theme"] == "dark"
             assert reloaded["nav-expanded"] is False
+
+            grok_home = install_grok_home(isolated_paths["tmp_path"], monkeypatch)
+            patch_cli_version_probe(monkeypatch)
+            write_metadata_version(grok_home)
+            billing = install_billing_script(monkeypatch)
+            assert_empty(await grok_subscription.get_usage(), "not_logged_in")
+            assert billing.requests == []
+            write_cli_auth(grok_home, FAKE_ACCESS)
+            assert grok_subscription.get_status()["source"] == "grok-cli"
+            for used in (1.0, 4.0):
+                billing.push(200, billing_body(used))
+                assert_usage_ok(await grok_subscription.get_usage(), used)
+                assert_billing_request(
+                    billing.requests[-1], FAKE_ACCESS, version="1.0.5"
+                )
+            for code, status in ((503, "unavailable"), (403, "auth_expired")):
+                billing.push(code)
+                assert_empty(await grok_subscription.get_usage(), status)
+            (grok_home / "auth.json").unlink()
+            assert_empty(await grok_subscription.get_usage(), "not_logged_in")
+            assert len(billing.requests) == 4
+
+            with monkeypatch.context() as agy_patch:
+                quota = install_quota_script(agy_patch)
+                assert (await antigravity.get_usage())["status"] == "not_logged_in"
+                quota["logged_in"] = True
+                assert_quota(await antigravity.get_usage(), 25)
+                quota["remaining"] = 0
+                assert_quota(await antigravity.get_usage(), 100)
+                quota["status"] = 403
+                assert (await antigravity.get_usage())["status"] == "auth_expired"
+                quota["logged_in"] = False
+                assert (await antigravity.get_usage())["groups"] == []
 
             # --- catalog.builtins: read-only catalog --------------------
             tool_entries = studio.catalog.builtins.list("tools")

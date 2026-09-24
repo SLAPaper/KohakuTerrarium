@@ -190,6 +190,12 @@ class TestToolContextPathResolution:
         absolute = (tmp_path / "abs.txt").resolve()
         assert ctx.resolve_path(str(absolute)) == absolute
 
+    def test_file_uri_resolves_to_the_named_path(self, tmp_path):
+        ctx = ToolContext(agent_name="a", session=None, working_dir=tmp_path)
+        absolute = (tmp_path / "abs.txt").resolve()
+        assert ctx.resolve_path(absolute.as_uri()) == absolute
+        assert not (tmp_path / "file:").exists()
+
     def test_channels_and_scratchpad_proxy_session(self):
         class _Sess:
             channels = ["ch"]
@@ -254,8 +260,19 @@ class TestToolInfo:
         assert info.tool_name == "ok_tool"
         assert info.description == "always succeeds"
         assert info.execution_mode is ExecutionMode.BACKGROUND
-        # documentation is pulled from get_full_documentation
-        assert "ok_tool" in info.documentation
+        # Registration does not read the packaged markdown: it used to load the
+        # whole corpus at boot to serve one rare fallback.
+        assert info.documentation == ""
+        # It is resolved on demand instead.
+        assert "ok_tool" in info.resolve_documentation()
+
+    def test_explicit_documentation_wins_over_the_lazy_lookup(self):
+        info = ToolInfo(tool_name="ok_tool", description="d", documentation="EXPLICIT")
+        assert info.resolve_documentation() == "EXPLICIT"
+
+    def test_resolve_documentation_is_empty_without_a_tool(self):
+        info = ToolInfo(tool_name="x", description="d")
+        assert info.resolve_documentation() == ""
 
     def test_to_prompt_line_format(self):
         info = ToolInfo(tool_name="bash", description="run shell")

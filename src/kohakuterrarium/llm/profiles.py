@@ -36,6 +36,7 @@ from kohakuterrarium.llm.backends import (
 )
 from kohakuterrarium.llm.codex_auth import CodexTokens
 from kohakuterrarium.llm.grok_auth import GrokTokens
+from kohakuterrarium.llm.antigravity_auth import AgyCredentials
 from kohakuterrarium.llm.preset_store import get_subagent_models, load_presets
 from kohakuterrarium.llm.preset_store import preset_from_data as _preset_from_data
 from kohakuterrarium.llm.preset_store import serialize_user_data as _serialize_user_data
@@ -61,6 +62,11 @@ logger = get_logger(__name__)
 def save_backend(backend: LLMBackend) -> None:
     """Persist a user provider after normalizing its backend type."""
     backend.backend_type = validate_backend_type(backend.backend_type)
+    if (
+        backend.backend_type == "google-antigravity"
+        or backend.name == "google-antigravity"
+    ):
+        raise ValueError("Antigravity is a fixed built-in local provider")
     data = _load_yaml()
     backends = load_backends()
     presets = load_presets()
@@ -150,16 +156,18 @@ def load_profiles() -> dict[tuple[str, str], LLMProfile]:
     return profiles
 
 
-# The first available provider supplies the implicit default model.
+# The first available provider supplies the implicit default model — this is
+# what a fresh install runs on before anyone sets `kt model default`. Each
+# entry names that provider's current flagship.
 _PROVIDER_DEFAULT_MODELS: list[tuple[str, str]] = [
-    ("codex", "gpt-5.5"),
+    ("codex", "gpt-6-astra"),
     ("openrouter", "mimo-v2.5-pro"),
     ("anthropic", "claude-opus-4.8"),
-    ("openai", "gpt-5.5"),
+    ("openai", "gpt-5.6-sol"),
     ("gemini", "gemini-3.1-pro"),
     ("mimo", "mimo-v2.5-pro"),
     ("kimi-code", "kimi-for-coding"),
-    ("glm-coding", "glm-5.2"),
+    ("glm-coding", "glm-5.3"),
 ]
 
 
@@ -516,6 +524,8 @@ def _is_available(provider_name: str) -> bool:
         return CodexTokens.load() is not None
     if backend and backend.backend_type == "grok-subscription":
         return GrokTokens.available()
+    if backend and backend.backend_type == "google-antigravity":
+        return AgyCredentials.available()
     if provider_name == "grok-subscription":
         return GrokTokens.available()
     if backend:

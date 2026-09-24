@@ -11,7 +11,10 @@ relevance scores.
 
 ``refresh=true`` incrementally reconciles only files whose ``(mtime, size)``
 fingerprint changed. ``full_rescan=true`` rereads every file and is intended
-for changes made outside the application.
+for changes made outside the application. Concurrent refreshes are
+single-flighted: bursts queue behind the running scan and at most one
+trailing scan runs for the whole burst (see ``_reconcile_guarded``), while
+every refresh still reflects the changes that made the client ask.
 
 The router mounts under both ``/api/persistence/saved`` and ``/api/sessions``
 to preserve the session API URLs.
@@ -28,7 +31,9 @@ from kohakuterrarium.studio.persistence.session_index import (
     aggregate_stats,
     get_session_index_default,
 )
-from kohakuterrarium.studio.persistence.session_index.reconcile import reconcile
+from kohakuterrarium.studio.persistence.session_index.refresh import (
+    reconcile_guarded as _reconcile_guarded,
+)
 from kohakuterrarium.studio.persistence.store import (
     _session_dir,
     delete_session_files,
@@ -91,7 +96,7 @@ def _list_via_index(
     session_dir = _session_dir()
     index = get_session_index_default(session_dir)
     if refresh or full_rescan:
-        reconcile(index, session_dir, full=full_rescan)
+        _reconcile_guarded(session_dir, index, full_rescan=full_rescan)
     page = index.list(
         search=search,
         status=status,

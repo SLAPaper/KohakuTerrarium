@@ -11,6 +11,10 @@ from kohakuterrarium.core.budget import (
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.executor import Executor
 from kohakuterrarium.core.registry import Registry
+from kohakuterrarium.core.tool_output import (
+    discard_raw_output_file,
+    normalize_tool_output,
+)
 from kohakuterrarium.llm.base import LLMProvider
 from kohakuterrarium.llm.tools import build_tool_schemas
 from kohakuterrarium.modules.plugin.base import (
@@ -26,6 +30,8 @@ from kohakuterrarium.modules.subagent.result import (  # noqa: F401
     SubAgentResult,
     build_subagent_framework_hints,
 )
+from kohakuterrarium.modules.tool.base import BaseTool
+from kohakuterrarium.modules.tool.media_policy import resolve_media_policy
 from kohakuterrarium.parsing import ParserConfig, StreamParser, TextEvent, ToolCallEvent
 from kohakuterrarium.parsing.format import BRACKET_FORMAT, XML_FORMAT, ToolCallFormat
 from kohakuterrarium.prompt.aggregator import aggregate_system_prompt
@@ -164,7 +170,6 @@ class SubAgent:
             registry=self.registry,
             include_tools=True,
             include_hints=True,
-            skill_mode="dynamic",
             tool_format=self.tool_format or "bracket",
             runtime_plugins=self._plugin_manager,
             plugin_context=plugin_ctx,
@@ -663,10 +668,33 @@ class SubAgent:
                     continue
                 # Preserve compatibility with tools predating the ToolResult contract.
                 if isinstance(result, str):
-                    results.append(f"[{tool_call.name}]\n{result}")
+                    max_output = (
+                        tool.config.max_output if isinstance(tool, BaseTool) else 0
+                    )
+                    normalized = normalize_tool_output(
+                        result,
+                        max_output=max_output,
+                        tool_name=tool_call.name,
+                    )
+                    results.append(f"[{tool_call.name}]\n{normalized.text}")
                     continue
+                max_output = tool.config.max_output if isinstance(tool, BaseTool) else 0
+                result_metadata = (
+                    result.metadata if isinstance(result.metadata, dict) else {}
+                )
+                normalized = normalize_tool_output(
+                    result.output,
+                    max_output=max_output,
+                    tool_name=tool_call.name,
+                    saved_to=result_metadata.get("raw_output_path"),
+                    media_policy=resolve_media_policy(tool, result_metadata),
+                )
+                if tool_call.name == "bash" and (
+                    not result.success or not normalized.metadata.get("truncated")
+                ):
+                    discard_raw_output_file(result_metadata)
                 if result.success:
-                    text_output = result.get_text_output()
+                    text_output = normalized.text
                     output = text_output if text_output else "(no output)"
                     results.append(f"[{tool_call.name}]\n{output}")
                     logger.debug(

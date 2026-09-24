@@ -1,10 +1,10 @@
-"""
-Provide Responses API access through Codex OAuth or an explicit API key.
-"""
+"""Provide Responses API access through Codex OAuth or an explicit API key."""
 
 import asyncio
 import hashlib
 import json as _json
+from contextlib import aclosing
+from copy import deepcopy
 from typing import Any, AsyncIterator
 
 import httpx
@@ -17,6 +17,7 @@ except ImportError:
     AsyncOpenAI = None  # type: ignore[assignment,misc]
     HAS_OPENAI = False
 
+from kohakuterrarium.llm import responses_ws_options as ws_options
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
@@ -36,12 +37,13 @@ from kohakuterrarium.llm.codex_image_gen import (
     translate_image_gen_tool,
 )
 from kohakuterrarium.llm.codex_rate_limits import (
-    capture_from_headers,
+    capture_rate_limit_headers as _capture_rate_limit_headers,
     parse_rate_limit_event,
     UsageSnapshot,
     set_cached,
 )
 from kohakuterrarium.llm.openai_sanitize import strip_surrogates
+from kohakuterrarium.llm.openai_ws import record_ws_assistant_echo
 from kohakuterrarium.llm.responses_reasoning import ResponsesReasoningCollector
 from kohakuterrarium.llm.recovery import (
     ErrorClass,
@@ -55,19 +57,6 @@ from kohakuterrarium.utils.logging import get_logger
 logger = get_logger(__name__)
 
 CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-
-
-async def _capture_rate_limit_headers(response: Any) -> None:
-    """Cache rate-limit headers without allowing telemetry failures to break requests."""
-    try:
-        snap = capture_from_headers(response.headers)
-        set_cached(snap)
-    except Exception as exc:  # pragma: no cover - response hooks must be isolated
-        logger.warning(
-            "Codex rate-limit header capture failed",
-            error=str(exc),
-            exc_info=True,
-        )
 
 
 class CodexOAuthProvider(BaseLLMProvider):
@@ -99,15 +88,18 @@ class CodexOAuthProvider(BaseLLMProvider):
         self.timeout = timeout
         self.max_retries = max_retries
         self._retry_policy = RetryPolicy.from_value(retry_policy)
-        # An explicit key bypasses OAuth and targets the configured Responses endpoint.
         self._api_key = api_key
         self._base_url = base_url
         self.extra_body = dict(extra_body or {})
+        self._ws_connection_options = ws_options.build_websocket_connection_options(
+            self.extra_body.get("websocket_connection_options"), timeout=timeout
+        )
         if websocket_mode is None:
             websocket_mode = bool(self.extra_body.get("websocket_mode"))
         self._websocket_mode = bool(websocket_mode)
         self._ws_session: ResponsesWSSession | None = None
         self._tokens: CodexTokens | None = None
+        self._token_lock = asyncio.Lock()
         self._client: Any = None  # AsyncOpenAI
         self._last_tool_calls: list[NativeToolCall] = []
         self._last_usage: dict[str, int] = {}
@@ -159,17 +151,62 @@ class CodexOAuthProvider(BaseLLMProvider):
         )
 
     async def _ensure_valid_token(self) -> None:
-        """Refresh token if expired and rebuild client (OAuth mode only)."""
+        """Adopt a newer on-disk login or refresh the expired access token."""
         if self._api_key:
             if not self._client:
                 self._rebuild_client()
             return
-        if not self._tokens:
-            await self.ensure_authenticated()
-            return
-        if self._tokens.is_expired():
-            self._tokens = await refresh_tokens(self._tokens)
+        async with self._token_lock:
+            if not self._tokens:
+                await self.ensure_authenticated()
+                await self._reset_ws_session()
+                return
+            if not self._tokens.is_expired():
+                return
+            reloaded = CodexTokens.load()
+            if reloaded is not None and not reloaded.is_expired():
+                self._tokens = reloaded
+            else:
+                try:
+                    self._tokens = await refresh_tokens(self._tokens)
+                except Exception:
+                    reloaded = CodexTokens.load()
+                    if reloaded is None or reloaded.is_expired():
+                        raise
+                    self._tokens = reloaded
+            await self._reset_ws_session()
             self._rebuild_client()
+
+    @staticmethod
+    def _is_unauthorized_error(exc: BaseException) -> bool:
+        """Return whether the server rejected the cached access token."""
+        return getattr(exc, "status_code", None) == 401
+
+    async def _recover_unauthorized(self) -> bool:
+        """Reload or refresh credentials after a server 401, then rebuild the client."""
+        async with self._token_lock:
+            if self._tokens is None:
+                return False
+            previous_access = self._tokens.access_token
+            reloaded = CodexTokens.load()
+            if reloaded is not None:
+                self._tokens = reloaded
+            if (
+                self._tokens.is_expired()
+                or self._tokens.access_token == previous_access
+            ):
+                try:
+                    self._tokens = await refresh_tokens(self._tokens)
+                except Exception:
+                    recovered = CodexTokens.load()
+                    if recovered is None or recovered.access_token == previous_access:
+                        return False
+                    self._tokens = recovered
+            if self._tokens.access_token == previous_access:
+                return False
+            await self._reset_ws_session()
+            self._rebuild_client()
+            return True
 
     @property
     def last_tool_calls(self) -> list[NativeToolCall]:
@@ -197,10 +234,15 @@ class CodexOAuthProvider(BaseLLMProvider):
             retry_policy=self._retry_policy,
             api_key=self._api_key,
             base_url=self._base_url,
-            extra_body=dict(self.extra_body),
+            extra_body={
+                **self.extra_body,
+                "websocket_connection_options": self._ws_connection_options,
+            },
             websocket_mode=self._websocket_mode,
         )
         clone._tokens = self._tokens
+        clone.extra_body = dict(self.extra_body)
+        clone._token_lock = self._token_lock
         clone._client = self._client
         clone._retry_policy = self._retry_policy
         clone._emergency_drop_callbacks = list(self._emergency_drop_callbacks)
@@ -222,19 +264,42 @@ class CodexOAuthProvider(BaseLLMProvider):
         """Stream with classified retries and two-stage overflow recovery."""
         current = messages
         attempt = 0
+        auth_retry = False
         overflow_state = OverflowRecoveryState()
         while True:
+            emitted = False
             try:
-                async for chunk in self._raw_stream_chat(
-                    current,
-                    tools=tools,
-                    provider_native_tools=provider_native_tools,
-                    **kwargs,
-                ):
-                    yield chunk
+                async with aclosing(
+                    self._raw_stream_chat(
+                        current,
+                        tools=tools,
+                        provider_native_tools=provider_native_tools,
+                        **kwargs,
+                    )
+                ) as stream:
+                    async for chunk in stream:
+                        emitted = True
+                        yield chunk
                 return
             except Exception as exc:
+                if isinstance(exc, ResponsesWSError) and (
+                    exc.submitted or exc.mid_stream
+                ):
+                    raise
                 cls = classify_openai_error(exc)
+                if (
+                    not auth_retry
+                    and not emitted
+                    and not self._api_key
+                    and self._is_unauthorized_error(exc)
+                ):
+                    auth_retry = True
+                    if await self._recover_unauthorized():
+                        logger.warning(
+                            "Codex credential rejected; retrying with refreshed token",
+                            error_class=cls.value,
+                        )
+                        continue
                 if cls is ErrorClass.OVERFLOW:
                     replacement = await self._recover_from_overflow(
                         current, overflow_state
@@ -287,7 +352,12 @@ class CodexOAuthProvider(BaseLLMProvider):
             else:
                 input_messages.append(msg)
 
-        api_input = to_responses_input(input_messages)
+        echo_options = dict(model=self.model, extra_body=deepcopy(self.extra_body))
+        api_input = to_responses_input(
+            input_messages,
+            model=self.model,
+            replay_reasoning=self.extra_body.get("responses_reasoning_replay"),
+        )
 
         # Function tools precede provider-native tools in the outbound list.
         api_tools: list[dict[str, Any]] | None = None
@@ -352,18 +422,28 @@ class CodexOAuthProvider(BaseLLMProvider):
                 }
                 if api_tools:
                     base_event["tools"] = api_tools
+                output_text: list[str] = []
                 try:
-                    async for event in session.stream_turn(
-                        base_event, api_input, fix_tool_call_pairing
-                    ):
-                        piece = self._process_stream_event(event, collected_tool_calls)
-                        if piece is not None:
-                            yield piece
+                    async with aclosing(
+                        session.stream_turn(
+                            base_event, api_input, fix_tool_call_pairing
+                        )
+                    ) as stream:
+                        async for event in stream:
+                            piece = self._process_stream_event(
+                                event, collected_tool_calls
+                            )
+                            if piece is not None:
+                                output_text.append(piece)
+                                yield piece
                     self._last_assistant_extra_fields = self._reasoning.fields()
                     self._last_tool_calls = collected_tool_calls
+                    record_ws_assistant_echo(
+                        session, self, "".join(output_text), echo_options
+                    )
                     return
                 except ResponsesWSError as exc:
-                    if exc.mid_stream:
+                    if exc.mid_stream or exc.submitted:
                         raise
                     logger.warning(
                         "Codex WebSocket turn unavailable, using HTTP",
@@ -382,7 +462,7 @@ class CodexOAuthProvider(BaseLLMProvider):
             stream = await self._client.responses.create(
                 model=self.model,
                 instructions=instr_text,
-                # Codex requires each function call adjacent to its matching output.
+                # Keep parallel calls together with their matching outputs.
                 input=fix_tool_call_pairing(api_input),
                 tools=api_tools,
                 store=False,
@@ -428,11 +508,8 @@ class CodexOAuthProvider(BaseLLMProvider):
 
     def _wire_extra_body(self) -> dict[str, Any]:
         """Return extra_body wire fields (framework knobs and reasoning removed)."""
-        return {
-            k: v
-            for k, v in self.extra_body.items()
-            if k not in ("reasoning", "websocket_mode", "disable_prompt_caching")
-        }
+        knobs = ws_options.FRAMEWORK_KNOBS | {"reasoning"}
+        return {k: v for k, v in self.extra_body.items() if k not in knobs}
 
     def _ws_session_for_turn(
         self, session_headers: dict[str, str]
@@ -444,7 +521,9 @@ class CodexOAuthProvider(BaseLLMProvider):
             def _factory() -> Any:
                 # Late-bound so credential reloads and header updates apply.
                 return self._client.responses.connect(
-                    max_retries=0, extra_headers=dict(self._ws_headers)
+                    max_retries=0,
+                    extra_headers=dict(self._ws_headers),
+                    websocket_connection_options=dict(self._ws_connection_options),
                 )
 
             self._ws_session = ResponsesWSSession(_factory)
@@ -506,11 +585,16 @@ class CodexOAuthProvider(BaseLLMProvider):
         if part is not None:
             self._last_assistant_parts.append(part)
 
+    async def _reset_ws_session(self) -> None:
+        """Drop the WebSocket session so the next turn reconnects with fresh auth."""
+        session = self._ws_session
+        self._ws_session = None
+        if session is not None:
+            await session.close()
+
     async def close(self) -> None:
         """Close the WebSocket session and the underlying SDK client."""
-        if self._ws_session is not None:
-            await self._ws_session.close()
-            self._ws_session = None
+        await self._reset_ws_session()
         if self._client:
             await self._client.close()
         self._client = None

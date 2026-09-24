@@ -48,7 +48,7 @@ order: `config.yaml` → `config.yml` → `config.json` → `config.toml`.
 | `system_prompt` | str | `"You are a helpful assistant."` | no | Inline system prompt. |
 | `system_prompt_file` | str | `null` | no | Path to a markdown prompt file; relative to the agent folder. Concatenated through the inheritance chain. |
 | `prompt_context_files` | dict[str,str] | `{}` | no | Jinja variable → file path; files are read and injected when the prompt is rendered. |
-| `skill_mode` | str | `"dynamic"` | no | `dynamic` (on-demand via the `info` framework command) or `static` (full docs up-front). |
+| `tool_doc_mode` | str | `"standard"` | no | `brief` (name + description only, `info` gated), `standard` (plus full parameter schema), or `full` (usage tier inlined). Per-tool override: `doc_mode` on a `tools:` entry. |
 | `include_tools_in_prompt` | bool | `true` | no | Include auto-generated tool list. |
 | `include_hints_in_prompt` | bool | `true` | no | Include framework hints (tool-call syntax and `info` / `read_job` / `jobs` / `wait` command examples). |
 | `max_messages` | int | `0` | no | Conversation cap. `0` = unlimited. |
@@ -95,7 +95,7 @@ All fields may also be set at the top level for backward compatibility.
 | `reasoning_effort` | str | `"medium"` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`. Consumed directly by Codex; for other providers use `extra_body` (see [Provider-specific `extra_body` notes](#provider-specific-extra_body-notes)). |
 | `service_tier` | str | `null` | `priority`, `flex`. |
 | `extra_body` | dict | `{}` | Deep-merged onto the resolved preset's `extra_body` (which may already carry variation patches). |
-| `skill_mode`, `include_tools_in_prompt`, `include_hints_in_prompt`, `max_messages`, `ephemeral`, `tool_format` | | | Mirror top-level fields. |
+| `tool_doc_mode`, `include_tools_in_prompt`, `include_hints_in_prompt`, `max_messages`, `ephemeral`, `tool_format` | | | Mirror top-level fields. |
 
 Canonical model identifiers are now `provider/name[@group=option,...]`. The runtime stores and surfaces this full identifier (for `/model`, session-info events, and UI display), so a round-trip like `/model openai/gpt-5.4-api@reasoning=high` is stable.
 
@@ -152,9 +152,9 @@ per-preset catalogue of groups and options.
 
 ### Provider-specific `extra_body` notes
 
-`extra_body` is deep-merged into the JSON request body. Each provider reads
-reasoning/effort knobs from a different path; set the knob the provider
-actually honours:
+`extra_body` is deep-merged into the JSON request body, except for framework
+settings described below. Each provider reads reasoning/effort knobs from a
+different path; set the knob the provider actually honours:
 
 | Provider | Canonical path | Notes |
 |---|---|---|
@@ -172,6 +172,86 @@ it.
 Anthropic-compatible endpoints also get automatic prompt-caching markers
 applied to the system message and the last three non-tool conversation
 messages unless you set `extra_body.disable_prompt_caching: true`.
+
+Responses transports (`codex` over HTTP or WebSocket, and `openai` with
+`websocket_mode: true`) accept the framework setting
+`extra_body.responses_reasoning_replay`. Set it to `true` only for a target
+that accepts plaintext `reasoning_text` input, including a compatible model
+served under an alias. It replays stored assistant `reasoning_content` when
+converting full history, including after reconnect or session resume.
+`false` disables plaintext replay. Omission or `null` retains the legacy
+default: replay only for model names starting with `deepseek-` or `deepseek/`
+(case-insensitive). Other value types are rejected by Responses conversion.
+
+This setting does not enable model thinking, reconstruct missing reasoning,
+or convert reasoning summaries or encrypted state into plaintext. It is
+removed before sending a request and does not change Chat Completions
+reasoning handling, including HTTP fallback. Set it on the target preset;
+when switching to a target that rejects plaintext reasoning, use `false`.
+Programmatic `with_model()` preserves `extra_body`, so update the setting
+when the new model has different capabilities.
+
+### Responses WebSocket transport
+
+The `openai` and `codex` providers enable Responses WebSocket transport with
+`extra_body.websocket_mode: true`. Configure socket resources and liveness
+through `extra_body.websocket_connection_options`, a dictionary or `null`:
+
+```yaml
+controller:
+  extra_body:
+    websocket_mode: true
+    websocket_connection_options:
+      max_size: null
+      max_queue: 16
+      open_timeout: 120
+      ping_timeout: 120
+```
+
+These settings are validated when the provider is constructed and copied
+for each socket connection. They remain fixed for that provider instance,
+including credential reloads and programmatic `with_model()` clones.
+Per-call `extra_body` overrides do not change them. Both framework keys are
+removed from outgoing HTTP and WebSocket request bodies, including HTTP
+fallback. Invalid values or unknown options fail during construction.
+
+| Option | Default | Accepted values and behavior |
+|---|---|---|
+| `max_size` | `null` | Positive integer bytes or `null`. Limits each incoming message; `null` removes the SDK's receive-size limit. This is not an outgoing-request or conversation-size limit. |
+| `max_queue` | SDK default: `16` | Positive integer frames or `null`. Receive-queue high-water mark; `null` disables queue flow control. |
+| `write_limit` | SDK default: `32768` | Positive integer bytes. Write-buffer high-water mark; applies backpressure rather than limiting request size. |
+| `open_timeout` | Provider timeout | Positive finite seconds or `null`. Deadline for opening the socket; `null` disables it. |
+| `ping_interval` | SDK default: `20` | Positive finite seconds or `null`. Interval between keepalive pings; `null` disables keepalive. |
+| `ping_timeout` | Provider timeout | Positive finite seconds or `null`. Time to await a pong; `null` disables this deadline while allowing pings. |
+| `close_timeout` | SDK default: `10` | Positive finite seconds or `null`. Deadline for the close handshake; `null` disables it. |
+| `compression` | SDK default: `"deflate"` | `"deflate"` or `null`; `null` disables compression. |
+
+The provider timeout defaults to **120 seconds for OpenAI** and **300 seconds
+for Codex**, or the `timeout` passed to the provider's Python constructor.
+Setting `open_timeout` or `ping_timeout` here overrides only the corresponding
+socket deadline. These are connection and heartbeat settings, not a deadline
+for completing generation. A responsive WebSocket can continue generating
+beyond them; upstream generation deadlines still apply.
+
+Boolean values, nonfinite numbers, zero or negative limits, and unrelated
+connection arguments such as `proxy` or `additional_headers` are rejected.
+These options do not change the SDK's outgoing failed-send queue or the retry
+policy. For ordinary Responses requests, a transport failure before the first
+server event permits one reconnect and full-history resend. This applies to
+requests without tools or with only client-executed function tools. The original
+generation may already have started, so this bounded retry can duplicate remote
+generation; it is not an exactly-once guarantee.
+
+Any server event, including `response.created`, ends that retry window. Partial
+output, cancellation, explicit server errors, and submitted requests with
+server-executed tools or `background: true` are not automatically replayed.
+Explicit protocol, policy, message-size, and application-specific WebSocket
+close codes are also terminal; retry does not bypass those limits.
+An explicit `previous_response_not_found` still permits full-history recovery.
+Once a send has been attempted, exhausting the reconnect does not fall through
+to HTTP or the provider's additional retries, even if the reconnect itself
+failed before sending. Failures entirely before submission retain connection
+retry and HTTP-fallback behavior.
 
 ### Input
 
@@ -796,6 +876,31 @@ parent. The mapping is read when a sub-agent is created, so edits affect future
 jobs only. Conversation and Inspector Trace rows record the model actually bound
 to each new job, preferring its canonical profile selector and falling back to
 the raw model id.
+
+### OpenAI-compatible retries
+
+`OpenAIProvider` uses the framework's `retry_policy` to retry rate limits,
+server errors, and transient failures, including HTTP 408/409 and responses
+with `x-should-retry: true`. The OpenAI SDK's automatic
+retries are disabled, so a retry budget of `N` allows at most `N + 1` HTTP
+attempts for a retryable failure. With the default retry classes, a local-media
+configuration error such as
+`Cannot load local files without --allowed-local-media-path` fails after one
+request. This applies to streaming and non-streaming chat and remains in
+effect after credential reloads and model switches.
+
+Retries honor `retry-after-ms` and `Retry-After` (seconds or an HTTP date)
+when the requested delay is positive and at most 60 seconds, matching the
+SDK's limit. Otherwise they use the policy's exponential backoff and jitter.
+
+When constructing `OpenAIProvider` directly, `max_retries` supplies the budget
+if `retry_policy` is omitted; an explicit policy takes precedence. Defaults
+allow three retries. `max_retries=0`, or `retry_policy={"max_retries": 0}`,
+disables retries. Overflow recovery remains separate: it may compact or drop
+a tool round before sending a smaller request.
+
+These controls describe `OpenAIProvider`; LiteLLM and native Anthropic clients
+have their own retry behavior.
 
 ### Adding a custom LLM backend provider
 

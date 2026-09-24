@@ -1,11 +1,160 @@
-import { createPinia, setActivePinia } from "pinia"
-import { computed, isReactive } from "vue"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { createPinia, getActivePinia, setActivePinia } from "pinia"
+import { computed, isReactive, toRaw } from "vue"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { terrariumAPI } from "@/utils/api"
+import { subscribeAttentionEdges } from "./attention"
 import { _parseSlashCommand, _replayEvents, useChatStore } from "./chat.js"
 
 beforeEach(() => {
   setActivePinia(createPinia())
+  // Production getHistory delegates to getHistoryPage, so the fixture pages
+  // the other way: per-test leaf mocks on getHistory keep feeding every
+  // history test through the paged path. The cycle cannot close — tests
+  // either replace getHistory with a leaf mock or never load history.
+  vi.spyOn(terrariumAPI, "getHistoryPage").mockImplementation((id, tab) =>
+    terrariumAPI.getHistory(id, tab),
+  )
+})
+afterEach(() => {
+  for (const store of getActivePinia()._s.values()) store._cleanup?.()
+  vi.restoreAllMocks()
+})
+
+afterEach(() => {
+  useChatStore()._clearBranchResyncTimers()
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
+
+describe("chat store — websocket ownership", () => {
+  const OriginalWebSocket = globalThis.WebSocket
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    if (OriginalWebSocket === undefined) delete globalThis.WebSocket
+    else globalThis.WebSocket = OriginalWebSocket
+  })
+
+  function installFakeWebSocket() {
+    const sockets = []
+    class FakeWebSocket {
+      static CONNECTING = 0
+      static OPEN = 1
+      static CLOSING = 2
+      static CLOSED = 3
+
+      constructor(url) {
+        this.url = url
+        this.readyState = FakeWebSocket.CONNECTING
+        this.close = vi.fn(() => {
+          this.readyState = FakeWebSocket.CLOSED
+        })
+        sockets.push(this)
+      }
+    }
+    vi.stubGlobal("WebSocket", FakeWebSocket)
+    return sockets
+  }
+
+  it("can disable reconnects for an explicit-refresh host", () => {
+    vi.useFakeTimers()
+    const values = new Map()
+    vi.stubGlobal("localStorage", {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, String(value)),
+      removeItem: (key) => values.delete(key),
+    })
+    try {
+      const sockets = installFakeWebSocket()
+      const chat = useChatStore()
+      chat.initForInstance(
+        {
+          id: "explicit-refresh",
+          graph_id: "explicit-refresh",
+          session_id: "explicit-refresh",
+          type: "creature",
+          creatures: [{ name: "kohaku" }],
+          channels: [],
+        },
+        { autoReconnect: false },
+      )
+      sockets[0].onclose()
+      vi.runAllTimers()
+
+      expect(sockets).toHaveLength(1)
+      expect(chat._reconnectTimer).toBeNull()
+      expect(chat.wsStatus).toBe("closed")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("keeps reconnecting by default for Dashboard hosts", () => {
+    vi.useFakeTimers()
+    try {
+      const sockets = installFakeWebSocket()
+      const chat = useChatStore()
+      const reconnect = vi.fn()
+
+      chat._openWs({
+        generation: chat._instanceGeneration,
+        url: "ws://dashboard",
+        onOpen: vi.fn(),
+        reconnect,
+      })
+      sockets[0].onclose()
+      vi.advanceTimersByTime(500)
+
+      expect(reconnect).toHaveBeenCalledOnce()
+      expect(chat._reconnectTimer).toBeNull()
+      expect(chat.wsStatus).toBe("reconnecting")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("stores the socket raw, closes the previous owner, and rejects all stale callbacks", () => {
+    const sockets = installFakeWebSocket()
+    const chat = useChatStore()
+    const firstOpen = vi.fn()
+    const firstReconnect = vi.fn()
+    const onMessage = vi.spyOn(chat, "_onMessage")
+    const failOperation = vi.spyOn(chat, "_failBranchOperation")
+
+    chat._historyLoaded = true
+    chat.branchOperationByTab = { kohaku: { type: "regenerate" } }
+    chat._openWs({
+      generation: chat._instanceGeneration,
+      url: "ws://first",
+      onOpen: firstOpen,
+      reconnect: firstReconnect,
+    })
+    const first = sockets[0]
+    expect(chat._ws).toBe(first)
+    expect(isReactive(chat._ws)).toBe(false)
+
+    chat._openWs({
+      generation: chat._instanceGeneration,
+      url: "ws://second",
+      onOpen: vi.fn(),
+      reconnect: vi.fn(),
+    })
+    const second = sockets[1]
+    expect(first.close).toHaveBeenCalledOnce()
+
+    first.onopen()
+    first.onmessage({ data: JSON.stringify({ type: "attention_required" }) })
+    first.onerror(new Event("error"))
+    first.onclose()
+
+    expect(firstOpen).not.toHaveBeenCalled()
+    expect(onMessage).not.toHaveBeenCalled()
+    expect(failOperation).not.toHaveBeenCalled()
+    expect(firstReconnect).not.toHaveBeenCalled()
+    expect(chat._reconnectTimer).toBeNull()
+    expect(chat._ws).toBe(second)
+  })
 })
 
 describe("chat store — slash commands", () => {
@@ -531,6 +680,31 @@ describe("chat store — slash commands", () => {
     getHistory.mockRestore()
   })
 
+  it("passes one prepared history projection through the real Pinia resync path", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "session_1"
+    chat._instanceGraphId = "graph_1"
+    chat.messagesByTab = { kohaku: [] }
+    const events = [
+      { type: "user_input", content: "hello", event_id: 1, turn_index: 1, branch_id: 1 },
+      { type: "user_input", content: "hello", event_id: 2, turn_index: 1, branch_id: 1 },
+    ]
+    const importActual = await vi.importActual("@/utils/api")
+    const getHistory = vi
+      .spyOn(importActual.terrariumAPI, "getHistory")
+      .mockResolvedValue({ events, messages: [], is_processing: false })
+    const rebuild = vi.spyOn(chat, "_rebuildMessages")
+
+    await expect(chat._resyncHistory("kohaku")).resolves.toBe(true)
+
+    const prepared = rebuild.mock.calls[0][2]
+    expect(prepared.events).toBe(toRaw(chat.eventsByTab.kohaku))
+    expect(prepared.events).toHaveLength(1)
+    expect(prepared.branchMetadata.branchSelection).toEqual(new Map([[1, 1]]))
+    rebuild.mockRestore()
+    getHistory.mockRestore()
+  })
+
   it("anchors a command result before a later message while initial history is deferred", async () => {
     const chat = useChatStore()
     chat._instanceId = "session_1"
@@ -841,6 +1015,19 @@ describe("chat store — slash commands", () => {
     getHistory.mockRestore()
   })
 
+  it("does not append normal text when the websocket is unavailable", async () => {
+    const chat = useChatStore()
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "kohaku"
+    chat.messagesByTab = { kohaku: [] }
+    chat._ws = { readyState: WebSocket.CLOSED, send: vi.fn() }
+
+    await expect(chat.send([{ type: "text", text: "hello" }])).rejects.toThrow(/not connected/i)
+
+    expect(chat._ws.send).not.toHaveBeenCalled()
+    expect(chat.messagesByTab.kohaku).toEqual([])
+  })
+
   it("continues sending normal text over the websocket", async () => {
     const chat = useChatStore()
     chat._instanceGraphId = "graph_1"
@@ -876,6 +1063,37 @@ describe("chat store — slash commands", () => {
       command: "goal",
       args: "set X",
     })
+  })
+
+  it("sends channel text over HTTP while its existing websocket is closed", async () => {
+    const chat = useChatStore()
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "ch:team"
+    chat.messagesByTab = { "ch:team": [] }
+    const wsSend = vi.fn()
+    chat._ws = { readyState: WebSocket.CLOSED, send: wsSend }
+
+    const importActual = await vi.importActual("@/utils/api")
+    const channelSpy = vi.spyOn(importActual.terrariumAPI, "sendToChannel").mockResolvedValue({})
+
+    try {
+      await chat.send([{ type: "text", text: "hello team" }])
+
+      expect(channelSpy).toHaveBeenCalledWith(
+        "graph_1",
+        "team",
+        [{ type: "text", text: "hello team" }],
+        "human",
+      )
+      expect(wsSend).not.toHaveBeenCalled()
+      expect(chat.messagesByTab["ch:team"]).toHaveLength(1)
+      expect(chat.messagesByTab["ch:team"][0]).toMatchObject({
+        role: "user",
+        content: "hello team",
+      })
+    } finally {
+      channelSpy.mockRestore()
+    }
   })
 
   it("sends slash-prefixed channel text to the channel instead", async () => {
@@ -989,12 +1207,38 @@ describe("chat store — queued message edit/cancel (UXI-08a)", () => {
 })
 
 describe("chat store — UI reply routing (UXI-09)", () => {
+  it("submitUIReply leaves the prompt unresolved when the socket is unavailable", () => {
+    const chat = useChatStore()
+    const prompt = { role: "ui_event", eventId: "e1", replied: false }
+    chat.messagesByTab = { worker: [prompt] }
+    chat._ws = { readyState: WebSocket.CLOSED, send: vi.fn() }
+
+    expect(chat.submitUIReply("worker", "e1", "submit", { text: "hi" })).toBe(false)
+    expect(prompt).toEqual({ role: "ui_event", eventId: "e1", replied: false })
+    expect(chat._ws.send).not.toHaveBeenCalled()
+  })
+
+  it("submitUIReply restores the prompt when the socket closes during send", () => {
+    const chat = useChatStore()
+    const prompt = { role: "ui_event", eventId: "e1", replied: false }
+    chat.messagesByTab = { worker: [prompt] }
+    chat._ws = {
+      readyState: WebSocket.OPEN,
+      send: vi.fn(() => {
+        throw Error("closed")
+      }),
+    }
+
+    expect(chat.submitUIReply("worker", "e1", "submit", { text: "hi" })).toBe(false)
+    expect(prompt).toEqual({ role: "ui_event", eventId: "e1", replied: false })
+  })
+
   it("submitUIReply routes to the prompt's creature via target", () => {
     const chat = useChatStore()
     chat.messagesByTab = { worker: [{ role: "ui_event", eventId: "e1", replied: false }] }
     const wsSend = vi.fn()
     chat._ws = { readyState: WebSocket.OPEN, send: wsSend }
-    chat.submitUIReply("worker", "e1", "submit", { text: "hi" })
+    expect(chat.submitUIReply("worker", "e1", "submit", { text: "hi" })).toBe(true)
     expect(JSON.parse(wsSend.mock.calls[0][0])).toMatchObject({
       type: "ui_reply",
       target: "worker",
@@ -2337,7 +2581,7 @@ describe("chat store — multimodal edit + branch resync", () => {
 
     // Second poll: branch=2 events landed. Rebuild now safe; pending cleared.
     await expect(chat._resyncHistory("main")).resolves.toBe(true)
-    expect(rebuildSpy).toHaveBeenCalledWith("main", expect.any(Number))
+    expect(rebuildSpy).toHaveBeenCalledWith("main", expect.any(Number), expect.any(Object))
     expect(chat._branchResyncPendingByTab.main).toBeUndefined()
 
     rebuildSpy.mockRestore()
@@ -2397,10 +2641,41 @@ describe("chat store — multimodal edit + branch resync", () => {
     await chat._resyncHistory("main")
 
     expect(chat.branchViewByTab.main).toEqual({ 2: 1 })
-    expect(rebuildSpy).toHaveBeenCalledWith("main", expect.any(Number))
+    expect(rebuildSpy).toHaveBeenCalledWith("main", expect.any(Number), expect.any(Object))
 
     rebuildSpy.mockRestore()
     getHistory.mockRestore()
+  })
+})
+
+describe("chat store — public instance lifecycle", () => {
+  it("unbinds transport and timers and remains reusable", () => {
+    const chat = useChatStore()
+    const close = vi.fn()
+    const stop = vi.fn()
+    const beforeGeneration = chat._instanceGeneration
+
+    chat._instanceId = "runtime-1"
+    chat.tabs = ["alpha"]
+    chat.activeTab = "alpha"
+    chat._reconnectTimer = setTimeout(() => {}, 60_000)
+    chat._ws = { close, onopen: vi.fn(), onmessage: vi.fn(), onclose: vi.fn(), onerror: vi.fn() }
+    chat._jobTimer = { stop }
+
+    chat.unbindFromInstance()
+
+    expect(close).toHaveBeenCalledOnce()
+    expect(stop).toHaveBeenCalledOnce()
+    expect(chat._reconnectTimer).toBeNull()
+    expect(chat._ws).toBeNull()
+    expect(chat.wsStatus).toBe("closed")
+    expect(chat._instanceGeneration).toBeGreaterThan(beforeGeneration)
+    expect(chat._instanceId).toBeNull()
+    expect(chat.tabs).toEqual([])
+
+    chat.unbindFromInstance()
+    expect(close).toHaveBeenCalledOnce()
+    expect(stop).toHaveBeenCalledOnce()
   })
 })
 
@@ -5354,6 +5629,13 @@ describe("chat store — interrupt targets the given tab", () => {
 
     const importActual = await vi.importActual("@/utils/api")
     const spy = vi.spyOn(importActual.terrariumAPI, "interruptCreature").mockResolvedValue({})
+    const history = vi
+      .spyOn(importActual.terrariumAPI, "getHistory")
+      .mockResolvedValue({ events: [], messages: [], is_processing: false })
+    spy.mockImplementation(async () => {
+      chat._onMessage({ type: "processing_end", source: "root_b" })
+      return { status: "interrupted" }
+    })
 
     await chat.interrupt("root_b")
 
@@ -5364,6 +5646,8 @@ describe("chat store — interrupt targets the given tab", () => {
     expect(chat.processingByTab.root_a).toBe(true)
 
     spy.mockRestore()
+    history.mockRestore()
+    chat._clearBranchResyncTimers()
   })
 })
 
@@ -5634,5 +5918,195 @@ describe("chat store — concurrent history resyncs apply in order", () => {
 
     chat._clearBranchResyncTimers()
     getHistorySpy.mockRestore()
+  })
+})
+
+describe("chat store — drive-turn transcript marker", () => {
+  it("live drive_turn activity inserts a trigger message with the goal identity", () => {
+    const chat = useChatStore()
+    chat.messagesByTab = { main: [{ id: "m1", role: "assistant", parts: [] }] }
+    chat.activeTab = "main"
+    chat._handleActivity("main", {
+      type: "activity",
+      activity_type: "drive_turn",
+      name: "unknown",
+      drive_id: "goal-abc",
+      drive_kind: "goal",
+      delivery_reason: "resume",
+      objective: "ship the release",
+    })
+    const marker = chat.messagesByTab.main.at(-1)
+    expect(marker.role).toBe("trigger")
+    expect(marker.content).toBe("drive turn: goal goal-abc (resume)")
+    expect(marker.triggerContent).toBe("ship the release")
+    expect(marker.driveId).toBe("goal-abc")
+  })
+
+  it("history replay renders the persisted drive_turn activity the same way", () => {
+    const events = [
+      { type: "processing_start" },
+      {
+        type: "activity",
+        activity_type: "drive_turn",
+        drive_id: "goal-abc",
+        drive_kind: "goal",
+        delivery_reason: "activated",
+        objective: "ship the release",
+      },
+      { type: "text", content: "working on it" },
+      { type: "processing_end" },
+    ]
+    const { messages: replayed } = _replayEvents([], events)
+    const marker = replayed.find((m) => m.role === "trigger")
+    expect(marker).toBeTruthy()
+    expect(marker.content).toBe("drive turn: goal goal-abc (activated)")
+    expect(marker.triggerContent).toBe("ship the release")
+    // The marker sits right after the turn shell processing_start opens.
+    expect(replayed.indexOf(marker)).toBe(1)
+  })
+})
+
+describe("chat store — attention edge summaries", () => {
+  it("summarizes a completed live response from the streamed text parts", () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    chat.tabs = ["main"]
+    chat.messagesByTab = { main: [] }
+
+    const edges = []
+    const unsubscribe = subscribeAttentionEdges((edge) => edges.push(edge))
+    chat._onMessage({ type: "processing_start", source: "main" })
+    chat._onMessage({ type: "text", source: "main", content: "Deploy finished. " })
+    chat._onMessage({ type: "text", source: "main", content: "All checks passed." })
+    chat._onMessage({ type: "processing_end", source: "main" })
+    unsubscribe()
+
+    expect(edges).toHaveLength(1)
+    expect(edges[0]).toMatchObject({
+      kind: "completed",
+      summary: "Deploy finished. All checks passed.",
+    })
+  })
+
+  it("summarizes the completed turn even when its chunks stream on a non-viewed branch", () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    chat.tabs = ["main"]
+    chat.messagesByTab = { main: [] }
+    // The user is viewing branch 1 while the regen streams on branch 2:
+    // the branch-isolation gate drops the chunks from the displayed list.
+    chat.branchViewByTab = { main: { 1: 1 } }
+
+    const edges = []
+    const unsubscribe = subscribeAttentionEdges((edge) => edges.push(edge))
+    chat._onMessage({
+      type: "processing_start",
+      source: "main",
+      turn_index: 1,
+      branch_id: 2,
+    })
+    chat._onMessage({
+      type: "text",
+      source: "main",
+      content: "Regenerated answer.",
+      turn_index: 1,
+      branch_id: 2,
+    })
+    chat._onMessage({
+      type: "processing_end",
+      source: "main",
+      turn_index: 1,
+      branch_id: 2,
+    })
+    unsubscribe()
+
+    // Display isolation is intact…
+    expect(chat.messagesByTab.main.some((m) => m.role === "assistant")).toBe(false)
+    // …but the notification still previews the response that just completed.
+    expect(edges).toHaveLength(1)
+    expect(edges[0]).toMatchObject({ kind: "completed", summary: "Regenerated answer." })
+  })
+
+  it("does not surface a stale preview when a later turn completes without text", () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    chat.tabs = ["main"]
+    chat.messagesByTab = { main: [] }
+
+    const edges = []
+    const unsubscribe = subscribeAttentionEdges((edge) => edges.push(edge))
+    chat._onMessage({ type: "processing_start", source: "main" })
+    chat._onMessage({ type: "text", source: "main", content: "First turn answer." })
+    chat._onMessage({ type: "processing_end", source: "main" })
+    chat._onMessage({ type: "processing_start", source: "main" })
+    chat._onMessage({ type: "processing_end", source: "main" })
+    unsubscribe()
+
+    expect(edges).toHaveLength(2)
+    expect(edges[0]).toMatchObject({ kind: "completed", summary: "First turn answer." })
+    expect(edges[1]).toMatchObject({ kind: "completed" })
+    expect(edges[1].summary).toBeUndefined()
+  })
+
+  it("summarizes an interactive prompt from its frame payload", () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    chat.tabs = ["main"]
+    chat.messagesByTab = { main: [] }
+
+    const edges = []
+    const unsubscribe = subscribeAttentionEdges((edge) => edges.push(edge))
+    chat._onMessage({
+      type: "ask_text",
+      source: "main",
+      event_id: "prompt-1",
+      interactive: true,
+      surface: "chat",
+      payload: { prompt: "Deploy the staging build?" },
+    })
+    unsubscribe()
+
+    expect(edges).toHaveLength(1)
+    expect(edges[0]).toMatchObject({
+      kind: "waiting-input",
+      eventId: "prompt-1",
+      summary: "Deploy the staging build?",
+    })
+  })
+})
+
+describe("chat store — attention accumulator bounds", () => {
+  it("bounds the retained stream copy while preserving the summary", () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    chat.tabs = ["main"]
+    chat.messagesByTab = { main: [] }
+
+    const edges = []
+    const unsubscribe = subscribeAttentionEdges((edge) => edges.push(edge))
+    chat._onMessage({ type: "processing_start", source: "main" })
+    const bigWord = "x".repeat(50)
+    for (let i = 0; i < 100; i++) {
+      chat._onMessage({ type: "text", source: "main", content: `${bigWord} ` })
+    }
+    // The retained accumulator never grows past the ceiling despite ~5000
+    // streamed characters.
+    expect(chat._attentionStreamTextByTab.main.length).toBeLessThanOrEqual(400)
+    chat._onMessage({ type: "processing_end", source: "main" })
+    unsubscribe()
+
+    expect(edges).toHaveLength(1)
+    expect(edges[0].summary).toHaveLength(200)
+    expect(edges[0].summary.endsWith("…")).toBe(true)
   })
 })

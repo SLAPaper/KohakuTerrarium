@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,9 +29,18 @@ _EXPIRY_SKEW_SECONDS = 30
 _GROK_CLI_REFRESH_WINDOW_SECONDS = 30 * 60
 _GROK_CLI_REFRESH_TIMEOUT_SECONDS = 20.0
 _refresh_tasks: dict[asyncio.AbstractEventLoop, asyncio.Task["GrokToken | None"]] = {}
+_grok_version_cache: dict[tuple[str, int], str] = {}
 _GROK_VERSION_PATTERN = re.compile(
     r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)*(?: \([0-9A-Fa-f]+\))?$"
 )
+
+
+class GrokAuthError(Exception):
+    """A redacted CLI credential failure. ``kind`` is auth_expired or unavailable."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        super().__init__(f"Grok auth {kind}")
 
 
 @dataclass(frozen=True)
@@ -74,14 +84,23 @@ class GrokTokens:
         return [token] if token and _grok_cli_executable() else []
 
     @classmethod
+    def load_cli_candidate(cls) -> GrokToken | None:
+        """Return the CLI token even when expired, independent of OpenCode."""
+        return _load_grok_cli_token()
+
+    @classmethod
     def available(cls) -> bool:
         """Return whether a valid or CLI-refreshable local login exists."""
         return bool(cls.load_bootstrap_candidates())
 
     @classmethod
     async def ensure_fresh_cli(cls, *, force: bool = False) -> GrokToken | None:
-        """Ask Grok CLI to refresh its token when due, sharing concurrent work."""
-        current = _load_grok_cli_token()
+        """Ask Grok CLI to refresh its token when due, sharing concurrent work.
+
+        Auth-file and version lookups run off the event loop. Unexpected refresh
+        failures are redacted rather than returned with raw exception text.
+        """
+        current = await asyncio.to_thread(_load_grok_cli_token)
         if current is None:
             return None
         if not force and not _needs_cli_refresh(current):
@@ -145,8 +164,12 @@ def _needs_cli_refresh(token: GrokToken, now: float | None = None) -> bool:
 
 
 async def _refresh_grok_cli(before: GrokToken, *, force: bool) -> GrokToken | None:
-    await _run_grok_models()
-    refreshed = _load_grok_cli_token()
+    try:
+        await _run_grok_models()
+        refreshed = await asyncio.to_thread(_load_grok_cli_token)
+    except Exception as exc:
+        logger.warning("Grok CLI credential refresh failed", error=type(exc).__name__)
+        raise GrokAuthError("unavailable") from exc
     if refreshed is None or _needs_cli_refresh(refreshed):
         return None
     if force and refreshed.access_token == before.access_token:
@@ -156,7 +179,7 @@ async def _refresh_grok_cli(before: GrokToken, *, force: bool) -> GrokToken | No
 
 async def _run_grok_models() -> bool:
     """Run a non-generating CLI command; auth-file changes prove refresh."""
-    executable = _grok_cli_executable()
+    executable = await asyncio.to_thread(_grok_cli_executable)
     if executable is None:
         return False
     try:
@@ -188,9 +211,11 @@ def _grok_cli_executable() -> str | None:
     executable = shutil.which("grok")
     if executable:
         return executable
-    bundled = _grok_home() / "bin" / "grok"
-    if bundled.is_file() and os.access(bundled, os.X_OK):
-        return str(bundled)
+    bin_dir = _grok_home() / "bin"
+    for name in ("grok", "grok.exe"):
+        bundled = bin_dir / name
+        if bundled.is_file() and os.access(bundled, os.X_OK):
+            return str(bundled)
     return None
 
 
@@ -208,6 +233,10 @@ def _grok_cli_headers() -> dict[str, str]:
 
 
 def _read_grok_cli_version() -> str:
+    executable_version = _read_grok_cli_executable_version()
+    if executable_version:
+        return executable_version
+
     path = _grok_home() / ".metadata_version"
     try:
         version = path.read_text(encoding="utf-8").strip()
@@ -224,6 +253,49 @@ def _read_grok_cli_version() -> str:
         logger.warning("Ignoring invalid Grok CLI version metadata", path=str(path))
         return ""
     return version
+
+
+def _read_grok_cli_executable_version() -> str:
+    """Return the installed CLI version without trusting mutable auth data."""
+    executable = _grok_cli_executable()
+    if executable is None:
+        return ""
+    try:
+        stamp = Path(executable).stat().st_mtime_ns
+    except OSError:
+        return ""
+    cache_key = (executable, stamp)
+    cached = _grok_version_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5.0,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        result = None
+    match = (
+        re.search(
+            r"(?:^|\s)grok\s+([0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)*)",
+            result.stdout,
+        )
+        if result is not None and result.returncode == 0
+        else None
+    )
+    version = match.group(1) if match else ""
+    _grok_version_cache.clear()
+    _grok_version_cache[cache_key] = version
+    if version and _GROK_VERSION_PATTERN.fullmatch(version):
+        return version
+    return ""
 
 
 def _load_opencode_token() -> GrokToken | None:
@@ -302,6 +374,7 @@ __all__ = [
     "GROK_CLI_BASE_URL",
     "OPENCODE_SOURCE",
     "XAI_BASE_URL",
+    "GrokAuthError",
     "GrokToken",
     "GrokTokens",
 ]

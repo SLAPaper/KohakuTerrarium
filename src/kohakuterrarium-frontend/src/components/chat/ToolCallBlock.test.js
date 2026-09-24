@@ -18,7 +18,10 @@ beforeEach(() => {
 
 // Render MarkdownRenderer's content into a ``.md`` div so tests can tell
 // markdown-rendered text from raw monospace (tool / system) blocks.
-const MarkdownStub = { props: ["content"], template: `<div class="md">{{ content }}</div>` }
+const MarkdownStub = {
+  props: ["content", "origin"],
+  template: `<div class="md" :data-origin="origin">{{ content }}</div>`,
+}
 
 function mountBlock(tc, expanded = true) {
   const chat = useChatStore()
@@ -30,6 +33,20 @@ function mountBlock(tc, expanded = true) {
   })
   return wrapper
 }
+
+it("passes the Dashboard origin to tool-result Markdown", () => {
+  const href = `${window.location.origin}/sessions/tool-result`
+  const wrapper = mountBlock({
+    type: "tool",
+    id: "tool-origin",
+    name: "read",
+    kind: "tool",
+    status: "done",
+    resultParts: [{ type: "text", text: `[session](${href})` }],
+  })
+
+  expect(wrapper.get(".md").attributes("data-origin")).toBe(window.location.origin)
+})
 
 function convButton(wrapper) {
   return wrapper.findAll("button").find((b) => b.text().includes("Conversation"))
@@ -104,6 +121,33 @@ describe("ToolCallBlock — generated artifacts", () => {
     )
 
     expect(wrapper.find(`video[src="${videoUrl}"]`).exists()).toBe(true)
+  })
+
+  it("folds media away with the block when the tool's policy is not pinned", async () => {
+    const seen = "file:///tmp/seen.png"
+    const tc = {
+      type: "tool",
+      id: "t-read-image",
+      name: "read",
+      kind: "tool",
+      args: { path: "/tmp/seen.png" },
+      status: "done",
+      result: "Image: /tmp/seen.png",
+      resultParts: [
+        { type: "text", text: "Image: /tmp/seen.png" },
+        { type: "image_url", image_url: { url: seen }, meta: { source_type: "file" } },
+      ],
+      resultMeta: { media: { persist: false, pinned: false } },
+    }
+    const collapsed = mountBlock(tc, false)
+    expect(collapsed.find("img").exists()).toBe(false)
+    expect(collapsed.find('[data-testid="tool-media-pinned"]').exists()).toBe(false)
+
+    const expanded = mountBlock(tc, true)
+    const img = expanded.find('[data-testid="tool-media-collapsible"] img')
+    expect(img.exists()).toBe(true)
+    // A file reference loads through the raw file route, never as file://.
+    expect(img.attributes("src")).toBe("/api/files/raw?path=%2Ftmp%2Fseen.png")
   })
 
   it("does not preview media from non-artifact URLs", () => {

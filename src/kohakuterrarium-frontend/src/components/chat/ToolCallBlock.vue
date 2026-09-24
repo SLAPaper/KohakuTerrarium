@@ -15,9 +15,10 @@
       <span v-if="tc.result || tc.tools_used?.length || tc.children?.length || tc.status === 'running'" class="i-carbon-chevron-down text-warm-400 transition-transform text-[10px] shrink-0" :class="{ 'rotate-180': expanded }" />
     </div>
 
-    <!-- Generated media stays visible even when verbose tool details are collapsed. -->
-    <div v-if="tc.kind !== 'subagent' && mediaParts.length" class="flex flex-col gap-2 p-2 border-t border-sapphire/15 dark:border-sapphire/20 bg-sapphire/4 dark:bg-sapphire/6">
-      <template v-for="(part, i) in mediaParts" :key="i">
+    <!-- Pinned media (the tool's product) stays visible while details are collapsed;
+         the tool's media policy decides, so a file the creature merely looked at folds away. -->
+    <div v-if="tc.kind !== 'subagent' && pinnedMediaParts.length" class="flex flex-col gap-2 p-2 border-t border-sapphire/15 dark:border-sapphire/20 bg-sapphire/4 dark:bg-sapphire/6" data-testid="tool-media-pinned">
+      <template v-for="(part, i) in pinnedMediaParts" :key="i">
         <img v-if="part.type === 'image_url'" :src="part.image_url.url" class="tool-inline-image" />
         <VideoFilePreview v-else :file="part.file" />
       </template>
@@ -36,13 +37,13 @@
             <template v-if="tc.resultParts?.length">
               <div class="flex flex-col gap-2">
                 <template v-for="(part, i) in tc.resultParts" :key="i">
-                  <MarkdownRenderer v-if="part.type === 'text'" :content="part.text || ''" />
+                  <MarkdownRenderer v-if="part.type === 'text'" :content="part.text || ''" :origin="markdownOrigin" />
                   <img v-else-if="part.type === 'image_url'" :src="part.image_url?.url" class="tool-inline-image" />
                   <VideoFilePreview v-else-if="part.type === 'file' && part.file?.mime?.startsWith('video/')" :file="part.file" />
                 </template>
               </div>
             </template>
-            <MarkdownRenderer v-else :content="tc.result" />
+            <MarkdownRenderer v-else :content="tc.result" :origin="markdownOrigin" />
           </div>
         </div>
         <div v-else-if="tc.status === 'interrupted'" class="px-3 py-2 text-xs text-amber dark:text-amber-light bg-amber/6 dark:bg-amber/10">(interrupted)</div>
@@ -75,12 +76,19 @@
         </div>
       </template>
       <template v-else>
+        <!-- Collapsible media: shown only while the block is expanded. -->
+        <div v-if="collapsibleMediaParts.length" class="flex flex-col gap-2 p-2 border-b border-sapphire/15 dark:border-sapphire/20 bg-sapphire/4 dark:bg-sapphire/6" data-testid="tool-media-collapsible">
+          <template v-for="(part, i) in collapsibleMediaParts" :key="i">
+            <img v-if="part.type === 'image_url'" :src="part.image_url.url" class="tool-inline-image" />
+            <VideoFilePreview v-else :file="part.file" />
+          </template>
+        </div>
         <!-- Tool raw output, scrollable accordion -->
         <div v-if="detailParts.length || !tc.resultParts?.length" ref="resultEl" class="text-xs font-mono px-3 py-2 text-warm-500 dark:text-warm-400 whitespace-pre-wrap max-h-64 overflow-y-auto overflow-x-hidden bg-sapphire/4 dark:bg-sapphire/6 min-w-0 break-all" @scroll="onResultScroll">
           <template v-if="detailParts.length">
             <div class="flex flex-col gap-2">
               <template v-for="(part, i) in detailParts" :key="i">
-                <MarkdownRenderer v-if="part.type === 'text'" :content="part.text || ''" />
+                <MarkdownRenderer v-if="part.type === 'text'" :content="part.text || ''" :origin="markdownOrigin" />
               </template>
             </div>
           </template>
@@ -103,12 +111,16 @@
 </template>
 
 <script setup>
-import MarkdownRenderer from "@/components/common/MarkdownRenderer.vue"
-import VideoFilePreview from "@/components/chat/VideoFilePreview.vue"
-import SubagentConversationPanel from "@/components/subagents/SubagentConversationPanel.vue"
+import { computed, inject } from "vue"
+
 import { useChatStore } from "@/stores/chat"
-import { safeArtifactUrl, safeMediaParts } from "@/utils/artifacts"
-import { useI18n } from "@/utils/i18n"
+
+import MarkdownRenderer from "../../public/chat/MarkdownRenderer.vue"
+import { safeArtifactUrl, safeMediaParts } from "../../public/chat/mediaRefs.js"
+import { usePlatformOrigin } from "../../public/chat/platformOrigin.js"
+import { useI18n } from "../../utils/i18n"
+import SubagentConversationPanel from "../subagents/SubagentConversationPanel.vue"
+import VideoFilePreview from "./VideoFilePreview.vue"
 
 const props = defineProps({
   tc: { type: Object, required: true },
@@ -117,9 +129,20 @@ const props = defineProps({
 })
 
 const emit = defineEmits(["toggle"])
-const chat = useChatStore()
+const chat = inject("chatStore", null) || useChatStore()
 const { t } = useI18n()
+// The shared platform-origin seam (installed by the host) owns the origin
+// tool-result Markdown links resolve against. It is left uninstalled by the
+// Dashboard, which keeps the browser origin; the VS Code webview installs an
+// explicit value so its opaque document origin is never treated as backend.
+const platformOrigin = usePlatformOrigin()
+const markdownOrigin = computed(() => (platformOrigin !== undefined ? platformOrigin : typeof window !== "undefined" ? window.location.origin : null))
 const mediaParts = computed(() => safeMediaParts(props.tc.resultParts))
+// The tool's media policy (``session_metadata.media``) decides whether its
+// media is pinned above the fold; absent metadata keeps the pinned default.
+const mediaPinned = computed(() => props.tc.resultMeta?.media?.pinned !== false)
+const pinnedMediaParts = computed(() => (mediaPinned.value ? mediaParts.value : []))
+const collapsibleMediaParts = computed(() => (mediaPinned.value ? [] : mediaParts.value))
 const detailParts = computed(() => (Array.isArray(props.tc.resultParts) ? props.tc.resultParts : []).filter((part) => part?.type !== "image_url" && !(part?.type === "file" && part.file?.mime?.startsWith("video/"))))
 const artifactLinks = computed(() =>
   (Array.isArray(props.tc.resultMeta?.artifacts) ? props.tc.resultMeta.artifacts : [])

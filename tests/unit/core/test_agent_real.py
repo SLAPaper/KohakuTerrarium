@@ -4054,8 +4054,10 @@ class TestInterruptMidStream:
                 )
 
             agent._run_single_turn = fake_run_single_turn
-            await agent._process_event(create_user_input_event("hi"))
-            assert agent._interrupt_requested is False
+            event = create_user_input_event("hi")
+            await agent._process_event(event)
+            assert event.context["interrupted_by_user"] is True
+            assert agent._interrupt_requested is True  # reset by the next turn
         finally:
             await agent.stop()
 
@@ -5938,6 +5940,9 @@ class TestMidTurnBatchDrain:
             assert len(banners) == 1
             assert banners[0]["job_id"] == "grep_abc123"
             assert banners[0]["kind"] == "tool"
+            # The banner event rides the sink's write-behind queue (S4b);
+            # drain before asserting on the persisted store.
+            await agent._session_output.drain()
             events = store.get_events("test_agent")
             persisted = [e for e in events if e.get("type") == "background_result"]
             assert len(persisted) == 1
@@ -6175,4 +6180,107 @@ class TestMidTurnBatchDrain:
             if not turn.done():
                 turn.cancel()
                 await asyncio.gather(turn, return_exceptions=True)
+            await agent.stop()
+
+
+# ── Drive turns: interrupt-drop settlement + transcript marker ────
+
+
+class TestDriveTurnIntegration:
+    async def test_interrupt_drops_queued_drive_events_as_user_interrupted(
+        self, make_agent
+    ):
+        # A queued delivery the user interrupted must settle as a user
+        # interrupt so the dispatcher pauses the drive instead of retrying.
+        from kohakuterrarium.core.event_inbox import EventEnvelope
+        from kohakuterrarium.core.events import TriggerEvent
+
+        agent = make_agent()
+        await agent.start()
+        try:
+            loop = asyncio.get_running_loop()
+            env = EventEnvelope(
+                event=TriggerEvent(
+                    type="drive_ready",
+                    content="",
+                    context={"drive_id": "goal-1"},
+                    stackable=False,
+                ),
+                future=loop.create_future(),
+            )
+            agent._event_inbox.put(env)
+            agent.interrupt()
+            outcome = env.future.result()
+            assert outcome.status == "interrupted"
+            assert outcome.interrupted_by_user is True
+            assert agent._event_inbox.empty()
+        finally:
+            agent._interrupt_requested = False
+            await agent.stop()
+
+    async def test_drive_turn_marker_carries_goal_identity(self, make_agent):
+        from kohakuterrarium.core.events import TriggerEvent
+
+        agent = make_agent()
+        seen = []
+        agent.output_router.notify_activity = lambda kind, detail, metadata=None: (
+            seen.append((kind, detail, metadata or {}))
+        )
+        event = TriggerEvent(
+            type="drive_resume",
+            content="",
+            context={
+                "drive_id": "goal-abc",
+                "drive_kind": "goal",
+                "delivery_reason": "resume",
+                "delivery_id": "del-1",
+                "drive": {"kind": "goal", "objective": "ship the release"},
+            },
+            stackable=False,
+        )
+        agent._notify_drive_turn(event)
+        assert len(seen) == 1
+        kind, detail, meta = seen[0]
+        assert kind == "drive_turn"
+        assert detail == "[drive] goal goal-abc (resume): ship the release"
+        assert meta["drive_id"] == "goal-abc"
+        assert meta["delivery_reason"] == "resume"
+        assert meta["delivery_id"] == "del-1"
+        assert meta["objective"] == "ship the release"
+
+    async def test_marker_emitted_only_for_drive_started_turns(self, make_agent):
+        from kohakuterrarium.core.events import TriggerEvent
+
+        agent = make_agent(script=["reply one", "reply two"])
+        seen = []
+        orig = agent.output_router.notify_activity
+
+        def spy(kind, detail="", metadata=None, **kw):
+            seen.append((kind, metadata or {}))
+            return orig(kind, detail, metadata=metadata, **kw)
+
+        agent.output_router.notify_activity = spy
+        await agent.start()
+        try:
+            await agent.run("hi")
+            assert not [k for k, _ in seen if k == "drive_turn"]
+            result = await agent.run_event(
+                TriggerEvent(
+                    type="drive_ready",
+                    content="",
+                    context={
+                        "drive_id": "goal-xyz",
+                        "drive_kind": "goal",
+                        "delivery_reason": "activated",
+                        "drive": {"kind": "goal", "objective": "do the thing"},
+                    },
+                    stackable=False,
+                )
+            )
+            assert result.status == "ok"
+            markers = [m for k, m in seen if k == "drive_turn"]
+            assert len(markers) == 1
+            assert markers[0]["drive_id"] == "goal-xyz"
+            assert markers[0]["objective"] == "do the thing"
+        finally:
             await agent.stop()

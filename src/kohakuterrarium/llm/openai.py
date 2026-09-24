@@ -3,10 +3,12 @@ Provide streaming and complete chat access to OpenAI-compatible endpoints.
 """
 
 import asyncio
+from contextlib import aclosing
 from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
+from kohakuterrarium.llm import responses_ws_options as ws_options
 from kohakuterrarium.llm.anthropic_cache import (
     apply_anthropic_cache_markers,
     is_anthropic_endpoint,
@@ -42,8 +44,8 @@ from kohakuterrarium.llm.openai_ws import stream_ws_turn
 from kohakuterrarium.llm.recovery import (
     ErrorClass,
     RetryPolicy,
-    backoff_delay,
     classify_openai_error,
+    retry_delay,
 )
 from kohakuterrarium.llm.responses_ws import ResponsesWSError, ResponsesWSSession
 from kohakuterrarium.utils.logging import get_logger
@@ -77,7 +79,7 @@ class OpenAIProvider(BaseLLMProvider):
         retry_policy: RetryPolicy | dict[str, Any] | None = None,
         websocket_mode: bool = False,
     ):
-        """Configure an OpenAI-compatible client and optional stateful reasoning echo."""
+        """Configure the client, using max_retries when retry_policy is omitted."""
         super().__init__(
             LLMConfig(
                 model=model,
@@ -88,17 +90,22 @@ class OpenAIProvider(BaseLLMProvider):
         )
 
         self.extra_body = extra_body or {}
+        self._ws_connection_options = ws_options.build_websocket_connection_options(
+            self.extra_body.get("websocket_connection_options"), timeout=timeout
+        )
         self._websocket_mode = bool(
             websocket_mode or self.extra_body.get("websocket_mode")
         )
         self._ws_session: ResponsesWSSession | None = None
         self.echo_reasoning = bool(echo_reasoning)
-        self._retry_policy = RetryPolicy.from_value(retry_policy)
+        self._retry_policy = RetryPolicy.from_value(
+            {"max_retries": max_retries} if retry_policy is None else retry_policy
+        )
         self._api_key = api_key
         self._base_url_input = base_url
         self._timeout = timeout
         self._extra_headers = extra_headers or {}
-        self._max_retries = max_retries
+        self._max_retries = 0
         self._last_usage: dict[str, int] = {}
         self._last_assistant_extra_fields: dict[str, Any] = {}
         self.prompt_cache_key: str | None = None
@@ -115,7 +122,7 @@ class OpenAIProvider(BaseLLMProvider):
             api_key=api_key,
             base_url=base_url,
             timeout=timeout,
-            max_retries=max_retries,
+            max_retries=self._max_retries,
             default_headers=extra_headers or {},
         )
 
@@ -159,6 +166,7 @@ class OpenAIProvider(BaseLLMProvider):
         )
         clone.extra_body = dict(self.extra_body)
         clone._websocket_mode = self._websocket_mode
+        clone._ws_connection_options = dict(self._ws_connection_options)
         clone._ws_session = None
         clone.echo_reasoning = self.echo_reasoning
         clone._retry_policy = self._retry_policy
@@ -225,7 +233,10 @@ class OpenAIProvider(BaseLLMProvider):
 
             def _factory() -> Any:
                 # Late-bound so credential reloads pick up the rebuilt client.
-                return self._client.responses.connect(max_retries=0)
+                return self._client.responses.connect(
+                    max_retries=0,
+                    websocket_connection_options=dict(self._ws_connection_options),
+                )
 
             self._ws_session = ResponsesWSSession(_factory)
         if self._ws_session.busy:
@@ -246,7 +257,7 @@ class OpenAIProvider(BaseLLMProvider):
 
     def _sanitize_extra_body(self, extra: dict[str, Any]) -> dict[str, Any]:
         """Remove framework-only request knobs before provider submission."""
-        knobs = ("disable_prompt_caching", "websocket_mode")
+        knobs = ws_options.FRAMEWORK_KNOBS
         if not any(k in extra for k in knobs):
             return extra
         return {k: v for k, v in extra.items() if k not in knobs}
@@ -270,12 +281,17 @@ class OpenAIProvider(BaseLLMProvider):
         overflow_state = OverflowRecoveryState()
         while True:
             try:
-                async for chunk in self._raw_stream_chat(
-                    current, tools=tools, **kwargs
-                ):
-                    yield chunk
+                async with aclosing(
+                    self._raw_stream_chat(current, tools=tools, **kwargs)
+                ) as stream:
+                    async for chunk in stream:
+                        yield chunk
                 return
             except Exception as exc:
+                if isinstance(exc, ResponsesWSError) and (
+                    exc.submitted or exc.mid_stream
+                ):
+                    raise
                 cls = classify_openai_error(exc)
                 if cls is ErrorClass.OVERFLOW:
                     replacement = await self._recover_from_overflow(
@@ -289,7 +305,7 @@ class OpenAIProvider(BaseLLMProvider):
                     and attempt < self._retry_policy.max_retries
                 ):
                     attempt += 1
-                    delay = backoff_delay(attempt, self._retry_policy)
+                    delay = retry_delay(exc, attempt, self._retry_policy)
                     logger.warning(
                         "provider_retry",
                         attempt=attempt,
@@ -316,13 +332,14 @@ class OpenAIProvider(BaseLLMProvider):
             session = self._ws_session_for_turn()
             if session is not None:
                 try:
-                    async for piece in stream_ws_turn(
-                        self, session, messages, tools, kwargs
-                    ):
-                        yield piece
+                    async with aclosing(
+                        stream_ws_turn(self, session, messages, tools, kwargs)
+                    ) as stream:
+                        async for piece in stream:
+                            yield piece
                     return
                 except ResponsesWSError as exc:
-                    if exc.mid_stream:
+                    if exc.mid_stream or exc.submitted:
                         raise
                     logger.warning(
                         "Responses WebSocket turn unavailable, using HTTP",
@@ -507,7 +524,7 @@ class OpenAIProvider(BaseLLMProvider):
                     and attempt < self._retry_policy.max_retries
                 ):
                     attempt += 1
-                    delay = backoff_delay(attempt, self._retry_policy)
+                    delay = retry_delay(exc, attempt, self._retry_policy)
                     logger.warning(
                         "provider_retry",
                         attempt=attempt,

@@ -126,9 +126,19 @@ share Codex tokens with workers in a way that survives refresh.
 
 ### From the UI
 
-In the dashboard's "New creature" modal, the **Site** picker shows
-every connected worker plus `Host`. Pick a worker, configure as
-usual, click Spawn. The frontend posts:
+In the dashboard's "New creature" modal, the **Run on** picker shows
+the connected workers, including when only one is connected. The initial
+selection uses an available worker; the coordination host cannot execute a
+creature. If the selected worker disconnects, choose a site again before
+starting. Pick a worker, configure as usual, click Start.
+Creature choices reload from the selected worker's installed
+packages and local configuration roots (`KT_CREATURES_DIRS`, `./creatures`, and
+`./agents` on that worker). Switching workers clears the previous choice.
+If discovery fails, the modal reports the error instead of showing host choices;
+older workers without the discovery operation need to be updated.
+
+The same list is available through `GET /api/configs/creatures?on_node=<worker>`.
+Omitting `on_node` preserves host-local discovery. The frontend posts:
 
 ```http
 POST /api/sessions/active/creature
@@ -140,6 +150,14 @@ POST /api/sessions/active/creature
 
 (In lab-host mode, `on_node` is required for `start_creature`;
 spawning on the host is rejected because the host runs no agents.)
+
+`config_path` can also be a package reference such as
+`@kt-biome/creatures/general`. The selected worker resolves it using its own
+installed packages; the host does not need the same package or directory layout.
+Install the package on that worker with `kt install @kt-biome`, using the same
+`KT_CONFIG_DIR` as the worker's `--home-dir` when a custom home is configured.
+Starting a creature does not install missing packages automatically. Ordinary
+filesystem paths must still be absolute paths on the worker.
 
 ### From the HTTP API
 

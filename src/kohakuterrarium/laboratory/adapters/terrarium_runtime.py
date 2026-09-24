@@ -61,6 +61,7 @@ from kohakuterrarium.terrarium.wire import (
     unpack_creature_build_input,
 )
 from kohakuterrarium.utils.logging import get_logger
+from kohakuterrarium.errors import ConflictError
 
 logger = get_logger(__name__)
 
@@ -140,8 +141,10 @@ class TerrariumRuntimeAdapter:
         except _NotHostedHere as e:
             # Catch the routing sentinel before its KeyError base class.
             return {"error": {"kind": "creature_not_hosted", "message": str(e)}}
-        except KeyError as e:
+        except (KeyError, FileNotFoundError) as e:
             return {"error": {"kind": "not_found", "message": str(e)}}
+        except ConflictError as e:
+            return {"error": {"kind": "conflict", "message": str(e)}}
         except ValueError as e:
             return {"error": {"kind": "invalid", "message": str(e)}}
         except Exception as e:  # pragma: no cover - defensive
@@ -224,6 +227,8 @@ class TerrariumRuntimeAdapter:
         if not provider:
             return
         backend_type = profile.get("backend_type") or provider
+        if backend_type == "google-antigravity":
+            raise ValueError("Antigravity: local_host_only")
         set_remote_backend(
             LLMBackend(
                 name=provider,
@@ -489,7 +494,7 @@ class TerrariumRuntimeAdapter:
             case "interrupt":
                 cid = msg.body["creature_id"]
                 creature = self._require_hosted(cid)
-                creature.agent.interrupt()
+                await creature.agent.interrupt_and_wait()
                 return {}
 
             case "list_jobs":
@@ -525,6 +530,24 @@ class TerrariumRuntimeAdapter:
                 cid = msg.body["creature_id"]
                 self._require_hosted(cid)
                 return {"history": chat_history_for(self._engine, cid)}
+
+            case (
+                "chat_history_detail"
+                | "chat_history_page"
+                | "channel_history_page"
+                | "channel_history_detail"
+            ):
+                body = dict(msg.body)
+                service = LocalTerrariumService(self._engine)
+                if msg.type in ("chat_history_page", "chat_history_detail"):
+                    cid = body.pop("creature_id")
+                    self._require_hosted(cid)
+                    result = await getattr(service, msg.type)(cid, **body)
+                else:
+                    graph_id, name = body.pop("graph_id"), body.pop("name")
+                    operation = getattr(service, msg.type)
+                    result = await operation(graph_id, name, **body)
+                return {"history": result}
 
             case "chat_branches":
                 cid = msg.body["creature_id"]

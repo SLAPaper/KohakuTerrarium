@@ -29,11 +29,15 @@ import asyncio
 from typing import Any
 
 import pytest
+from PIL import Image
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.builtins.subagents.research import RESEARCH_CONFIG
 from kohakuterrarium.builtins.tools import web_search
+from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
+from kohakuterrarium.builtins.tools.glob import GlobTool
+from kohakuterrarium.builtins.tools.grep import GrepTool
 from kohakuterrarium.builtins.tools.web_search import WebSearchTool
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.core.config_types import (
@@ -1494,7 +1498,9 @@ class TestModulesIntegration:
         finally:
             await agent.stop()
 
-    async def test_tool_executes_direct_mode_feeds_controller(self, make_agent):
+    async def test_tool_executes_direct_mode_feeds_controller(
+        self, make_agent, tmp_path
+    ):
         """tool protocol — a real DIRECT-mode tool is dispatched by the
         controller from a ``[/...]`` block, the executor runs it, and the
         result is fed back into the controller's conversation so the next
@@ -1523,11 +1529,63 @@ class TestModulesIntegration:
                     "[/recorder]@@msg=explode\n[recorder/]", match="trigger a failure"
                 ),
                 ScriptEntry("handled the failure", match="deliberate explosion"),
+                ScriptEntry(
+                    "[/grep]@@pattern=MATCH\n@@glob=*.log\n[grep/]",
+                    match="search with ignore rules",
+                ),
+                ScriptEntry("filtered search done", match="keep.log:1: MATCH kept"),
+                ScriptEntry(
+                    "[/glob]@@pattern=*.log\n@@gitignore=false\n[glob/]",
+                    match="list including ignored logs",
+                ),
+                ScriptEntry("unfiltered listing done", match="drop.log"),
+                ScriptEntry(
+                    f"[/canvas_image]@@path={tmp_path / 'out.png'}\n[canvas_image/]",
+                    match="publish first image",
+                ),
+                ScriptEntry("first image published", match="Canvas:"),
+                ScriptEntry(
+                    f"[/canvas_image]@@path={tmp_path / 'out.png'}\n[canvas_image/]",
+                    match="publish updated image",
+                ),
+                ScriptEntry("updated image published", match="Canvas:"),
+                ScriptEntry(
+                    "[/grep]@@pattern=MATCH\n@@path=grep.txt\n@@limit=5\n[grep/]",
+                    match="search the text",
+                ),
+                ScriptEntry("search complete", match="Showing 5 matches from 1 files"),
+                ScriptEntry(
+                    "[/grep]@@pattern=MATCH\n@@glob=src\\**\\*.txt\n"
+                    "@@limit=1\n[grep/]",
+                    match="search recursive paths",
+                ),
+                ScriptEntry("recursive search complete", match="a.txt:2: MATCH"),
+                ScriptEntry(
+                    "[/glob]@@pattern=src\\**\\*.txt\n[glob/]",
+                    match="list recursive paths",
+                ),
+                ScriptEntry("recursive listing complete", match="a.txt"),
             ]
         )
         tool = RecordingTool()
         agent.registry.register_tool(tool)
         agent.executor.register_tool(tool)
+        for search_tool in (GrepTool(), GlobTool()):
+            agent.registry.register_tool(search_tool)
+            agent.executor.register_tool(search_tool)
+        canvas_tool = CanvasImageTool()
+        agent.registry.register_tool(canvas_tool)
+        agent.executor.register_tool(canvas_tool)
+        grep_tool = GrepTool()
+        agent.registry.register_tool(grep_tool)
+        agent.executor.register_tool(grep_tool)
+        glob_tool = GlobTool()
+        agent.registry.register_tool(glob_tool)
+        agent.executor.register_tool(glob_tool)
+        store = SessionStore(str(tmp_path / "canvas.kohakutr"))
+        store.init_meta("canvas", "agent", "", str(tmp_path), [agent.config.name])
+        agent.attach_session_store(store)
+        agent.workspace.set(tmp_path)
 
         await agent.start()
         try:
@@ -1578,8 +1636,94 @@ class TestModulesIntegration:
             assert "recorder failed: deliberate explosion" in convo_text
             last = agent.controller.conversation.get_last_assistant_message()
             assert "handled the failure" in last.get_text_content()
+            (tmp_path / ".gitignore").write_text("*.log\n!keep.log\n", encoding="utf-8")
+            (tmp_path / "keep.log").write_text("MATCH kept\n", encoding="utf-8")
+            (tmp_path / "drop.log").write_text("MATCH ignored\n", encoding="utf-8")
+            await agent._process_event(
+                create_user_input_event("search with ignore rules")
+            )
+            outputs = [
+                m.get_text_content()
+                for m in agent.controller.conversation.get_messages()
+            ]
+            grep_output = next(text for text in reversed(outputs) if "## grep_" in text)
+            assert "keep.log:1: MATCH kept" in grep_output
+            assert "drop.log" not in grep_output
+            assert (
+                agent.controller.conversation.get_last_assistant_message().get_text_content()
+                == "filtered search done"
+            )
+            await agent._process_event(
+                create_user_input_event("list including ignored logs")
+            )
+            outputs = [
+                m.get_text_content()
+                for m in agent.controller.conversation.get_messages()
+            ]
+            glob_output = next(text for text in reversed(outputs) if "## glob_" in text)
+            assert "drop.log" in glob_output and "keep.log" in glob_output
+            assert (
+                agent.controller.conversation.get_last_assistant_message().get_text_content()
+                == "unfiltered listing done"
+            )
+            image_path = tmp_path / "out.png"
+            Image.new("RGB", (2, 2), "red").save(image_path)
+            original = image_path.read_bytes()
+            await agent._process_event(create_user_input_event("publish first image"))
+            artifacts = list((store.artifacts_dir / "canvas_images").rglob("*.png"))
+            assert len(artifacts) == 1, [
+                m.get_text_content()
+                for m in agent.controller.conversation.get_messages()[-3:]
+            ]
+            first_artifact = artifacts[0]
+            assert first_artifact.read_bytes() == original
+            Image.new("RGB", (2, 2), "blue").save(image_path)
+            await agent._process_event(create_user_input_event("publish updated image"))
+            artifacts = list((store.artifacts_dir / "canvas_images").rglob("*.png"))
+            assert len(artifacts) == 2
+            assert first_artifact.read_bytes() == original
+            assert {p.read_bytes() for p in artifacts} == {
+                original,
+                image_path.read_bytes(),
+            }
+            last = agent.controller.conversation.get_last_assistant_message()
+            assert last.get_text_content() == "updated image published"
+            (tmp_path / "grep.txt").write_text("MATCH\n" * 20000, encoding="utf-8")
+            await agent._process_event(create_user_input_event("search the text"))
+            convo_text = "\n".join(
+                m.get_text_content()
+                for m in agent.controller.conversation.get_messages()
+            )
+            assert ".:5: MATCH" in convo_text
+            assert ".:6: MATCH" not in convo_text
+            assert "Showing 5 matches from 1 files; more may exist" in convo_text
+            last = agent.controller.conversation.get_last_assistant_message()
+            assert last.get_text_content() == "search complete"
+            search_dir = tmp_path / "src" / "nested"
+            search_dir.mkdir(parents=True)
+            (search_dir / "a.txt").write_text("skip\nMATCH\n", encoding="utf-8")
+            await agent._process_event(
+                create_user_input_event("search recursive paths")
+            )
+            convo_text = "\n".join(
+                m.get_text_content()
+                for m in agent.controller.conversation.get_messages()
+            )
+            assert "a.txt:2: MATCH" in convo_text
+            last = agent.controller.conversation.get_last_assistant_message()
+            assert last.get_text_content() == "recursive search complete"
+            await agent._process_event(create_user_input_event("list recursive paths"))
+            glob_output = next(
+                message.get_text_content()
+                for message in reversed(agent.controller.conversation.get_messages())
+                if "## glob_" in message.get_text_content()
+            )
+            assert f"\n{(search_dir / 'a.txt').relative_to(tmp_path)}" in glob_output
+            last = agent.controller.conversation.get_last_assistant_message()
+            assert last.get_text_content() == "recursive listing complete"
         finally:
             await agent.stop()
+            store.close()
 
     async def test_web_search_backend_switch_executes_and_resumes(
         self, make_agent, monkeypatch, tmp_path
@@ -1823,7 +1967,7 @@ class TestModulesIntegration:
             cmd = agent.list_user_commands()["goal"]
 
             # /goal set through the resolved command object. It immediately
-            # wakes the assigned creature and defaults to continuing autonomy.
+            # wakes the assigned creature once; autonomy defaults to manual.
             set_res = await cmd.execute(
                 "set Fix the auth race",
                 UserCommandContext(agent=agent, extra=dict(extra)),
@@ -1838,7 +1982,7 @@ class TestModulesIntegration:
             assert len(drives) == 1
             drive_id = drives[0].record.drive_id
             assert drives[0].record.owner.format() == "user:alice"
-            assert drives[0].record.spec["autonomy"] == "continue_when_ready"
+            assert drives[0].record.spec["autonomy"] == "manual"
 
             # The drive_ready delivered and settled as an ordinary turn.
             for _ in range(200):

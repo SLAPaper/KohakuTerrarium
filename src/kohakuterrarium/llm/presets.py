@@ -9,6 +9,8 @@ may be lower than the vendor-advertised maximum for reliability.
 
 from typing import Any
 
+from kohakuterrarium.llm.antigravity_presets import PRESETS as AGY_PRESETS
+
 from kohakuterrarium.llm.preset_aliases import _CANONICAL_NAMES, ALIASES
 from kohakuterrarium.llm.preset_groups import (
     _ANTHROPIC_EFFORT_46_GROUP,
@@ -19,9 +21,10 @@ from kohakuterrarium.llm.preset_groups import (
     _GEMINI_THINKING_GROUP_WITH_MINIMAL,
     _GEMINI_THINKING_LITE_GROUP,
     _GLM_EFFORT_GROUP,
-    _GPT56_LUNA_REASONING_GROUP,
     _GPT56_MODE_GROUP,
     _GPT56_REASONING_GROUP,
+    _GPT6_REASONING_GROUP,
+    _GPT5X_CONTEXT_GROUP,
     _GROK_EFFORT_GROUP,
     _MIMO_THINKING_GROUP,
     _MISTRAL_REASONING_GROUP,
@@ -53,6 +56,11 @@ PRESETS: dict[str, dict[str, Any]] = {
     #  by CodexOAuthProvider. GPT-5.4/5.5 additionally support
     #  fast mode (priority tier). The Codex/GPT lines merged at
     #  5.4 — there is no separate ``-codex`` model anymore.
+    #
+    #  ``max_context`` is the catalog's ``context_window`` (the operating
+    #  point the backend actually grants), not ``max_context_window`` (the
+    #  ceiling). It drives the compaction threshold, so overstating it makes
+    #  compaction fire too late and overflow the window.
     # ═══════════════════════════════════════════════════════
     "gpt-5.3-codex-spark": {
         "provider": "codex",
@@ -66,44 +74,72 @@ PRESETS: dict[str, dict[str, Any]] = {
         "provider_native_tools": [],
         "variation_groups": {"reasoning": _CODEX_REASONING_GROUP},
     },
-    "gpt-5.6-sol": {
+    # GPT-6 Astra. Codex's catalog marks it ``visibility: hide`` with
+    # ``priority: 1`` and ``minimal_client_version: 0.153.0`` — rolled out but
+    # not yet in the model picker. Same shape as the 5.6 family; the one
+    # difference is ``multi_agent_reasoning_effort: xhigh``, which the Codex
+    # app uses for its own delegation and does not put on the wire.
+    "gpt-6-astra": {
         "provider": "codex",
-        "model": "gpt-5.6-sol",
-        "max_context": 372000,
+        "model": "gpt-6-astra",
+        "max_context": 1000000,
         "max_output": 128000,
         "reasoning_effort": "xhigh",
         "extra_body": {"websocket_mode": True},
         "variation_groups": {
+            "context": _GPT5X_CONTEXT_GROUP,
+            "reasoning": _GPT6_REASONING_GROUP,
+            "speed": _CODEX_SPEED_GROUP,
+        },
+    },
+    "gpt-daybreak-blue-latest": {
+        "provider": "codex",
+        "model": "gpt-daybreak-blue-latest",
+        "max_context": 1000000,
+        "max_output": 128000,
+        "reasoning_effort": "medium",
+        "variation_groups": {
+            "context": _GPT5X_CONTEXT_GROUP,
+            "reasoning": _GPT56_REASONING_GROUP,
+        },
+    },
+    "gpt-5.6-sol": {
+        "provider": "codex",
+        "model": "gpt-5.6-sol",
+        "max_context": 400000,
+        "max_output": 128000,
+        "reasoning_effort": "xhigh",
+        "extra_body": {"websocket_mode": True},
+        "variation_groups": {
+            "context": _GPT5X_CONTEXT_GROUP,
             "reasoning": _GPT56_REASONING_GROUP,
             "speed": _CODEX_SPEED_GROUP,
-            "mode": _GPT56_MODE_GROUP,
         },
     },
     "gpt-5.6-terra": {
         "provider": "codex",
         "model": "gpt-5.6-terra",
-        "max_context": 372000,
+        "max_context": 400000,
         "max_output": 128000,
         "reasoning_effort": "xhigh",
         "extra_body": {"websocket_mode": True},
         "variation_groups": {
+            "context": _GPT5X_CONTEXT_GROUP,
             "reasoning": _GPT56_REASONING_GROUP,
             "speed": _CODEX_SPEED_GROUP,
-            "mode": _GPT56_MODE_GROUP,
         },
     },
     "gpt-5.6-luna": {
         "provider": "codex",
         "model": "gpt-5.6-luna",
-        "max_context": 372000,
+        "max_context": 400000,
         "max_output": 128000,
         "reasoning_effort": "xhigh",
         "extra_body": {"websocket_mode": True},
         "variation_groups": {
-            # Luna exposes max but not the CLI-only ultra mode.
-            "reasoning": _GPT56_LUNA_REASONING_GROUP,
+            "context": _GPT5X_CONTEXT_GROUP,
+            "reasoning": _GPT56_REASONING_GROUP,
             "speed": _CODEX_SPEED_GROUP,
-            "mode": _GPT56_MODE_GROUP,
         },
     },
     "gpt-5.5": {
@@ -123,7 +159,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "provider": "codex",
         "model": "gpt-5.4",
         # Cap below the advertised maximum to avoid long-context quality degradation.
-        "max_context": 400000,
+        "max_context": 272000,
         "max_output": 128000,
         "reasoning_effort": "xhigh",
         "extra_body": {"websocket_mode": True},
@@ -135,7 +171,7 @@ PRESETS: dict[str, dict[str, Any]] = {
     "gpt-5.4-mini": {
         "provider": "codex",
         "model": "gpt-5.4-mini",
-        "max_context": 400000,
+        "max_context": 272000,
         "max_output": 128000,
         "reasoning_effort": "high",
         "extra_body": {"websocket_mode": True},
@@ -948,6 +984,7 @@ def get_all_presets() -> dict[tuple[str, str], dict[str, Any]]:
         flat[(provider, bare_name)] = body
 
     flat.update(_merge_package_presets())
+    flat.update(AGY_PRESETS)
     _all_presets_cache = flat
     return _all_presets_cache
 

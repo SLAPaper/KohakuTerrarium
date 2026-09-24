@@ -35,6 +35,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from kohakuterrarium.llm import antigravity_auth as agy_auth
 from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import set_service
 from kohakuterrarium.api.routes.catalog import _deps as catalog_deps
@@ -43,6 +44,21 @@ from kohakuterrarium.studio.catalog import packages as _catalog_packages_ops
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
+
+from tests.helpers.antigravity_usage import install_quota_script, assert_quota
+
+from tests.helpers.grok_usage_script import (
+    FAKE_ACCESS,
+    assert_billing_request,
+    assert_empty,
+    assert_usage_ok,
+    billing_body,
+    install_billing_script,
+    install_grok_home,
+    patch_cli_version_probe,
+    write_cli_auth,
+    write_metadata_version,
+)
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -181,6 +197,7 @@ class TestApiStudioJourney:
         client: TestClient,
         workspace_root: Path,
         scripted_llm: ScriptedLLM,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Catalog browse → workspace authoring → validate → start a
         session → chat → history.
@@ -191,6 +208,62 @@ class TestApiStudioJourney:
         start a live session from that creature directory and take a
         turn.
         """
+        with monkeypatch.context() as agy_patch:
+            agy_patch.setattr(agy_auth, "read_sources", lambda: [])
+            status = client.get("/api/settings/antigravity-status")
+            assert status.status_code == 200
+            assert status.json()["state"] == "login_required"
+            assert (
+                client.get("/api/settings/antigravity-status?node=worker").status_code
+                == 400
+            )
+            assert client.post("/api/settings/antigravity-refresh").status_code == 409
+
+        with monkeypatch.context() as quota_patch:
+            quota = install_quota_script(quota_patch)
+            usage_url = "/api/settings/antigravity-usage"
+            assert client.get(usage_url).json()["status"] == "not_logged_in"
+            quota["logged_in"] = True
+            response = client.get(usage_url)
+            assert response.status_code == 200
+            assert_quota(response.json(), 25)
+            quota["remaining"] = 0.5
+            assert_quota(client.get(usage_url).json(), 50)
+            remote = client.get(usage_url + "?node=worker").json()
+            assert remote["status"] == "unsupported"
+            assert remote["groups"] == []
+            quota["status"] = 503
+            assert client.get(usage_url).json()["status"] == "unavailable"
+            quota["logged_in"] = False
+            assert client.get(usage_url).json()["groups"] == []
+
+        with monkeypatch.context() as usage_patch:
+            grok_home = install_grok_home(workspace_root, usage_patch)
+            patch_cli_version_probe(usage_patch)
+            write_metadata_version(grok_home)
+            billing = install_billing_script(usage_patch)
+            url = "/api/settings/grok-usage?node=_host"
+            response = client.get(url)
+            assert response.status_code == 200
+            assert_empty(response.json(), "not_logged_in")
+            write_cli_auth(grok_home, FAKE_ACCESS)
+            for used in (1.0, 4.0):
+                billing.push(200, billing_body(used))
+                response = client.get(url)
+                assert response.status_code == 200
+                assert_usage_ok(response.json(), used)
+                assert_billing_request(
+                    billing.requests[-1], FAKE_ACCESS, version="1.0.5"
+                )
+            for code, status in ((503, "unavailable"), (403, "auth_expired")):
+                billing.push(code)
+                response = client.get(url)
+                assert response.status_code == 200
+                assert_empty(response.json(), status)
+            (grok_home / "auth.json").unlink()
+            assert_empty(client.get(url).json(), "not_logged_in")
+            assert len(billing.requests) == 4
+
         # 1. Catalog: browse builtin tools — the read-only module pool.
         resp = client.get("/api/studio/catalog/tools")
         assert resp.status_code == 200
@@ -239,6 +312,29 @@ class TestApiStudioJourney:
         assert resp.status_code == 200
         models = resp.json()
         assert models and all("name" in m for m in models)
+        agy_models = {
+            entry["model"]: entry
+            for entry in models
+            if entry["provider"] == "google-antigravity"
+        }
+        for model in ("gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"):
+            entry = agy_models[model]
+            assert (entry["max_context"], entry["max_output"]) == (1048576, 65536)
+            assert list(entry["variation_groups"]["reasoning"]) == [
+                "low",
+                "medium",
+                "high",
+            ]
+        assert list(agy_models["gemini-3.1-pro"]["variation_groups"]["reasoning"]) == [
+            "low",
+            "high",
+        ]
+        for model in ("claude-sonnet-4-6", "claude-opus-4-6-thinking"):
+            assert agy_models[model]["variation_groups"] == {}
+            assert (
+                agy_models[model]["max_context"],
+                agy_models[model]["max_output"],
+            ) == (250000, 64000)
 
         # Embedding presets + plugin-hook catalog round out the catalog.
         resp = client.get("/api/studio/catalog/embedding_presets")
@@ -488,7 +584,10 @@ class TestApiStudioJourney:
         assert scripted_llm.call_count == 1
 
         # 8. Sessions: history reflects the turn we just took.
-        resp = client.get(f"/api/sessions/{session_id}/creatures/{creature_id}/history")
+        resp = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+            params={"stream": "snapshot", "limit": 400},
+        )
         assert resp.status_code == 200
         messages = resp.json()["messages"]
         roles = [m.get("role") for m in messages]
@@ -592,7 +691,9 @@ class TestApiStudioJourney:
         assert resp.status_code == 200
         # The regeneration replaced the tail assistant message — history
         # reflects the new reply, the two user turns are untouched.
-        resp = client.get(f"{base}/history")
+        resp = client.get(
+            f"{base}/history", params={"stream": "snapshot", "limit": 400}
+        )
         assert resp.status_code == 200
         regen_msgs = resp.json()["messages"]
         assert [m["content"] for m in regen_msgs if m["role"] == "user"] == [
@@ -656,14 +757,15 @@ class TestApiStudioJourney:
         assert listing["total"] == 1
         assert listing["sessions"][0]["name"] == saved_name
         assert listing["sessions"][0]["agents"] == ["scout"]
-        # History index lists the agent target; the per-target read
-        # returns its saved metadata.
+        # The index carries metadata; the target endpoint carries bounded events.
         resp = client.get(f"/api/sessions/{saved_name}/history")
         assert resp.status_code == 200
         assert "scout" in resp.json()["targets"]
+        assert resp.json()["meta"]["agents"] == ["scout"]
         resp = client.get(f"/api/sessions/{saved_name}/history/scout")
         assert resp.status_code == 200
-        assert resp.json()["meta"]["agents"] == ["scout"]
+        assert resp.json()["history_page"]["stream"] == "events"
+        assert any(row.get("content") == _REPLY_TWO for row in resp.json()["events"])
         # An unknown target is a hard 404.
         resp = client.get(f"/api/sessions/{saved_name}/history/no-such-target")
         assert resp.status_code == 404

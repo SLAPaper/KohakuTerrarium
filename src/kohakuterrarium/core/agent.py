@@ -181,6 +181,7 @@ class Agent(
         # Interrupt: flag + task reference for immediate cancellation
         self._interrupt_requested = False
         self._processing_task: asyncio.Task | None = None
+        self._turn_completion: asyncio.Future[None] | None = None
         self._branch_request_id: str | None = None
 
         self._active_handles: dict[str, Any] = {}
@@ -573,13 +574,13 @@ class Agent(
         The consumer's turn body swallows the cancellation, finalizes, and
         loops — so any events still queued on the inbox process as the next
         fresh turn (no explicit re-fire needed). Queued Drive deliveries
-        are dropped WITHOUT running and their settlement resolved
-        ``interrupted`` so the dispatcher redelivers, matching the prior
-        drop-drive-on-interrupt behavior."""
+        are dropped WITHOUT running and settle as user-interrupted, so the
+        dispatcher pauses their drive instead of redelivering."""
+        already_requested = self._interrupt_requested
         self._interrupt_requested = True
         self.controller._interrupted = True
         processing = getattr(self, "_processing_task", None)
-        if processing and not processing.done():
+        if processing and not processing.done() and not already_requested:
             processing.cancel()
         for job_id in list(self._active_handles.keys()):
             self._interrupt_direct_job(job_id)
@@ -591,7 +592,13 @@ class Agent(
         for env in dropped:
             fut = env.future
             if fut is not None and not fut.done():
-                fut.set_result(TurnOutcome(status="interrupted", was_primary=False))
+                fut.set_result(
+                    TurnOutcome(
+                        status="interrupted",
+                        was_primary=False,
+                        interrupted_by_user=True,
+                    )
+                )
         if dropped:
             logger.info(
                 "Dropped queued Drive deliveries after user interrupt",

@@ -16,14 +16,13 @@ import pytest
 
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium import channel_lifecycle as cl
-from kohakuterrarium.terrarium import config as config_mod
 from kohakuterrarium.terrarium import creature_ops as co
 from kohakuterrarium.terrarium import recipe as recipe_mod
 from kohakuterrarium.terrarium import recipe_apply as recipe_apply_mod
 from kohakuterrarium.terrarium import resume as resume_mod
 from kohakuterrarium.terrarium import root as root_mod
 from kohakuterrarium.terrarium import wire as wire_mod
-from kohakuterrarium.terrarium.config import ChannelConfig, CreatureConfig
+from kohakuterrarium.terrarium.config import CreatureConfig
 from kohakuterrarium.terrarium.events import EventKind
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder, _FakeAgent
 from kohakuterrarium.terrarium.creature_host import Creature
@@ -51,6 +50,10 @@ class TestResolveStorePathRealStore:
 # ---------------------------------------------------------------------------
 # resume._resume_terrarium_into_engine — name-match branches
 # ---------------------------------------------------------------------------
+
+
+async def _async_noop(*_a, **_k):
+    return None
 
 
 class TestTerrariumResumeNameMatch:
@@ -83,11 +86,11 @@ class TestTerrariumResumeNameMatch:
             lambda p: TerrariumConfig(name="t", creatures=[], channels=[]),
         )
         injected = []
-        monkeypatch.setattr(
-            resume_mod,
-            "inject_saved_state",
-            lambda agent, store, name: injected.append(name),
-        )
+
+        async def _record_inject(agent, store, name):
+            injected.append(name)
+
+        monkeypatch.setattr(resume_mod, "inject_saved_state_async", _record_inject)
 
         engine_holder = {}
 
@@ -148,7 +151,7 @@ class TestTerrariumResumeNameMatch:
             "load_terrarium_config",
             lambda p: TerrariumConfig(name="t", creatures=[], channels=[]),
         )
-        monkeypatch.setattr(resume_mod, "inject_saved_state", lambda *a, **kw: None)
+        monkeypatch.setattr(resume_mod, "inject_saved_state_async", _async_noop)
 
         engine_holder = {}
 
@@ -220,44 +223,6 @@ class TestAssignRootDefensive:
             assert t.get_creature("root").is_privileged is True
         finally:
             await t.shutdown()
-
-
-# ---------------------------------------------------------------------------
-# config.build_channel_topology_prompt — broadcast-channel branch
-# ---------------------------------------------------------------------------
-
-
-class TestConfigBroadcastChannel:
-    def test_broadcast_channel_added_to_relevant_names(self):
-        """A recipe channel declared ``channel_type='broadcast'`` is
-        surfaced in the team-communication prompt even when the creature
-        has no explicit listen/send edge on it."""
-        creature = CreatureConfig(
-            name="alice",
-            config_data={"name": "alice"},
-            base_dir=Path("."),
-            listen_channels=[],
-            send_channels=[],
-        )
-        config = SimpleNamespace(
-            channels=[
-                ChannelConfig(
-                    name="townhall",
-                    description="all hands",
-                    channel_type="broadcast",
-                )
-            ],
-            creatures=[creature],
-        )
-        # townhall is broadcast → it must appear in the rendered block
-        # despite alice having no edge on it.
-        block = config_mod.build_channel_topology_prompt(config, creature)
-        assert "townhall" in block
-
-
-# ---------------------------------------------------------------------------
-# recipe — path-string load + custom-builder env binding + bad send edge
-# ---------------------------------------------------------------------------
 
 
 class TestRecipeBranches:

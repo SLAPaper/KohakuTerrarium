@@ -25,6 +25,7 @@ import { useChatStore } from "@/stores/chat"
 import { useEditorStore } from "@/stores/editor"
 import { useInstancesStore } from "@/stores/instances"
 import { useLayoutStore } from "@/stores/layout"
+import { DEFAULT_PRESET_ID } from "@/stores/layoutPanels"
 import { useTabsStore } from "@/stores/tabs"
 
 const props = defineProps({ tab: { type: Object, required: true } })
@@ -160,8 +161,9 @@ function applyPreset() {
     layout.switchPreset(remembered)
     return
   }
-  const fallback = instance.value?.type === "terrarium" ? "multi-creature" : "chat-focus"
-  layout.switchPreset(fallback)
+  // Every fresh tab lands on the default layout; the status rail carries
+  // the creature list, so a multi-creature graph needs no other preset.
+  layout.switchPreset(DEFAULT_PRESET_ID)
 }
 
 watch(
@@ -198,7 +200,9 @@ onMounted(async () => {
   document.addEventListener("visibilitychange", markVisibleConversationRead)
   await loadInstance()
   refreshTimer = createVisibilityInterval(() => {
-    loadInstance().catch((err) => console.error("Instance refresh failed:", err))
+    // Return the promise so the interval skips ticks while a slow
+    // refresh is still in flight instead of stacking requests.
+    return loadInstance().catch((err) => console.error("Instance refresh failed:", err))
   }, 5000)
   refreshTimer.start()
 })

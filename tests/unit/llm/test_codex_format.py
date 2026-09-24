@@ -7,6 +7,9 @@ resolution to data URLs (with on-disk fixtures).
 """
 
 import base64
+from copy import deepcopy
+
+import pytest
 
 from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm.codex_format import (
@@ -22,6 +25,168 @@ from kohakuterrarium.llm.codex_rate_limits import (
 
 
 class TestToResponsesInput:
+    @pytest.mark.parametrize("model", ["slurm/ds", "kimi-k2", "glm-5", "alias"])
+    def test_explicit_replay_preserves_reasoning_for_aliases(self, model):
+        messages = [
+            {"role": "assistant", "content": "Done", "reasoning_content": "Think"}
+        ]
+        items = to_responses_input(messages, model=model, replay_reasoning=True)
+        assert items[0] == {
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "Think"}],
+        }
+        messages[0]["reasoning_content"] = "Edited"
+        assert (
+            to_responses_input(messages, model=model, replay_reasoning=True)[0][
+                "content"
+            ][0]["text"]
+            == "Edited"
+        )
+        assert items[0]["content"][0]["text"] == "Think"
+
+    def test_explicit_false_disables_legacy_replay(self):
+        assert (
+            to_responses_input(
+                [{"role": "assistant", "content": "", "reasoning_content": "Think"}],
+                model="deepseek-flash",
+                replay_reasoning=False,
+            )
+            == []
+        )
+
+    @pytest.mark.parametrize("flag", ["false", "true", 0, 1, [], {}])
+    def test_invalid_replay_capability_is_rejected(self, flag):
+        with pytest.raises(ValueError, match="responses_reasoning_replay"):
+            to_responses_input([], replay_reasoning=flag)
+
+    def test_opt_in_does_not_turn_summary_or_encrypted_state_into_plaintext(self):
+        assert (
+            to_responses_input(
+                [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_summary": "Summary",
+                        "encrypted_content": "opaque",
+                    }
+                ],
+                model="alias",
+                replay_reasoning=True,
+            )
+            == []
+        )
+
+    @pytest.mark.parametrize(
+        "model", ["", "gpt-6-astra", "other-model", "not-deepseek-flash"]
+    )
+    def test_other_models_omit_foreign_reasoning_without_mutating_history(self, model):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "Done",
+                "reasoning_content": "Inspect files",
+            }
+        ]
+        original = deepcopy(messages)
+        assert to_responses_input(messages, model=model) == [
+            {"role": "assistant", "content": [{"type": "output_text", "text": "Done"}]}
+        ]
+        assert messages == original
+
+    @pytest.mark.parametrize("content", ["", "Checking files."])
+    def test_reasoning_precedes_assistant_text_and_tool_calls(self, content):
+        messages = [
+            {
+                "role": "assistant",
+                "content": content,
+                "reasoning_content": "Inspect the workspace.\nThen check the files.",
+                "reasoning_summary": "A display summary",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "tree", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "README.md"},
+        ]
+        original = deepcopy(messages)
+        items = fix_tool_call_pairing(
+            to_responses_input(messages, model="deepseek-flash")
+        )
+        expected = [
+            {
+                "type": "reasoning",
+                "summary": [],
+                "content": [
+                    {
+                        "type": "reasoning_text",
+                        "text": messages[0]["reasoning_content"],
+                    }
+                ],
+            }
+        ]
+        if content:
+            expected.append(
+                {
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": content}],
+                }
+            )
+        expected.extend(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "name": "tree",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "c1",
+                    "output": "README.md",
+                },
+            ]
+        )
+        assert items == expected
+        assert messages == original
+
+    @pytest.mark.parametrize("reasoning", [None, "", [], {}])
+    def test_summary_does_not_become_reasoning_content(self, reasoning):
+        assert to_responses_input(
+            [
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_content": reasoning,
+                    "reasoning_summary": "summary only",
+                }
+            ],
+            model="deepseek-flash",
+        ) == [
+            {
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "answer"}],
+            }
+        ]
+
+    def test_reasoning_only_assistant_turn_is_preserved(self):
+        items = to_responses_input(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "Still thinking",
+                }
+            ],
+            model="deepseek-flash",
+        )
+        assert items == [
+            {
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "Still thinking"}],
+            }
+        ]
+
     def test_string_user_message_becomes_input_text(self):
         out = to_responses_input([{"role": "user", "content": "hello"}])
         assert out == [
@@ -127,6 +292,41 @@ class TestToResponsesInput:
 
 
 class TestFixToolCallPairing:
+    def test_parallel_calls_stay_together_before_outputs(self):
+        reasoning = {
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "Check both files."}],
+        }
+        calls = [
+            {"type": "function_call", "call_id": call_id, "name": "read"}
+            for call_id in ("c1", "c2")
+        ]
+        outputs = [
+            {"type": "function_call_output", "call_id": call_id, "output": "ok"}
+            for call_id in ("c1", "c2")
+        ]
+        assert fix_tool_call_pairing([reasoning, *calls, *reversed(outputs)]) == [
+            reasoning,
+            *calls,
+            *outputs,
+        ]
+
+    def test_separate_tool_rounds_are_not_merged(self):
+        items = []
+        for call_id in ("c1", "c2"):
+            items.extend(
+                [
+                    {"type": "function_call", "call_id": call_id, "name": "read"},
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "ok",
+                    },
+                ]
+            )
+        assert fix_tool_call_pairing(items) == items
+
     def test_function_call_followed_by_its_output(self):
         api_input = [
             {"type": "function_call", "call_id": "c1", "name": "bash"},

@@ -22,8 +22,13 @@ modified value, new file). We compare SHA-256 of each file's bytes
 to keep the guard tight while ignoring no-op external rewrites.
 """
 
+import ctypes
 import hashlib
+import os
+import sys
 from pathlib import Path
+
+import pytest
 
 _REAL_CONFIG_DIR = Path.home() / ".kohakuterrarium"
 
@@ -32,6 +37,11 @@ _REAL_CONFIG_DIR = Path.home() / ".kohakuterrarium"
 # open while running pytest — those processes legitimately write
 # under these subtrees concurrently and a content drift there is
 # NOT a test leak. Tests never touch these paths.
+# SQLite/lock sidecars appear whenever *any* process opens a store — the
+# operator's daemon opening a pre-existing session included. A real leak mints
+# the base file, which is still flagged.
+_SIDECAR_SUFFIXES: tuple[str, ...] = ("-wal", "-shm", "-journal", ".migrate-lock")
+
 _RUNTIME_STATE_SUBDIRS: tuple[str, ...] = (
     "run",  # web daemon PID / state / log files
     "logs",  # framework log files
@@ -53,6 +63,8 @@ def _is_runtime_state(p: Path) -> bool:
     # writes.  Skip them so simply importing an installed package
     # during the test run doesn't trip the leak guard.
     if "__pycache__" in parts or any(part.endswith(".pyc") for part in parts):
+        return True
+    if p.name.endswith(_SIDECAR_SUFFIXES):
         return True
     for sub in _RUNTIME_STATE_SUBDIRS:
         sub_parts = tuple(sub.split("/"))
@@ -91,6 +103,42 @@ def _snapshot() -> dict[str, str]:
     return out
 
 
+def _pid_alive(pid: int) -> bool:
+    """Report whether a pid is running, without signalling it."""
+    if sys.platform == "win32":
+        # os.kill on Windows maps every signal other than CTRL_C_EVENT /
+        # CTRL_BREAK_EVENT to TerminateProcess, so a "probe" would kill the
+        # daemon it is asking about.
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            process_query_limited_information, False, pid
+        )
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Owned by another user: running, just not ours to signal.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _running_daemon_pid(config_dir: Path | None = None) -> int | None:
+    """Return the pid of a live KT web daemon, or None if none is running."""
+    root = _REAL_CONFIG_DIR if config_dir is None else config_dir
+    try:
+        pid = int((root / "run" / "web.pid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if _pid_alive(pid) else None
+
+
 _BEFORE: dict[str, str] = _snapshot()
 
 
@@ -122,8 +170,41 @@ def test_no_writes_to_real_kohakuterrarium_dir():
             ):
                 continue
             leaks.append(f"CONTENT-CHANGED: {path}")
+    # A live daemon rewrites llm_profiles.yaml / ui_prefs.json on its own
+    # schedule, which no snapshot can tell apart from a leak.
+    daemon = _running_daemon_pid()
+    if leaks and daemon is not None:
+        pytest.skip(
+            f"a KohakuTerrarium daemon is running (pid {daemon}); its writes to "
+            "the real config dir cannot be distinguished from a test leak. "
+            "Stop it and re-run to make this guard meaningful. Saw:\n"
+            + "\n".join(leaks)
+        )
     assert not leaks, (
         "tests wrote to the operator's real ~/.kohakuterrarium/ — every "
         "save path must resolve through KT_CONFIG_DIR (the conftest "
         "autouse fixture redirects to tmp_path).  Leaks:\n" + "\n".join(leaks)
     )
+
+
+def test_sidecars_are_runtime_state_but_the_store_itself_is_not():
+    base = _REAL_CONFIG_DIR / "sessions" / "s.kohakutr"
+    assert not _is_runtime_state(base)
+    for suffix in _SIDECAR_SUFFIXES:
+        assert _is_runtime_state(Path(str(base) + suffix)), suffix
+
+
+def test_daemon_probe_ignores_a_missing_or_dead_pid(tmp_path):
+    assert _running_daemon_pid(tmp_path) is None
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "web.pid").write_text("not-a-pid")
+    assert _running_daemon_pid(tmp_path) is None
+
+    # Our own pid is alive on every platform, unlike PID 1.
+    (run_dir / "web.pid").write_text(str(os.getpid()))
+    assert _running_daemon_pid(tmp_path) == os.getpid()
+
+    (run_dir / "web.pid").write_text("999999")
+    assert _running_daemon_pid(tmp_path) is None

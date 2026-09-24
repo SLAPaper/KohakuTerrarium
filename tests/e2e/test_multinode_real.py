@@ -194,7 +194,10 @@ async def test_subprocess_harness_boots_host_and_worker(tmp_path, monkeypatch):
 
     async with RealLabHost(tmp_path) as host:
         async with RealLabSubprocessWorker(
-            "sub-worker-1", host.lab_ws_url, tmp_path / "sub-worker-1"
+            "sub-worker-1",
+            host.lab_ws_url,
+            tmp_path / "sub-worker-1",
+            extra_env={"KT_CREATURES_DIRS": str(tmp_path / "worker-local-creatures")},
         ) as worker:
             await worker.wait_for_join(host, timeout=OP_TIMEOUT * 4)
             assert "sub-worker-1" in set(host.host_engine.alive_clients())
@@ -202,6 +205,47 @@ async def test_subprocess_harness_boots_host_and_worker(tmp_path, monkeypatch):
             assert worker.kt_config_dir.exists()
             assert worker.kt_session_dir.exists()
             assert worker.kt_config_dir != tmp_path / "kt-config"
+
+            local_config = _write_creature_config(
+                tmp_path / "worker-local-creatures",
+                "worker_local",
+                "Worker local config.",
+            )
+            package = worker.kt_config_dir / "packages" / "worker-only"
+            _write_creature_config(package, "worker_package", "Worker package config.")
+            (package / "kohaku.yaml").write_text(
+                "name: worker-only\nversion: 1.0.0\ncreatures:\n  - path: creature_worker_package\n",
+                encoding="utf-8",
+            )
+            host_catalog = await host.http.get("/api/configs/creatures")
+            assert host_catalog.status_code == 200, host_catalog.text
+            assert "worker_package" not in {
+                item["name"] for item in host_catalog.json()
+            }
+            catalog = await host.http.get(
+                "/api/configs/creatures", params={"on_node": worker.node_id}
+            )
+            assert catalog.status_code == 200, catalog.text
+            found = {item["name"]: item["path"] for item in catalog.json()}
+            assert found["worker_package"] == "@worker-only/creature_worker_package"
+            assert found["worker_local"] == str(local_config)
+            spawned = await host.http.post(
+                "/api/sessions/active/creature",
+                json={"config_path": found["worker_local"], "on_node": worker.node_id},
+            )
+            assert spawned.status_code == 200, spawned.text
+            session = spawned.json()
+            sid = session["session_id"]
+            cid = session["creatures"][0]["creature_id"]
+            async with host.api_ws(f"/ws/sessions/{sid}/creatures/{cid}/chat") as ws:
+                assert "OK" in await _drain_chat_ws(ws, "hello")
+            assert (
+                await host.http.delete(f"/api/sessions/active/agents/{cid}")
+            ).status_code == 200
+            rejected = await host.http.get(
+                "/api/configs/creatures", params={"on_node": "not-connected"}
+            )
+            assert rejected.status_code == 404
         # After __aexit__, the worker process must be gone.
         assert worker.returncode is not None, (
             "worker did not exit after __aexit__; stderr: "
@@ -1332,6 +1376,65 @@ async def test_subprocess_worker_spawn_and_chat_round_trip(tmp_path, monkeypatch
                 "KT_TEST_LLM_SCRIPT seam did not take effect inside the "
                 f"subprocess.  Worker stderr: {worker.dump_stderr()[:2000]}"
             )
+
+            package_root = worker.kt_config_dir / "packages" / "worker-biome"
+            package_config = _write_creature_config(
+                package_root, "package_scout", "Worker package configuration."
+            )
+            package_ref = "@worker-biome/creature_package_scout"
+            for host_has_package in (False, True):
+                if host_has_package:
+                    _write_creature_config(
+                        tmp_path / "kt-config" / "packages" / "worker-biome",
+                        "package_scout",
+                        "Host package configuration must not be used.",
+                    )
+                    host_config = (
+                        tmp_path
+                        / "kt-config"
+                        / "packages"
+                        / "worker-biome"
+                        / "creature_package_scout"
+                        / "config.yaml"
+                    )
+                    host_config.write_text(
+                        "name: wrong_host_creature\n", encoding="utf-8"
+                    )
+                spawned = await host.http.post(
+                    "/api/sessions/active/creature",
+                    json={"config_path": package_ref, "on_node": worker.node_id},
+                )
+                assert spawned.status_code == 200, spawned.text
+                package_session = spawned.json()
+                entry = package_session["creatures"][0]
+                assert entry["name"] == "package_scout"
+                sid = package_session["session_id"]
+                cid = entry["creature_id"]
+                async with host.api_ws(
+                    f"/ws/sessions/{sid}/creatures/{cid}/chat"
+                ) as ws:
+                    assert "sub-scout reporting in" in await _drain_chat_ws(
+                        ws, "report"
+                    )
+                stopped = await host.http.delete(f"/api/sessions/active/agents/{cid}")
+                assert stopped.status_code == 200, stopped.text
+                active = (await host.http.get("/api/sessions/active")).json()
+                assert sid not in {item["session_id"] for item in active}
+
+            for bad_ref, message in (
+                ("@missing-worker-package/creatures/general", "Package not installed"),
+                ("@worker-biome/missing", "Path not found in package"),
+                ("@worker-biome/../outside", "escapes the package root"),
+                ("@/creatures/general", "Empty package name"),
+                ("creatures/general", "requires an absolute remote path"),
+            ):
+                rejected = await host.http.post(
+                    "/api/sessions/active/creature",
+                    json={"config_path": bad_ref, "on_node": worker.node_id},
+                )
+                assert rejected.status_code == 400, rejected.text
+                assert message in rejected.json()["detail"]
+            assert package_config.is_dir()
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,8 @@ populated via ``TestTerrariumBuilder``; the lab transport is replaced
 by a fake ``LabRegistrar`` so the test never touches a real socket.
 """
 
+import pytest
+
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.adapters.terrarium_runtime import (
     TerrariumRuntimeAdapter,
@@ -94,6 +96,22 @@ class TestConstruction:
 
 
 class TestErrorMapping:
+    async def test_missing_package_is_not_found_without_spawning(self):
+        engine = await TestTerrariumBuilder().build()
+        adapter = TerrariumRuntimeAdapter(engine, _FakeNode())
+        try:
+            out = await adapter._dispatch(
+                _msg(
+                    "add_creature",
+                    {"config": {"kind": "path", "value": "@missing/creatures/general"}},
+                )
+            )
+            assert out["error"]["kind"] == "not_found"
+            assert "Package not installed: missing" in out["error"]["message"]
+            assert engine.list_creatures() == []
+        finally:
+            await engine.shutdown()
+
     async def test_not_hosted_here(self):
         adapter = await _make_adapter()
         try:
@@ -413,3 +431,15 @@ class TestShutdown:
 class TestNotHostedHere:
     def test_is_key_error(self):
         assert issubclass(_NotHostedHere, KeyError)
+
+
+def test_antigravity_remote_preset_is_rejected_before_registration():
+    with pytest.raises(ValueError, match="local_host_only"):
+        TerrariumRuntimeAdapter._stash_remote_preset(
+            "custom/borrowed",
+            {
+                "backend_type": "google-antigravity",
+                "provider": "custom",
+                "model": "gemini-3-flash",
+            },
+        )

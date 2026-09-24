@@ -1,25 +1,28 @@
-"""Resolve local session-artifact image URLs to inline ``data:`` URLs.
+"""Resolve local media references to inline ``data:`` URLs at the provider boundary.
 
-Inline local session artifacts at the provider boundary.
-
-Stored conversations keep compact relative URLs, while outgoing requests use
-base64 data URLs that external providers can consume.
+Stored conversations keep compact references, a session-artifact URL for media
+the session produced or a ``file://`` URL for a file a tool looked at, while
+outgoing requests carry base64 data URLs that external providers can consume.
 """
 
 import base64
 import re
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from kohakuterrarium.studio.persistence.artifacts import (
     resolve_artifact_file,
     resolve_artifacts_dir,
 )
 from kohakuterrarium.studio.persistence.store import _session_dir
+from kohakuterrarium.utils.fs_path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 _ARTIFACT_URL_RE = re.compile(r"^/api/sessions/(?P<sid>[^/]+)/artifacts/(?P<path>.+)$")
+_FILE_SCHEME = "file://"
 
 _ARTIFACT_MIME_BY_EXT = {
     ".png": "image/png",
@@ -37,22 +40,44 @@ _ARTIFACT_MIME_BY_EXT = {
 }
 
 
-def resolve_artifact_url(url: str) -> str:
-    """Inline a local artifact URL, preserving the original URL on failure."""
-    if not isinstance(url, str) or not url.startswith("/api/sessions/"):
-        return url
+def file_reference_path(url: str) -> Path | None:
+    """Return the local path a ``file://`` reference names, or ``None``."""
+    if not isinstance(url, str) or not url.startswith(_FILE_SCHEME):
+        return None
+    try:
+        if urlparse(url).netloc.lower() not in ("", "localhost"):
+            return None
+        return coerce_fs_path(url)
+    except ValueError:
+        return None
+
+
+def _local_media_path(url: str) -> Path | None:
+    """Map a stored media reference to the file behind it."""
+    file_path = file_reference_path(url)
+    if file_path is not None:
+        return file_path
     match = _ARTIFACT_URL_RE.match(url)
     if not match:
+        return None
+    artifacts = resolve_artifacts_dir(match.group("sid"), _session_dir())
+    return resolve_artifact_file(artifacts, match.group("path"))
+
+
+def resolve_artifact_url(url: str) -> str:
+    """Inline a local media reference, preserving the original URL on failure."""
+    if not isinstance(url, str):
         return url
-    sid = match.group("sid")
-    rel = match.group("path")
+    if not (url.startswith("/api/sessions/") or url.startswith(_FILE_SCHEME)):
+        return url
     try:
-        artifacts = resolve_artifacts_dir(sid, _session_dir())
-        path = resolve_artifact_file(artifacts, rel)
+        path = _local_media_path(url)
+        if path is None:
+            return url
         data = path.read_bytes()
     except Exception as exc:
         logger.warning(
-            "Artifact URL resolve failed — sending as-is",
+            "Media reference resolve failed — sending as-is",
             url=url,
             error=str(exc),
             exc_info=True,
@@ -64,10 +89,16 @@ def resolve_artifact_url(url: str) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+def _is_unresolved_local_media(url: str) -> bool:
+    if url.startswith("data:"):
+        return False
+    return url.startswith(_FILE_SCHEME) or url.startswith("/api/sessions/")
+
+
 def resolve_message_image_urls(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Inline local image parts while preserving object identity when unchanged."""
+    """Inline local image parts; omit refs that did not become a data URL."""
     any_changed = False
     out: list[dict[str, Any]] = []
     for msg in messages:
@@ -86,6 +117,13 @@ def resolve_message_image_urls(
                 iu = part["image_url"]
                 url = iu.get("url")
                 resolved = resolve_artifact_url(url) if isinstance(url, str) else url
+                if isinstance(resolved, str) and _is_unresolved_local_media(resolved):
+                    logger.warning(
+                        "Media reference unresolved — omitting image part",
+                        url=url,
+                    )
+                    msg_changed = True
+                    continue
                 if resolved is not url and resolved != url:
                     new_content.append({**part, "image_url": {**iu, "url": resolved}})
                     msg_changed = True

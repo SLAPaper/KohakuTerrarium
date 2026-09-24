@@ -47,6 +47,7 @@ from kohakuterrarium.api.routes.catalog import _deps as _catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core import agent_model as _agent_model
+from kohakuterrarium.packages.resolve import resolve_package_path
 from kohakuterrarium.session.embedding import NullEmbedder
 from kohakuterrarium.studio.catalog import packages as _catalog_packages_ops
 from kohakuterrarium.studio.sessions import lifecycle
@@ -153,13 +154,12 @@ def client(
     (saved-session list / resume / on-disk history) reads and writes
     the same isolated directory the engine saves into.
 
-    NOTE: the identity LLM stores (``llm/api_keys.py``,
-    ``llm/backends.py``, ``studio/identity/mcp_servers.py``,
-    ``ui_prefs.py``, ``editors/skills_state.py``) bind
-    ``Path.home() / ".kohakuterrarium"`` as an import-time constant
-    and honour no env override — so this tier exercises only the
-    *read* side of those routes plus error paths that 4xx before any
-    write.  See the report's ``B-fat2-api`` notes.
+    The identity LLM stores resolve their path fresh through
+    ``utils/config_dir.py::config_dir()`` on every read and write, and
+    ``tests/conftest.py::_default_isolated_config_dir`` pins
+    ``KT_CONFIG_DIR`` at a per-test tmp dir — so identity *writes*
+    (backends / profiles / default-model) are exercised for real here
+    without touching the operator's ``~/.kohakuterrarium``.
     """
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -337,6 +337,41 @@ class TestApiIntegration:
         assert resp.status_code == 200
         file_paths = {f["path"] for f in resp.json()}
         assert "kohaku.yaml" in file_paths
+
+        # ── Prefix-named sibling package ─────────────────────────────
+        # ``.../shorthand-pkg`` is a string prefix of this sibling's
+        # path; both refs below must round-trip through the resolver.
+        ext_src = tmp_path / "shorthand-pkg-extended"
+        (ext_src / "creatures" / "shorty-plus").mkdir(parents=True)
+        (ext_src / "kohaku.yaml").write_text(
+            "name: shorthand-pkg-extended\nversion: 1.0.0\n"
+            "creatures:\n  - name: shorty-plus\n",
+            encoding="utf-8",
+        )
+        (ext_src / "creatures" / "shorty-plus" / "config.yaml").write_text(
+            "name: shorty-plus\ndescription: sibling creature\nsystem_prompt: probe\n",
+            encoding="utf-8",
+        )
+        resp = client.post(
+            "/api/registry/install", json={"url": str(ext_src), "name": None}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["name"] == "shorthand-pkg-extended"
+
+        resp = client.get("/api/configs/creatures")
+        assert resp.status_code == 200
+        sibling_refs = {e["name"]: e["path"] for e in resp.json()}
+        assert sibling_refs["shorty"] == "@shorthand-pkg/creatures/shorty"
+        assert (
+            sibling_refs["shorty-plus"]
+            == "@shorthand-pkg-extended/creatures/shorty-plus"
+        )
+        assert resolve_package_path(sibling_refs["shorty-plus"]).is_dir()
+
+        resp = client.post(
+            "/api/registry/uninstall", json={"name": "shorthand-pkg-extended"}
+        )
+        assert resp.status_code == 200
 
         resp = client.post("/api/registry/uninstall", json={"name": "shorthand-pkg"})
         assert resp.status_code == 200
@@ -618,8 +653,7 @@ class TestApiIntegration:
         resp = client.delete("/api/settings/backends/does-not-exist")
         assert resp.status_code == 404
         # Deleting a profile / api-key / MCP server that does not exist
-        # likewise 404s — these error branches resolve before any
-        # write touches the (unrelocatable) real config tree.
+        # likewise 404s.
         resp = client.delete("/api/settings/profiles/ghost-provider/ghost-name")
         assert resp.status_code == 404
         resp = client.delete("/api/settings/keys/definitely-not-a-provider")
@@ -633,6 +667,52 @@ class TestApiIntegration:
             json={"name": "x", "model": "m", "provider": "no-such-provider-xyz"},
         )
         assert resp.status_code == 404
+
+        # Identity write round-trip the Settings → Models pane commits:
+        # register a backend, add a profile under it, then click a row to
+        # make it the default.
+        resp = client.post(
+            "/api/settings/backends",
+            json={
+                "name": "acme",
+                "backend_type": "openai",
+                "base_url": "https://acme.example/v1",
+            },
+        )
+        assert resp.status_code == 200
+        resp = client.post(
+            "/api/settings/profiles",
+            json={"name": "acme-fast", "model": "acme-model-1", "provider": "acme"},
+        )
+        assert resp.status_code == 200
+        # The pane sends the row it clicked; a bare name is upgraded to the
+        # canonical provider-qualified identifier before it is persisted.
+        resp = client.post("/api/settings/default-model", json={"name": "acme-fast"})
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "set", "default_model": "acme/acme-fast"}
+        resp = client.get("/api/settings/default-model")
+        assert resp.json()["default_model"] == "acme/acme-fast"
+        # The catalog the Models pane renders marks exactly that row.
+        resp = client.get("/api/settings/models")
+        assert resp.status_code == 200
+        assert [(m["provider"], m["name"]) for m in resp.json() if m["is_default"]] == [
+            ("acme", "acme-fast")
+        ]
+        # A bare name carried by several built-in providers is rejected
+        # rather than silently bound to whichever provider sorts first.
+        resp = client.post(
+            "/api/settings/default-model", json={"name": "claude-opus-4.8"}
+        )
+        assert resp.status_code == 400
+        assert "exists under multiple providers" in resp.json()["detail"]
+        resp = client.post(
+            "/api/settings/default-model", json={"name": "no-such-preset"}
+        )
+        assert resp.status_code == 404
+        # Neither rejection disturbed the stored default.
+        resp = client.get("/api/settings/default-model")
+        assert resp.json()["default_model"] == "acme/acme-fast"
+
         # MCP registry read round-trips.
         resp = client.get("/api/settings/mcp")
         assert resp.status_code == 200
@@ -782,17 +862,18 @@ class TestApiIntegration:
         assert resp.json() == {"response": _REPLY_TWO}
         assert scripted_llm.call_count == 2
         # History now carries both turns — the WS turn and this one —
-        # with the streamed scripted replies.
+        # with the streamed scripted replies. The default read is a
+        # bounded page whose raw events include the user_message /
+        # assistant pairs of both turns.
         resp = client.get(f"{base}/history")
         assert resp.status_code == 200
-        messages = resp.json().get("messages", [])
-        roles = [m.get("role") for m in messages]
-        assert "user" in roles and "assistant" in roles
-        user_msgs = [m for m in messages if m.get("role") == "user"]
+        page = resp.json()
+        events = page.get("events", [])
+        user_msgs = [e for e in events if e.get("type") == "user_message"]
         assert len(user_msgs) == 2
         joined = " ".join(
-            m.get("content", "") if isinstance(m.get("content"), str) else ""
-            for m in messages
+            str(e.get("content", "")) if isinstance(e.get("content"), str) else ""
+            for e in events
         )
         assert "hello creature" in joined
         assert "a second http turn" in joined
@@ -1120,8 +1201,12 @@ class TestApiIntegration:
         #    The rewind-to-0 in step 3b truncated the live conversation
         #    back to just the system prompt; the only user turn since is
         #    the single "post-switch turn" chat driven in step 4a. (The
-        #    full pre-rewind transcript was asserted in step 3b.)
-        resp = client.get(f"{base}/history")
+        #    full pre-rewind transcript was asserted in step 3b.) The
+        #    default read is a bounded page of raw events.
+        # The snapshot stream is the bounded, replay-consistent view (the
+        # raw-events default stream keeps pre-rewind branch history by
+        # design — the dashboard replays branches client-side).
+        resp = client.get(f"{base}/history", params={"stream": "snapshot"})
         assert resp.status_code == 200
         post_rewind_users = [
             m for m in resp.json().get("messages", []) if m.get("role") == "user"
@@ -1308,13 +1393,22 @@ class TestApiIntegration:
         assert resp.json()["total"] == 1
 
         # While the session is still live, its per-creature HTTP
-        # history carries both turns — and the ``ch:`` channel-history
-        # branch of the same route answers for a (here empty) channel.
+        # history is a bounded page (default) and still carries both
+        # turns. Unbounded ``paged=false`` is rejected. The ``ch:``
+        # channel-history branch of the same route answers for a
+        # (here empty) channel.
         resp = client.get(f"/api/sessions/{session_id}/creatures/{creature_id}/history")
         assert resp.status_code == 200
         live_blob = str(resp.json())
         assert "persist this turn" in live_blob
         assert "second turn please" in live_blob
+        assert (
+            client.get(
+                f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+                params={"paged": "false"},
+            ).status_code
+            == 400
+        )
         resp = client.get(
             f"/api/sessions/{session_id}/creatures/ch:no-such-channel/history"
         )
@@ -1347,6 +1441,194 @@ class TestApiIntegration:
         resp = client.get(f"/api/persistence/history/{saved_name}/history/alice")
         assert resp.status_code == 200
         assert "persist this turn" in str(resp.json())
+
+        # ── History paging (bounded, cursor-driven pages) ─────────────
+        # Omitted ``paged`` and explicit ``paged=true`` both return a
+        # bounded page. Live event pages carry raw event records with a
+        # physical ``_history_key`` and NEVER embed the conversation
+        # snapshot (no snapshot giant on an event page). Cursors are
+        # opaque exclusive record tokens; ``history_id`` is the
+        # session-and-target scoped history identity.
+        resp = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+            params={"paged": "true", "limit": 3, "stream": "events"},
+        )
+        assert resp.status_code == 200
+        live_page = resp.json()
+        live_hp = live_page["history_page"]
+        assert live_hp["version"] == 1
+        assert live_hp["stream"] == "events"
+        assert live_hp["history_id"] and len(live_hp["history_id"]) == 16
+        assert isinstance(live_hp["has_older"], bool)
+        assert isinstance(live_hp["has_newer"], bool)
+        assert live_hp["reset_required"] is False
+        assert live_hp["before"] and live_hp["after"]
+        assert live_page["messages"] == []
+        assert live_page["events"] and isinstance(live_page["events"], list)
+        assert live_page["is_processing"] is False
+        assert live_page["live_job_ids"] == []
+        live_keys = [e["_history_key"] for e in live_page["events"]]
+        assert all(k.startswith("events:") for k in live_keys)
+
+        # ``before`` walks to the next OLDER page; ``after`` walks back to
+        # the next NEWER page. Together they prove bounded pages stitch into
+        # a contiguous history without holes or duplicates.
+        older = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+            params={
+                "paged": "true",
+                "limit": 3,
+                "stream": "events",
+                "before": live_hp["before"],
+                "history_id": live_hp["history_id"],
+            },
+        ).json()
+        assert older["history_page"]["history_id"] == live_hp["history_id"]
+        assert older["history_page"]["has_newer"] is True
+        older_keys = [e["_history_key"] for e in older["events"]]
+        assert older_keys and older_keys != live_keys
+        assert set(older_keys).isdisjoint(set(live_keys))
+
+        back = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+            params={
+                "paged": "true",
+                "limit": 3,
+                "stream": "events",
+                "after": older["history_page"]["after"],
+                "history_id": older["history_page"]["history_id"],
+            },
+        ).json()
+        assert [e["_history_key"] for e in back["events"]] == live_keys
+        assert back["history_page"]["history_id"] == live_hp["history_id"]
+
+        # A stale / cross-session ``history_id`` forces a reset signal rather
+        # than a wrong payload — the client must discard the cached page.
+        stale = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+            params={
+                "paged": "true",
+                "limit": 3,
+                "stream": "events",
+                "before": live_hp["before"],
+                "history_id": "0000000000000000",
+            },
+        ).json()
+        assert stale["history_page"]["reset_required"] is True
+        assert stale["events"] == []
+
+        # Malformed / wrong-target cursors are rejected as 400, never merged.
+        assert (
+            client.get(
+                f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+                params={
+                    "paged": "true",
+                    "limit": 3,
+                    "stream": "events",
+                    "after": "not-a-cursor",
+                },
+            ).status_code
+            == 400
+        )
+
+        # Saved (on-disk) paging reuses the same bounded pager over the
+        # persisted store, with the same envelope + cursor semantics. The
+        # saved event page also omits the conversation snapshot.
+        resp = client.get(
+            f"/api/sessions/{saved_name}/history/alice",
+            params={"paged": "true", "limit": 3, "stream": "events"},
+        )
+        assert resp.status_code == 200
+        saved_page = resp.json()
+        assert saved_page["target"] == "alice"
+        saved_hp = saved_page["history_page"]
+        assert saved_hp["version"] == 1
+        assert saved_hp["stream"] == "events"
+        assert saved_hp["history_id"] and len(saved_hp["history_id"]) == 16
+        assert saved_page["messages"] == []
+        assert saved_page["events"]
+        saved_keys = [e["_history_key"] for e in saved_page["events"]]
+        assert all(k.startswith("events:") for k in saved_keys)
+        saved_older = client.get(
+            f"/api/sessions/{saved_name}/history/alice",
+            params={
+                "paged": "true",
+                "limit": 3,
+                "stream": "events",
+                "before": saved_hp["before"],
+                "history_id": saved_hp["history_id"],
+            },
+        ).json()
+        assert saved_older["history_page"]["history_id"] == saved_hp["history_id"]
+        assert saved_older["events"] and saved_older["events"] != saved_page["events"]
+
+        # ── History detail (full raw record behind a page) ────────────
+        # The opaque ref token addresses one physical record; the detail
+        # endpoint returns the complete raw record with the identical
+        # ``_history_key`` carried on the paged item. ``history_page.after``
+        # is an opaque record cursor for the page's newest event.
+        live_detail = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history/detail",
+            params={
+                "stream": "events",
+                "ref": live_hp["after"],
+                "history_id": live_hp["history_id"],
+            },
+        )
+        assert live_detail.status_code == 200
+        live_body = live_detail.json()
+        assert live_body["record"]["_history_key"] == live_keys[-1]
+        assert live_body["history_page"]["version"] == 1
+        assert live_body["history_page"]["stream"] == "events"
+        assert live_body["history_page"]["history_id"] == live_hp["history_id"]
+
+        saved_detail = client.get(
+            f"/api/sessions/{saved_name}/history/alice/detail",
+            params={
+                "stream": "events",
+                "ref": saved_hp["after"],
+                "history_id": saved_hp["history_id"],
+            },
+        )
+        assert saved_detail.status_code == 200
+        assert saved_detail.json()["record"]["_history_key"] == saved_keys[-1]
+        assert saved_detail.json()["history_page"]["stream"] == "events"
+
+        # Detail validation: malformed refs are 400 and a changed/foreign
+        # history identity is 409 (stale) — never a silently wrong record.
+        assert (
+            client.get(
+                f"/api/sessions/{session_id}/creatures/{creature_id}/history/detail",
+                params={
+                    "stream": "events",
+                    "ref": "not-a-cursor",
+                    "history_id": live_hp["history_id"],
+                },
+            ).status_code
+            == 400
+        )
+        assert (
+            client.get(
+                f"/api/sessions/{session_id}/creatures/{creature_id}/history/detail",
+                params={
+                    "stream": "events",
+                    "ref": live_hp["after"],
+                    "history_id": "0000000000000000",
+                },
+            ).status_code
+            == 409
+        )
+        assert (
+            client.get(
+                f"/api/sessions/{saved_name}/history/alice/detail",
+                params={
+                    "stream": "events",
+                    "ref": "not-a-cursor",
+                    "history_id": saved_hp["history_id"],
+                },
+            ).status_code
+            == 400
+        )
 
         # Artifacts route — the session has no artifacts directory, so
         # any file path 404s (the path-resolution guard rejects it

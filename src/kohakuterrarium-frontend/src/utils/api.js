@@ -52,6 +52,30 @@ function encodeTarget(target) {
   return encodeURIComponent(target)
 }
 
+const HISTORY_PAGE_LIMIT_DEFAULT = 400
+const HISTORY_PAGE_LIMIT_MAX = 400
+
+// Build query params for a bounded history page. ``before`` and
+// ``after`` are opaque string cursors and are mutually exclusive. The
+// limit must be a positive number; it is clamped to the backend page
+// bound when too large. The server rejects unbounded full-log reads.
+function buildHistoryPageParams({ limit, before, after, history_id, stream } = {}) {
+  const raw = limit ?? HISTORY_PAGE_LIMIT_DEFAULT
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 1) {
+    throw new Error("history page limit must be a positive number")
+  }
+  const clamped = Math.min(Math.floor(raw), HISTORY_PAGE_LIMIT_MAX)
+  const params = { paged: true, limit: clamped }
+  if (history_id != null) params.history_id = history_id
+  if (stream != null) params.stream = stream
+  if (before != null && after != null) {
+    throw new Error("history page before/after cursors are mutually exclusive")
+  }
+  if (before != null) params.before = before
+  if (after != null) params.after = after
+  return params
+}
+
 // ``baseURL`` stays empty so the interceptor controls every URL.
 const api = axios.create({
   baseURL: "",
@@ -163,8 +187,9 @@ api.interceptors.response.use(
 /** Config discovery */
 export const configAPI = {
   /** @returns {Promise<ConfigItem[]>} */
-  async listCreatures() {
-    const { data } = await api.get("/configs/creatures")
+  async listCreatures(opts = {}) {
+    const params = opts.onNode ? { on_node: opts.onNode } : {}
+    const { data } = await api.get("/configs/creatures", { params })
     return data
   },
 
@@ -337,20 +362,44 @@ export const terrariumAPI = {
   },
 
   /**
-   * Get full history for a creature/root in a terrarium.
-   * Returns { messages: [...], events: [...] }
+   * Get history for a creature/root in a terrarium.
+   * Always requests a bounded page; the server rejects unbounded reads.
    */
-  async getHistory(id, target, sinceEventId = null) {
-    const params = sinceEventId != null ? { params: { since_event_id: sinceEventId } } : {}
+  async getHistory(id, target) {
+    return this.getHistoryPage(id, target)
+  },
+
+  async getHistoryDetail(id, target, { stream, ref, history_id }) {
     const { data } = await api.get(
-      `/sessions/${id}/creatures/${encodeTarget(target)}/history`,
-      params,
+      `/sessions/${id}/creatures/${encodeTarget(target)}/history/detail`,
+      { params: { stream, ref, history_id } },
     )
+    return data
+  },
+
+  /** Read one bounded live history page. */
+  async getHistoryPage(id, target, options = {}) {
+    const params = buildHistoryPageParams(options)
+    const { data } = await api.get(`/sessions/${id}/creatures/${encodeTarget(target)}/history`, {
+      params,
+    })
     return data
   },
 
   async interruptCreature(id, name) {
     const { data } = await api.post(`/sessions/${id}/creatures/${encodeTarget(name)}/interrupt`)
+    return data
+  },
+
+  /** Start a stopped creature in place (it stays in its graph). */
+  async startCreature(id, name) {
+    const { data } = await api.post(`/sessions/${id}/creatures/${encodeTarget(name)}/start`)
+    return data
+  },
+
+  /** Stop a running creature without removing it from its graph. */
+  async stopCreature(id, name) {
+    const { data } = await api.post(`/sessions/${id}/creatures/${encodeTarget(name)}/stop`)
     return data
   },
 
@@ -885,7 +934,23 @@ export const sessionAPI = {
   },
 
   async getHistory(sessionName, target) {
-    const { data } = await api.get(`/sessions/${sessionName}/history/${encodeTarget(target)}`)
+    return this.getHistoryPage(sessionName, target)
+  },
+
+  async getHistoryDetail(sessionName, target, { stream, ref, history_id }) {
+    const { data } = await api.get(
+      `/sessions/${sessionName}/history/${encodeTarget(target)}/detail`,
+      { params: { stream, ref, history_id } },
+    )
+    return data
+  },
+
+  /** Read one bounded saved history page. */
+  async getHistoryPage(sessionName, target, options = {}) {
+    const params = buildHistoryPageParams(options)
+    const { data } = await api.get(`/sessions/${sessionName}/history/${encodeTarget(target)}`, {
+      params,
+    })
     return data
   },
 
@@ -1145,8 +1210,27 @@ export const settingsAPI = {
     const { data } = await api.get("/settings/codex-status", _nodeQuery(node))
     return data
   },
+  async getAntigravityStatus(node = "_host") {
+    const { data } = await api.get("/settings/antigravity-status", _nodeQuery(node))
+    return data
+  },
+  async getAntigravityUsage(node = "_host") {
+    const { data } = await api.get("/settings/antigravity-usage", {
+      timeout: 90000,
+      ..._nodeQuery(node),
+    })
+    return data
+  },
   async getGrokStatus(node = "_host") {
     const { data } = await api.get("/settings/grok-status", _nodeQuery(node))
+    return data
+  },
+  /**
+   * Node-local Grok subscription usage. The body is the normalized
+   * contract only — never an upstream error or credential.
+   */
+  async getGrokUsage(node = "_host") {
+    const { data } = await api.get("/settings/grok-usage", { timeout: 120000, ..._nodeQuery(node) })
     return data
   },
   async codexLogin(node = "_host") {
