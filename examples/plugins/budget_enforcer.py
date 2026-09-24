@@ -3,7 +3,7 @@
 Demonstrates:
   - post_llm_call: track cumulative usage after each call
   - pre_llm_call: block the next call if budget exceeded (return empty)
-  - State persistence: survive session resume via get_state/set_state
+  - State persistence: survive session resume via get_state_async/set_state_async
   - Options: configurable budget, warn threshold, per-model pricing
 
 This is similar to kt-biome' cost_tracker but focuses on the
@@ -20,6 +20,7 @@ Usage in config.yaml:
           warn_at_pct: 80         # Emit one warning before hard exhaustion.
 """
 
+import asyncio
 from typing import Any
 
 from kohakuterrarium.modules.plugin.base import BasePlugin, PluginContext
@@ -42,6 +43,7 @@ class BudgetEnforcerPlugin(BasePlugin):
         self._total_output = 0
         self._warned = False
         self._exhausted = False
+        self._lock = asyncio.Lock()
         self._ctx: PluginContext | None = None
 
     @property
@@ -51,10 +53,13 @@ class BudgetEnforcerPlugin(BasePlugin):
     async def on_load(self, context: PluginContext) -> None:
         self._ctx = context
         # Session state keeps cumulative usage intact after resume.
-        saved_input = context.get_state("total_input")
-        if saved_input is not None:
-            self._total_input = int(saved_input)
-            self._total_output = int(context.get_state("total_output") or 0)
+        async with self._lock:
+            saved_input = await context.get_state_async("total_input")
+            if saved_input is not None:
+                self._total_input = int(saved_input)
+                self._total_output = int(
+                    await context.get_state_async("total_output") or 0
+                )
         logger.info(
             "Budget enforcer loaded",
             budget=self._max_tokens,
@@ -92,12 +97,13 @@ class BudgetEnforcerPlugin(BasePlugin):
         self, messages: list[dict], response: str, usage: dict, **kwargs
     ) -> None:
         """Accumulate usage, persist it, and update warning or stop state."""
-        self._total_input += usage.get("prompt_tokens", 0)
-        self._total_output += usage.get("completion_tokens", 0)
+        async with self._lock:
+            self._total_input += usage.get("prompt_tokens", 0)
+            self._total_output += usage.get("completion_tokens", 0)
 
-        if self._ctx:
-            self._ctx.set_state("total_input", self._total_input)
-            self._ctx.set_state("total_output", self._total_output)
+            if self._ctx:
+                await self._ctx.set_state_async("total_input", self._total_input)
+                await self._ctx.set_state_async("total_output", self._total_output)
 
         pct = self._total / self._max_tokens if self._max_tokens else 0
 

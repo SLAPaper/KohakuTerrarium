@@ -1,17 +1,10 @@
-"""Persist runtime model / plugin selections so resume keeps them.
-
-``switch_model`` and plugin toggles are pure in-memory operations today;
-a resumed agent rebuilds its LLM and plugin manager from config and falls
-back to the defaults. These helpers snapshot the selections into private
-session state (the same ``store.state["{agent}:*"]`` surface used by
-``NativeToolOptions``) and re-apply them during resume. Restores are
-best-effort: an invalid or vanished profile/plugin name silently keeps
-the default rather than failing the resume.
-"""
+"""Restore durable model controls and legacy model/plugin selection caches."""
 
 import json
 from typing import Any
 
+from kohakuterrarium.errors import SessionError
+from kohakuterrarium.session.store_control import read_model_selection
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -66,6 +59,13 @@ def load_model_selection(agent: Any, store: Any | None = None) -> str | None:
     key = _state_key(agent, MODEL_SELECTION_STATE_KEY)
     if store is None or key is None:
         return None
+    namespace = (
+        getattr(getattr(agent, "_session_output", None), "_event_key_prefix", None)
+        or agent.config.name
+    )
+    committed = read_model_selection(store, namespace)
+    if committed is not None:
+        return committed
     raw = store.state.get(key)
     return str(raw) if raw else None
 
@@ -99,22 +99,30 @@ def load_plugin_selection(
 
 
 def restore_selections(agent: Any, store: Any | None = None) -> None:
-    """Re-apply persisted model / plugin selections on resume.
-
-    Called after the conversation, scratchpad, and native-tool-option
-    state have been restored. ``store`` may be passed explicitly because
-    resume calls this before ``attach_session_store``. Both restores are
-    best-effort: ``switch_model`` validates the profile and plugin toggles
-    tolerate names that no longer exist, so a stale selection degrades to
-    the default instead of failing the resume.
-    """
+    """Restore committed model intent strictly and legacy caches best-effort."""
     selector = load_model_selection(agent, store)
     if selector:
         switch = getattr(agent, "switch_model", None)
         if callable(switch):
             try:
                 switch(selector)
-            except Exception:
+            except Exception as exc:
+                stored = _store_of(agent, store)
+                namespace = (
+                    getattr(
+                        getattr(agent, "_session_output", None),
+                        "_event_key_prefix",
+                        None,
+                    )
+                    or agent.config.name
+                )
+                if (
+                    stored is not None
+                    and read_model_selection(stored, namespace) is not None
+                ):
+                    raise SessionError(
+                        "Cannot restore committed model selection"
+                    ) from exc
                 logger.warning(
                     "stale model selection ignored",
                     selector=selector,

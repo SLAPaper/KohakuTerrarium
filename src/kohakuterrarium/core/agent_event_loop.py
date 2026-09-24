@@ -12,6 +12,7 @@ from kohakuterrarium.core.agent_mid_turn import _to_serializable_content
 from kohakuterrarium.core.agent_runtime_tools import _make_job_label
 from kohakuterrarium.core.event_inbox import EventEnvelope, TurnOutcome
 from kohakuterrarium.core.metrics_hook import metrics
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.core.pending_input import pending_id_of
 from kohakuterrarium.session.raw_history import append_user_event_pair
 from kohakuterrarium.llm.message import content_parts_to_dicts
@@ -154,6 +155,7 @@ class AgentEventLoopMixin:
                     if not self._running:
                         self._reject_run(run, status="rejected")
                         return
+                    require_model_mutation_available(self)
                     await self._begin_batch(events)
                     await self._process_batch_with_controller(events, self.controller)
                     interrupted = bool(primary.context.get("interrupted_by_user"))

@@ -454,7 +454,8 @@ class TestApiCreatureJourney:
             )
             assert edited.status_code == 200, edited.text
             replayed = client.get(
-                f"/api/sessions/{session_id}/creatures/{creature_id}/history"
+                f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+                params={"stream": "snapshot", "limit": 400},
             ).json()
             assert replayed["messages"][-1]["content"] == "Edited turn completed."
             for message in replayed["messages"]:
@@ -507,7 +508,10 @@ class TestApiCreatureJourney:
         resp = client.get(f"/api/sessions/{session_id}/creatures/{creature_id}/history")
         assert resp.status_code == 200
         history = resp.json()
-        messages = history["messages"]
+        messages = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+            params={"stream": "snapshot", "limit": 400},
+        ).json()["messages"]
         roles = [m.get("role") for m in messages]
         assert roles.count("user") >= 3
         joined = " ".join(
@@ -527,7 +531,11 @@ class TestApiCreatureJourney:
         resp = client.get(f"/api/sessions/{session_id}/creatures/warm-ember/history")
         assert resp.status_code == 200
         by_name = resp.json()
-        assert len(by_name["messages"]) == len(messages)
+        by_name_messages = client.get(
+            f"/api/sessions/{session_id}/creatures/warm-ember/history",
+            params={"stream": "snapshot", "limit": 400},
+        ).json()["messages"]
+        assert by_name_messages == messages
         event_types = {e.get("type") for e in by_name["events"]}
         for required in (
             "user_input",
@@ -597,7 +605,11 @@ class TestApiCreatureJourney:
             if e.get("turn_index") == 1 and e.get("branch_id") is not None
         }
         assert turn1_branches == {1, 2, 3}
-        live_user = [m for m in edited_history["messages"] if m.get("role") == "user"]
+        edited_messages = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+            params={"stream": "snapshot", "limit": 400},
+        ).json()["messages"]
+        live_user = [m for m in edited_messages if m.get("role") == "user"]
         assert any(
             "edited hello creature" in (m.get("content") or "") for m in live_user
         )
@@ -618,9 +630,13 @@ class TestApiCreatureJourney:
         resp = client.get(f"/api/sessions/{session_id}/creatures/calm-river/history")
         assert resp.status_code == 200
         renamed_history = resp.json()
+        renamed_messages = client.get(
+            f"/api/sessions/{session_id}/creatures/calm-river/history",
+            params={"stream": "snapshot", "limit": 400},
+        ).json()["messages"]
         renamed_msgs = " ".join(
             m.get("content", "") if isinstance(m.get("content"), str) else ""
-            for m in renamed_history["messages"]
+            for m in renamed_messages
         )
         assert _REPLY_RENAMED in renamed_msgs
         renamed_chunks = "".join(
@@ -793,7 +809,12 @@ class TestApiCreatureJourney:
         resp = client.get(f"/api/sessions/{resumed_id}/creatures/alice/history")
         assert resp.status_code == 200
         resumed_history = resp.json()
-        resumed_blob = str(resumed_history["messages"])
+        snapshot = client.get(
+            f"/api/sessions/{resumed_id}/creatures/alice/history",
+            params={"stream": "snapshot", "limit": 400},
+        )
+        assert snapshot.status_code == 200
+        resumed_blob = str(snapshot.json()["messages"])
         assert "persist this turn" in resumed_blob
         assert _REPLY_GREET in resumed_blob
         # The restored turn/branch counters carried over: the recorded

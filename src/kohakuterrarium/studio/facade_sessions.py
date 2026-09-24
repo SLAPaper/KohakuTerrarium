@@ -381,8 +381,8 @@ class _SessionsModel:
     def __init__(self, studio: Studio) -> None:
         self._studio = studio
 
-    def switch(self, session_id: str, creature_id: str, profile_name: str) -> str:
-        return _session_model.switch_model(
+    async def switch(self, session_id: str, creature_id: str, profile_name: str) -> str:
+        return await _session_model.switch_model(
             self._studio._service, session_id, creature_id, profile_name
         )
 

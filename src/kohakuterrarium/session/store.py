@@ -28,6 +28,7 @@ from kohakuterrarium.session.store_counters import (
     restore_subagent_counters,
     restore_suffix_counters,
 )
+from kohakuterrarium.session.store_control import append_control_event
 from kohakuterrarium.session.store_fork import perform_fork
 from kohakuterrarium.session.store_lock import (
     TABLE_ATTRS,
@@ -74,6 +75,7 @@ class SessionStore(StoreAffinityMixin):
     rollups, job records, and full-text search data.
     """
 
+    append_control_event = append_control_event
     # Flush on either explicit threshold; KVault's interval remains a fallback.
     DEFAULT_FLUSH_EVERY_N_EVENTS = 4
     DEFAULT_FLUSH_EVERY_N_SECONDS = 1.0

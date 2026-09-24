@@ -7,6 +7,11 @@ import asyncio
 from typing import Any
 
 from kohakuterrarium.core.job import JobState, JobType
+from kohakuterrarium.core.model_switch_runtime import (
+    close_retired_model_providers,
+    drain_model_switches,
+    mark_model_switch_closing,
+)
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.utils.logging import get_logger
 
@@ -79,19 +84,20 @@ class AgentLifecycleMixin:
             return
         self._paused = False
         self.trigger_manager.resume_all()
-        # One wake releases the gate and lets the consumer claim the full queued batch.
         self._consumer_resume.set()
         self._event_inbox.wake()
         logger.info("Agent resumed", agent_name=self.config.name)
 
     async def stop(self) -> None:
         """Stop all agent modules once, serializing concurrent callers."""
+        mark_model_switch_closing(self)
         stop_lock = getattr(self, "_stop_lock", None)
         if stop_lock is None:
             stop_lock = self._stop_lock = asyncio.Lock()
         async with stop_lock:
             if getattr(self, "_stopped", False):
                 return
+            await drain_model_switches(self)
             await self._stop_inner()
             self._stopped = True
 
@@ -102,14 +108,10 @@ class AgentLifecycleMixin:
             await self.plugins.notify("on_agent_stop")
             await self.plugins.unload_all()
 
-        # Job terminals require both the running state and output router to remain live.
         self._finalize_inflight_jobs_for_stop()
-
         self._running = False
         self._shutdown_event.set()
 
-        # Wake the single event consumer so it observes ``_running`` False
-        # and exits instead of parking forever on the inbox / resume gate.
         consumer_resume = getattr(self, "_consumer_resume", None)
         if consumer_resume is not None:
             consumer_resume.set()
@@ -117,7 +119,6 @@ class AgentLifecycleMixin:
         if inbox is not None:
             inbox.wake()
 
-        # Unwind a live turn before closing its sinks, but never self-cancel stop().
         processing = getattr(self, "_processing_task", None)
         if (
             processing is not None
@@ -126,7 +127,6 @@ class AgentLifecycleMixin:
         ):
             processing.cancel()
             await asyncio.gather(processing, return_exceptions=True)
-        # The processing lock also covers output, wiring, and session finalization.
         turn_lock = getattr(self, "_processing_lock", None)
         if (
             turn_lock is not None
@@ -141,7 +141,6 @@ class AgentLifecycleMixin:
                     agent_name=self.config.name,
                 )
 
-        # Consumer cancellation rejects pending futures so callers cannot hang on shutdown.
         consumer = getattr(self, "_consumer_task", None)
         if (
             consumer is not None
@@ -165,6 +164,7 @@ class AgentLifecycleMixin:
         if self.compact_manager:
             await self.compact_manager.cancel()
         await self.output_router.stop()
+        await close_retired_model_providers(self)
         compact_llm = (
             getattr(self.compact_manager, "_llm", None)
             if self.compact_manager
@@ -212,7 +212,6 @@ class AgentLifecycleMixin:
             }
             if is_subagent:
                 metadata["result"] = error
-            # Pair only announced native calls; an orphan result would invalidate text-mode history.
             meta = getattr(self, "_direct_job_meta", {}).get(job_id) or {}
             tool_call_id = meta.get("tool_call_id")
             controller = getattr(self, "controller", None)

@@ -773,7 +773,7 @@ class TestStudioIntegration:
             # --- model switch: needs a key + a profile ------------------
             studio.identity.keys.set("openai", "sk-integration-test-key")
             studio.identity.llm.save_profile("rt-fast", "gpt-4o-mini", "openai")
-            new_model = studio.sessions.model.switch(
+            new_model = await studio.sessions.model.switch(
                 session_id, creature_id, "openai/rt-fast"
             )
             assert new_model == "openai/rt-fast"

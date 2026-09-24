@@ -5,6 +5,7 @@ Plugin membership changes must update command and prompt inventories together.
 
 from typing import Any
 
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.modules.user_command.aggregate import (
     CommandContribution,
     CommandProvenance,
@@ -43,8 +44,14 @@ class PluginCommandRefreshMixin:
                 )
         return out
 
+    def _require_model_mutation_available(self) -> None:
+        context = self._load_context
+        host = context._host_agent if context is not None else None
+        require_model_mutation_available(host)
+
     def unregister(self, name: str) -> bool:
         """Remove same-named plugins, clear toggle state, and refresh inventories."""
+        self._require_model_mutation_available()
         before = len(self._plugins)
         self._plugins = [p for p in self._plugins if getattr(p, "name", "") != name]
         removed = len(self._plugins) != before

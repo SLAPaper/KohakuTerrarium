@@ -2,6 +2,7 @@
 
 from kohakuterrarium.builtins.user_commands.registry import register_user_command
 from kohakuterrarium.llm.profiles import list_all
+from kohakuterrarium.errors import KTError
 from kohakuterrarium.modules.user_command.base import (
     BaseUserCommand,
     CommandLayer,
@@ -24,7 +25,7 @@ class ModelCommand(BaseUserCommand):
     ) -> UserCommandResult:
         if not args:
             return self._list_models(context)
-        return self._switch_model(args.strip(), context)
+        return await self._switch_model(args.strip(), context)
 
     def _list_models(self, context: UserCommandContext) -> UserCommandResult:
         entries = list_all()
@@ -99,16 +100,16 @@ class ModelCommand(BaseUserCommand):
             ),
         )
 
-    def _switch_model(
+    async def _switch_model(
         self, name: str, context: UserCommandContext
     ) -> UserCommandResult:
         if not context.agent:
             return UserCommandResult(error="No agent context for model switching.")
         try:
-            model = context.agent.switch_model(name)
+            model = await context.agent.switch_model_async(name)
             return UserCommandResult(
                 output=f"Switched to: {model}",
                 data=ui_notify(f"Model switched to {model}", level="success"),
             )
-        except ValueError as e:
+        except (ValueError, KTError) as e:
             return UserCommandResult(error=str(e))

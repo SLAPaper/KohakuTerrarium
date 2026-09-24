@@ -5,6 +5,7 @@ Validate, apply, and persist session-scoped plugin option overrides.
 
 from typing import TYPE_CHECKING, Any
 
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -38,6 +39,7 @@ class PluginOptions:
         Raises ``ValueError`` (subclass ``PluginOptionError``) on
         invalid input — unknown keys, wrong types, out-of-range values.
         """
+        require_model_mutation_available(self._agent)
         manager = getattr(self._agent, "plugins", None)
         if manager is None:
             raise KeyError(plugin_name)
@@ -55,6 +57,7 @@ class PluginOptions:
         Invalid entries are logged and skipped so other plugins can still be
         rehydrated.
         """
+        require_model_mutation_available(self._agent)
         data = self._load_private_state()
         if not isinstance(data, dict):
             return

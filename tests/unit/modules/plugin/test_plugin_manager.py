@@ -16,6 +16,7 @@ from kohakuterrarium.modules.plugin.base import (
     ToolVisibility,
 )
 from kohakuterrarium.modules.plugin.manager import PluginManager
+from kohakuterrarium.session.store import SessionStore
 
 # ── Test plugins ───────────────────────────────────────────────────
 
@@ -575,11 +576,9 @@ class TestCollectors:
         mgr.register(_WrongShape())
         assert mgr.collect_tool_visibility() is None
 
-    async def test_collect_tool_visibility_uses_plugin_scoped_context(self):
-        class _StateStore:
-            def __init__(self):
-                self.state: dict[str, object] = {}
-
+    async def test_collect_tool_visibility_uses_plugin_scoped_context(
+        self, tmp_path, request
+    ):
         class _StatefulVisibility(BasePlugin):
             name = "stateful"
 
@@ -591,14 +590,23 @@ class TestCollectors:
             async def on_load(self, context):
                 context.set_state("promoted", True)
 
-        store = _StateStore()
-        host = SimpleNamespace(session_store=store)
+        store = SessionStore(tmp_path / "visibility.kohakutr")
+        request.addfinalizer(store.close)
+        host = SimpleNamespace(session_store=store, config=SimpleNamespace(name="a"))
         mgr = PluginManager()
         mgr.register(_StatefulVisibility())
         await mgr.load_all(PluginContext(agent_name="a", _host_agent=host))
-        # on_load wrote plugin:stateful:promoted; the visibility hook must
-        # receive a context scoped to the same plugin name.
+        # on_load wrote the creature-scoped stateful key; the visibility hook
+        # must receive a context scoped to the same plugin name.
         assert mgr.collect_tool_visibility() is None
+        scoped = PluginContext(
+            agent_name="a", _host_agent=host, _plugin_name="stateful"
+        )
+        assert scoped.get_state("promoted") == 1
+        scoped.set_state("promoted", False)
+        assert mgr.collect_tool_visibility() == ToolVisibility(
+            allowed_tools=frozenset({"read"})
+        )
 
     def test_collect_tool_visibility_applies_against_current_model(self):
         class _ModelVisibility(BasePlugin):

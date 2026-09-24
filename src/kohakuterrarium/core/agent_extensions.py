@@ -7,6 +7,8 @@ and prompt bookkeeping needed to make an extension immediately usable.
 
 from typing import Any
 
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
+
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.modules.plugin.manager import PluginManager
 from kohakuterrarium.modules.trigger.base import BaseTrigger
@@ -26,12 +28,24 @@ class AgentExtensionsMixin:
         controller actually SEES the new tool (the old two-step
         registry/executor dance left the prompt frozen).
         """
+        require_model_mutation_available(self)
         self.registry.register_tool(tool)
         self.executor.register_tool(tool)
         self.refresh_system_prompt()
         logger.info("Tool added at runtime", tool_name=tool.tool_name)
 
     async def add_plugin(self, plugin: Any, *, enabled: bool = True) -> None:
+        """Register a plugin while reserving its model-sensitive initialization."""
+        require_model_mutation_available(self)
+        self._model_sensitive_extension_active = (
+            getattr(self, "_model_sensitive_extension_active", 0) + 1
+        )
+        try:
+            await self._add_plugin(plugin, enabled=enabled)
+        finally:
+            self._model_sensitive_extension_active -= 1
+
+    async def _add_plugin(self, plugin: Any, *, enabled: bool = True) -> None:
         """Register a plugin instance with full lifecycle wiring.
 
         The plugin joins the manager (created on demand), its hooks
@@ -73,6 +87,7 @@ class AgentExtensionsMixin:
 
     def add_subagent(self, config: Any) -> None:
         """Register a :class:`SubAgentConfig` instance + refresh prompt."""
+        require_model_mutation_available(self)
         self.subagent_manager.register(config)
         self.refresh_system_prompt()
         logger.info(
@@ -89,6 +104,7 @@ class AgentExtensionsMixin:
         (the runtime-graph section) are re-applied by their owners on
         the next engine event.
         """
+        require_model_mutation_available(self)
         system_prompt = self._build_aggregated_prompt()
         self._controller_config.system_prompt = system_prompt
         controller = getattr(self, "controller", None)

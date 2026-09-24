@@ -11,6 +11,12 @@ from typing import TYPE_CHECKING, Any, Callable
 from kohakuterrarium.modules.plugin.option_validation import (
     validate_plugin_options,
 )
+from kohakuterrarium.modules.plugin.state_io import (
+    get_plugin_state,
+    get_plugin_state_sync,
+    set_plugin_state,
+    set_plugin_state_sync,
+)
 from kohakuterrarium.plugins_context import (
     spawn_child_agent as _default_spawn_child_agent_helper,
 )
@@ -142,7 +148,7 @@ class PluginContext:
         return getattr(agent, "subagent_manager", None)
 
     def switch_model(self, name: str) -> str:
-        """Switch the LLM model. Returns resolved model name."""
+        """Switch the LLM model before the host starts; return its resolved name."""
         agent = self._host_agent
         if agent is not None and hasattr(agent, "switch_model"):
             return agent.switch_model(name)
@@ -153,6 +159,13 @@ class PluginContext:
         agent = self._host_agent
         if agent is not None and hasattr(agent, "controller"):
             agent.controller.push_event_sync(event)
+
+    async def switch_model_async(self, name: str) -> str:
+        """Confirm a live model switch; conflicting active turns are rejected."""
+        agent = self._host_agent
+        if agent is None:
+            return ""
+        return await agent.switch_model_async(name)
 
     async def emit(self, event: Any) -> None:
         """Emit a display-only output event through the host router."""
@@ -186,18 +199,20 @@ class PluginContext:
         queue.append({"role": role, "content": content})
 
     def get_state(self, key: str) -> Any:
-        """Read plugin-scoped state from session store."""
-        store = self.session_store
-        if store is None:
-            return None
-        return store.state.get(f"plugin:{self._plugin_name}:{key}")
+        """Read detached scoped state; block the caller until the worker completes."""
+        return get_plugin_state_sync(self, key)
 
     def set_state(self, key: str, value: Any) -> None:
-        """Write plugin-scoped state to session store."""
-        store = self.session_store
-        if store is None:
-            return
-        store.state[f"plugin:{self._plugin_name}:{key}"] = value
+        """Confirm a scoped write; block the caller until the worker completes."""
+        set_plugin_state_sync(self, key, value)
+
+    async def get_state_async(self, key: str) -> Any:
+        """Read creature-and-plugin-scoped state through the store worker."""
+        return await get_plugin_state(self, key)
+
+    async def set_state_async(self, key: str, value: Any) -> None:
+        """Write creature-and-plugin-scoped state through the store worker."""
+        await set_plugin_state(self, key, value)
 
     def spawn_child_agent(
         self,

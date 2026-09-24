@@ -83,6 +83,7 @@ class PluginManager(PluginCommandRefreshMixin, ToolVisibilityCollectorMixin):
         return len(self._plugins)
 
     def register(self, plugin: BasePlugin) -> None:
+        self._require_model_mutation_available()
         if name := getattr(plugin, "name", ""):
             self.unregister(name)
         self._plugins.append(plugin)
@@ -95,6 +96,7 @@ class PluginManager(PluginCommandRefreshMixin, ToolVisibilityCollectorMixin):
 
     def enable(self, name: str) -> bool:
         """Enable a plugin, rolling back state if host inventory refresh fails."""
+        self._require_model_mutation_available()
         if name in self._disabled:
             self._disabled.discard(name)
             self._needs_load.add(name)
@@ -110,6 +112,7 @@ class PluginManager(PluginCommandRefreshMixin, ToolVisibilityCollectorMixin):
         return any(getattr(p, "name", "") == name for p in self._plugins)
 
     def disable(self, name: str) -> bool:
+        self._require_model_mutation_available()
         for p in self._plugins:
             if getattr(p, "name", "") == name:
                 self._disabled.add(name)
@@ -184,6 +187,7 @@ class PluginManager(PluginCommandRefreshMixin, ToolVisibilityCollectorMixin):
 
     def set_plugin_options(self, name: str, values: dict[str, Any]) -> dict[str, Any]:
         """Apply validated overrides and return the plugin's merged options."""
+        self._require_model_mutation_available()
         plugin = self.get_plugin(name)
         if plugin is None:
             raise KeyError(name)

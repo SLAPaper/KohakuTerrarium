@@ -1,6 +1,7 @@
 """Route parsed and typed events across default, named, and secondary outputs."""
 
 import asyncio
+from copy import deepcopy
 
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.modules.output.event import OutputEvent, UIReply
@@ -209,6 +210,25 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
                     output=type(target).__name__,
                     event_type=event.type,
                     error=str(exc),
+                    exc_info=True,
+                )
+
+    def _notify_generation_observers(self, payload: dict) -> None:
+        """Notify renderers of an origin already confirmed by the canonical sink."""
+        for target in (self.default_output, *self._secondary_outputs):
+            if getattr(type(target), "_kt_canonical_session_output", False):
+                continue
+            try:
+                if hasattr(target, "on_activity_with_metadata"):
+                    target.on_activity_with_metadata(
+                        "assistant_generation_start", "", deepcopy(payload)
+                    )
+                else:
+                    target.on_activity("assistant_generation_start", "")
+            except Exception:
+                logger.warning(
+                    "Generation observer failed",
+                    output=type(target).__name__,
                     exc_info=True,
                 )
 

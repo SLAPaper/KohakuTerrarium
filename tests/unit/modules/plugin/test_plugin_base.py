@@ -18,6 +18,8 @@ from kohakuterrarium.modules.plugin.base import (
     ToolVisibility,
 )
 from kohakuterrarium.modules.plugin.option_validation import PluginOptionError
+from kohakuterrarium.modules.plugin.state_scope import context_state_key
+from kohakuterrarium.session.store import SessionStore
 
 
 class _FakeStore:
@@ -147,13 +149,18 @@ class TestPluginContextWithAgent:
             {"role": "system", "content": "second"},
         ]
 
-    def test_plugin_scoped_state_is_namespaced(self):
-        # Contract: get/set_state writes under plugin:<name>:<key>.
-        store = _FakeStore()
-        agent = _FakeAgent(session_store=store)
-        ctx = PluginContext(agent_name="a", _host_agent=agent, _plugin_name="budget")
+    def test_plugin_scoped_state_is_namespaced(self, tmp_path, request):
+        store = SessionStore(tmp_path / "state.kohakutr")
+        request.addfinalizer(store.close)
+        agent = _FakeAgent(session_store=store, config=type("C", (), {"name": "a"})())
+        ctx = PluginContext(
+            agent_name="stale", _host_agent=agent, _plugin_name="budget"
+        )
         ctx.set_state("turns", 7)
-        assert store.state == {"plugin:budget:turns": 7}
+        assert (
+            store.submit(lambda: store.state[context_state_key(ctx, "turns")]).result()
+            == 7
+        )
         assert ctx.get_state("turns") == 7
         # A different plugin name does NOT see it.
         other = PluginContext(

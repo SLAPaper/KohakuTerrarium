@@ -1,16 +1,57 @@
 """Engine mutation guards for graph-local creature identities."""
 
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
+
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 
 from kohakuterrarium.terrarium.graph_identity import (
     GraphNameConflictError,
     creature_name_aliases,
     ensure_graph_name_available,
 )
+from kohakuterrarium.terrarium.session_plugin_state import validate_graph_plugin_state
 
 if TYPE_CHECKING:
     from kohakuterrarium.terrarium.creature_host import Creature, CreatureRef
     from kohakuterrarium.terrarium.engine import Terrarium
+
+
+def guard_graph_model_bindings(engine: "Terrarium", *graph_ids: str) -> None:
+    """Reject graph changes that would disturb a pending model publication."""
+    for graph_id in set(graph_ids):
+        graph = engine._topology.graphs.get(graph_id)
+        if graph is not None:
+            for cid in graph.creature_ids:
+                creature = engine._creatures.get(cid)
+                if creature is not None:
+                    require_model_mutation_available(creature.agent)
+    validate_graph_plugin_state(engine, graph_ids)
+
+
+@contextmanager
+def reserve_graph_model_bindings(engine: "Terrarium", graph_id: str):
+    """Keep model replacement out of an asynchronous graph-removal window."""
+    guard_graph_model_bindings(engine, graph_id)
+    graph = engine._topology.graphs.get(graph_id)
+    agents = (
+        [
+            engine._creatures[cid].agent
+            for cid in graph.creature_ids
+            if cid in engine._creatures
+        ]
+        if graph is not None
+        else []
+    )
+    for agent in agents:
+        agent._model_sensitive_extension_active = (
+            getattr(agent, "_model_sensitive_extension_active", 0) + 1
+        )
+    try:
+        yield
+    finally:
+        for agent in agents:
+            agent._model_sensitive_extension_active -= 1
 
 
 def bind_runtime_creature_id(creature: "Creature") -> None:
@@ -63,6 +104,7 @@ def resolve_and_guard_connect(
     receiver_graph_id = engine._topology.creature_to_graph.get(
         receiver_creature.creature_id
     )
+    guard_graph_model_bindings(engine, sender_graph_id, receiver_graph_id)
     if (
         sender_graph_id != receiver_graph_id
         and sender_graph_id is not None

@@ -7,13 +7,13 @@ from kohakuterrarium.terrarium import TerrariumService
 from kohakuterrarium.studio._runtime import as_engine
 
 
-def switch_model(
+async def switch_model(
     service: "TerrariumService", session_id: str, creature_id: str, profile_name: str
 ) -> str:
     """Switch a creature's LLM model.  Returns the new model name."""
     engine = as_engine(service)
     creature = find_creature(engine, session_id, creature_id)
-    return creature.agent.switch_model(profile_name)
+    return await creature.agent.switch_model_async(profile_name)
 
 
 def set_native_tool_options(

@@ -29,6 +29,7 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.core import agent_model as _agent_model_mod
 from kohakuterrarium.core.agent import Agent
+from kohakuterrarium.core.agent_lifecycle import wait_for_turn_completion
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.events import (
     EventType,
@@ -245,10 +246,11 @@ def _write_config(config_dir, name: str = "pilot") -> str:
 
 
 async def _drain_chat(creature: Creature, message: str) -> str:
-    """``Creature.chat`` consumed to completion — the canonical drive."""
+    """Consume the legacy text stream and join its turn finalization."""
     chunks: list[str] = []
     async for chunk in creature.chat(message):
         chunks.append(chunk)
+    await wait_for_turn_completion(creature.agent, creature.agent._turn_completion)
     return "".join(chunks)
 
 
@@ -355,7 +357,7 @@ class TestProgCreatureJourney:
 
             # ---- milestone 5: change the model mid-session -----------
             original_llm = agent.llm
-            identifier = agent.switch_model("test/fast-model")
+            identifier = await agent.switch_model_async("test/fast-model")
             assert identifier == "test/fast-model"
             # The swap took on both the agent and its controller.
             assert agent.llm is not original_llm

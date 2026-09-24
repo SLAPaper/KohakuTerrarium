@@ -1,4 +1,4 @@
-"""Persist routed agent output and activity events to a session store.
+"""Session event log output module.
 
 Event appends are dispatched to the store's single-worker affinity thread in
 submit order. :meth:`SessionOutput.drain` waits for queued writes to complete;
@@ -20,6 +20,11 @@ from kohakuterrarium.session.output_activity import (
     _subagent_name as _subagent_name,  # noqa: F401
     _token_metadata as _token_metadata,  # noqa: F401
 )
+from kohakuterrarium.session.output_generation import (
+    ASSISTANT_EVENTS,
+    begin_generation,
+    stamp_generation,
+)
 from kohakuterrarium.session.text_buffer import (
     OpenTextSegment,
     last_persisted_turn_branch,
@@ -38,6 +43,9 @@ class SessionOutput(SessionActivityMixin, OutputModule):
     saves the conversation snapshot and agent state.
     """
 
+    _kt_canonical_session_output = True
+    _begin_generation = begin_generation
+
     def __init__(
         self,
         agent_name: str,
@@ -51,6 +59,8 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         self._store = store
         self._agent = agent
         self._capture_activity = capture_activity
+        self._generation_id: str | None = None
+        self._generation_coordinates = None
         # Attached agents require a host-scoped namespace to avoid collisions.
         self._event_key_prefix = event_key_prefix or agent_name
         # Durable buffering preserves partial text across process interruption.
@@ -108,8 +118,11 @@ class SessionOutput(SessionActivityMixin, OutputModule):
     def _append_event(self, event_type: str, data: dict) -> Future:
         """Append one event under this sink's configured namespace."""
         ti, bi = self._current_turn_branch()
+        path = self._current_parent_path()
+        if event_type in ASSISTANT_EVENTS and self._generation_coordinates is not None:
+            ti, bi, path = self._generation_coordinates
         return self._append_event_at(
-            event_type, data, ti, bi, self._current_parent_path()
+            event_type, stamp_generation(self, event_type, data), ti, bi, path
         )
 
     def _append_event_at(
@@ -208,6 +221,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
 
     async def stop(self) -> None:
         await self.flush()
+        self._generation_id = self._generation_coordinates = None
 
     async def write(self, text: str) -> None:
         self._ingest_text(text)
@@ -284,6 +298,8 @@ class SessionOutput(SessionActivityMixin, OutputModule):
                 logger.warning("Session record failed", error=str(exc), exc_info=True)
 
     async def on_processing_start(self, *, request_id: str | None = None) -> None:
+        self._flush_text_segment()
+        self._generation_id = self._generation_coordinates = None
         # Sequence numbers are local to one assistant response.
         self._chunk_seq = 0
         payload = {"request_id": request_id} if request_id is not None else {}
@@ -294,6 +310,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         # turn, so drain before reading the store.
         await self.drain()
         self._record("processing_end", {})
+        self._generation_id = self._generation_coordinates = None
         # _record flushed the open text segment and queued processing_end
         # itself; drain again so the turn's final events are durable and
         # the snapshot watermark below cannot run ahead of the log.
@@ -473,7 +490,8 @@ class SessionOutput(SessionActivityMixin, OutputModule):
                 await self.on_processing_end()
             case "user_input":
                 # The agent writes the canonical user-input event directly.
-                pass
+                self._flush_text_segment()
+                self._generation_id = self._generation_coordinates = None
             case "assistant_image":
                 payload = event.payload
                 self.on_assistant_image(

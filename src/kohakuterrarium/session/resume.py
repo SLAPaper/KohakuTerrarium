@@ -13,7 +13,7 @@ from kohakuterrarium.core.conversation_elide import (
     elide_stale_tool_results,
     estimate_tokens,
 )
-from kohakuterrarium.errors import SessionNotResumableError
+from kohakuterrarium.errors import SessionError, SessionNotResumableError
 from kohakuterrarium.modules.input.base import InputModule
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.packages.resolve import resolve_any_path
@@ -363,11 +363,10 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
             count=len(saved_triggers),
         )
 
-    # Re-apply the persisted model / plugin selections (best-effort;
-    # stale profiles/plugins degrade to the config defaults). The store
-    # is passed explicitly because attach_session_store runs after this.
     try:
         restore_selections(agent, store)
+    except SessionError:
+        raise
     except Exception:  # pragma: no cover - resume continues without selections
         logger.warning(
             "selection restore failed",

@@ -200,6 +200,20 @@ class TestSessionIntegration:
         try:
             await agent._process_event(create_user_input_event("introduce yourself"))
             await agent._process_event(create_user_input_event("use the echo tool"))
+            await store.run(lambda: None)
+            generation_events = await store.run(store.get_events, "scribe")
+            starts = [
+                e
+                for e in generation_events
+                if e["type"] == "assistant_generation_start"
+            ]
+            assert len(starts) == 3
+            assert len({e["generation_id"] for e in starts}) == 3
+            for answer in (e for e in generation_events if e["type"] == "text_chunk"):
+                origin = next(
+                    e for e in starts if e["generation_id"] == answer["generation_id"]
+                )
+                assert origin["event_id"] < answer["event_id"]
             # Drive the SessionOutput activity surface the runtime uses:
             # notify_activity → on_activity_with_metadata → _record_activity
             # dispatch table. Each call must land as a typed event row.

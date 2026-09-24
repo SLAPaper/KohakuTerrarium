@@ -74,8 +74,9 @@ class _MockAgent:
     def get_system_prompt(self):
         return "you are X"
 
-    def switch_model(self, model):
+    async def switch_model_async(self, model):
         self.config.model = model
+        return model
 
 
 class _MockCreature:
@@ -356,15 +357,13 @@ class TestPerCreatureOps:
         assert out == "new-model"
         assert c.agent.config.model == "new-model"
 
-    async def test_switch_model_fallback(self):
+    async def test_missing_async_switch_cannot_publish_only_config(self):
         svc, c = _build_service()
-        # Strip the helper class-method by replacing the agent with one
-        # that lacks switch_model, so the hasattr branch flips.
         new_agent = SimpleNamespace(config=SimpleNamespace(model="m"))
         c.agent = new_agent
-        out = await svc.switch_model("cid", "fallback-model")
-        assert out == "fallback-model"
-        assert new_agent.config.model == "fallback-model"
+        with pytest.raises(AttributeError, match="switch_model_async"):
+            await svc.switch_model("cid", "fallback-model")
+        assert new_agent.config.model == "m"
 
     async def test_list_plugins_empty(self):
         svc, _ = _build_service()

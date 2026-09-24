@@ -420,7 +420,7 @@ class TestProgStudioJourney:
             # --- sessions.model: flip the live model --------------------
             studio.identity.keys.set("openai", "sk-journey-test-key")
             studio.identity.llm.save_profile("journey-fast", "gpt-4o-mini", "openai")
-            new_model = studio.sessions.model.switch(
+            new_model = await studio.sessions.model.switch(
                 session_id, creature_id, "openai/journey-fast"
             )
             assert new_model == "openai/journey-fast"

@@ -1,23 +1,8 @@
-"""Session merge/split coordinator for the Terrarium engine.
+"""Coordinate session stores, history, and state across graph merges and splits.
 
-When the engine's topology changes such that the membership of a graph
-shifts (two graphs merging into one, or one graph fragmenting into
-several), the session stores attached to those graphs must follow the
-same shape — otherwise the user would lose history.  The rule:
-
-- **Merge** (two graphs become one): create a new store, copy events
-  from both old stores into it, attach to the merged graph.
-- **Split** (one graph becomes two): copy the old store into each new
-  graph, so each child carries the full pre-split history.
-- Topology changes that don't affect membership reuse the existing
-  store.
-
-Only graphs that already had a session attached are coordinated; an
-unattached graph stays unattached on the other side.
-
-The coordinator is only called from inside ``terrarium.channels``;
-external callers should go through ``Terrarium.connect`` /
-``Terrarium.disconnect``.
+Membership changes copy persisted history into the destination stores and rebind
+creatures. Unchanged graphs retain their stores. Engine channel operations own
+this coordination; external callers use Terrarium.connect/disconnect.
 """
 
 import time
@@ -29,6 +14,10 @@ import kohakuterrarium.terrarium.topology_leftovers as _topo_leftovers
 from kohakuterrarium.errors import SessionNotResumableError
 from kohakuterrarium.session.identity import new_conversation_id
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.terrarium.session_plugin_state import (
+    guarded_plugin_state_handoff,
+    transfer_graph_plugin_state,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -283,6 +272,7 @@ def _close_superseded(store: SessionStore) -> None:
         )
 
 
+@guarded_plugin_state_handoff
 def apply_merge(
     engine: "Terrarium",
     delta: "TopologyDelta",
@@ -380,6 +370,7 @@ def apply_merge(
             # handle, so it is engine-owned regardless of the sources.
             kept = merge_session_stores(old_stores, new_path)
             kept_owned = True
+    transfer_graph_plugin_state(engine, keep_gid, kept)
     engine._session_stores[keep_gid] = kept
     for gid in drop_gids:
         engine._session_stores.pop(gid, None)
@@ -402,6 +393,7 @@ def apply_merge(
     _attach_store_to_graph(engine, keep_gid, kept)
 
 
+@guarded_plugin_state_handoff
 def apply_split(
     engine: "Terrarium",
     delta: "TopologyDelta",
@@ -456,6 +448,7 @@ def apply_split(
     ]
     new_stores = split_session_store(parent, [p for _, p in fresh]) if fresh else []
     for (gid, _), store in zip(fresh, new_stores):
+        transfer_graph_plugin_state(engine, gid, store)
         engine._session_stores[gid] = store
         _attach_store_to_graph(engine, gid, store)
         _refresh_meta_for_split_graph(engine, gid, store)

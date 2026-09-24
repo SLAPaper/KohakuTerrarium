@@ -3,6 +3,7 @@
 import json
 from typing import TYPE_CHECKING, Any
 
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.modules.tool.runtime_options import validate_tool_options
 from kohakuterrarium.utils.logging import get_logger
 
@@ -42,6 +43,7 @@ class ToolOptions:
 
     def set(self, tool_name: str, values: dict[str, Any]) -> dict[str, Any]:
         """Patch runtime overrides, or reset them when ``values`` is empty."""
+        require_model_mutation_available(self._agent)
         tool = self._tool(tool_name)
         schema = self._schema(tool)
         baseline = self._baseline_values(tool_name, tool, schema)
@@ -82,6 +84,7 @@ class ToolOptions:
 
     def apply(self) -> None:
         """Load persisted overrides and refresh every still-registered tool."""
+        require_model_mutation_available(self._agent)
         data = self._load_private_state()
         previous_tools = set(self._values) | set(self._pending_values)
         self._values.clear()

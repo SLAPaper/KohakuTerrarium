@@ -479,13 +479,12 @@ class TestProgTerrariumJourney:
         assert next(c for c in rg["creatures"] if c["is_root"])["name"] == "root"
 
         # --- 8. runtime-graph prompt block on the evolved team -----------
-        # ``RuntimeGraphPrompt.refresh_creature`` splices the live
-        # ``## Live Group`` section into a creature's system prompt. The
-        # root has the analyst as a child + listens on every channel.
         root_creature = engine.get_creature("root")
         await engine._runtime_prompt.refresh_creature(root_creature)
         root_prompt = root_creature.agent.get_system_prompt()
-        assert "## Live Group" in root_prompt
+        assert "## Working with the group" in root_prompt
+        assert f"You are `{root_creature.creature_id}` (root)" in root_prompt
+        assert "findings" in root_prompt
         assert "privileged" in root_prompt
         assert "<!-- runtime-graph -->" in root_prompt
         # The hot-plugged helper's block reflects its single recipe wire.

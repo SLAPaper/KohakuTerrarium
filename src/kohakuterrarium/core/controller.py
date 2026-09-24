@@ -5,6 +5,7 @@ import base64
 import hashlib
 import re
 import tempfile
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
@@ -20,6 +21,7 @@ from kohakuterrarium.commands.read import (
     WaitCommand,
 )
 from kohakuterrarium.core.controller_metrics import time_llm_call
+from kohakuterrarium.core.controller_generation import start_generation
 from kohakuterrarium.core.controller_plugins import (
     register_controller_command,
     run_post_llm_call_chain,
@@ -186,6 +188,7 @@ class Controller:
 
         # Interrupt flag: checked during LLM streaming
         self._interrupted = False
+        self._active_generation = None
 
         # The agent injects optional collaborators after all modules are built.
         self.plugins: Any = None
@@ -412,6 +415,7 @@ class Controller:
 
         provider_native_tools = self._get_provider_native_tools()
 
+        await start_generation(self)
         with time_llm_call(self.llm) as _t:
             async for chunk in self.llm.chat(
                 messages,
@@ -450,7 +454,10 @@ class Controller:
         # next request, including completions that contain no tool call.
         extra_fields = getattr(self.llm, "last_assistant_extra_fields", {}) or {}
         final_content = _merge_text_and_parts(assistant_content, structured_parts)
-        append_kwargs: dict = {"extra_fields": extra_fields}
+        append_kwargs: dict = {
+            "extra_fields": extra_fields,
+            "metadata": {"generation": deepcopy(self._active_generation)},
+        }
         pending_native_events: list[ParseEvent] = []
 
         if native_calls:
@@ -550,6 +557,7 @@ class Controller:
 
         provider_native_tools = self._get_provider_native_tools()
 
+        await start_generation(self)
         with time_llm_call(self.llm) as _t:
             async for chunk in self.llm.chat(
                 messages,
@@ -886,6 +894,7 @@ class Controller:
             self.conversation.append(
                 "assistant",
                 _merge_text_and_parts(self._last_assistant_content, structured),
+                metadata={"generation": deepcopy(self._active_generation)},
                 extra_fields=(
                     getattr(self.llm, "last_assistant_extra_fields", {}) or {}
                 ),

@@ -51,6 +51,8 @@ class StoreAffinityMixin:
             executor, self._affinity = self._affinity, None
         if executor is not None:
             executor.shutdown(wait=True)
+            with self._affinity_lock:
+                self._affinity_worker_ident = None
 
     async def run(self, fn: Callable[..., _T], /, *args: Any, **kwargs: Any) -> _T:
         """Run ``fn`` on this store's affinity thread and return its result.

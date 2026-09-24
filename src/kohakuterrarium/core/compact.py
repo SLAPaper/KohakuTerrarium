@@ -22,6 +22,7 @@ from kohakuterrarium.core.compact_text import (
     format_messages_for_summary,
 )
 from kohakuterrarium.core.conversation_elide import elide_after_compact
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.core.single_flight import SingleFlightDispatch, SingleFlightLease
 from kohakuterrarium.utils.logging import get_logger
 
@@ -127,25 +128,13 @@ class CompactManager:
         return chars // 2 < self.config.max_tokens * self.config.threshold
 
     def trigger_compact(self) -> bool:
-        """Start compaction as a background task.
+        """Dispatch one background compaction and return whether it started.
 
-        Returns ``True`` only when this call actually dispatches the
-        single allowed compact job. If another compact is already
-        running, the attempt is ignored immediately and ``False`` is
-        returned.
-
-        Emits ``compact_start`` up-front, then runs background
-        summarization, then ``compact_complete`` (or ``compact_skipped``
-        if the conversation is too short to benefit).
-
-        Pre-check short-conversation case BEFORE acquiring the
-        single-flight lease or emitting ``compact_start``. Otherwise the
-        UI gets stuck on a "compacting..." banner because the background
-        task returns via the early-out in ``_run_compact`` without
-        emitting a completion event. Terrariums hit this path often —
-        the root agent's conversation is typically just orchestration so
-        ``/compact`` on root has "nothing to compact".
+        Busy or insufficient-history requests return ``False`` without starting
+        a job. Dispatched jobs emit ``compact_start`` and then either
+        ``compact_complete`` or ``compact_skipped``.
         """
+        require_model_mutation_available(self._agent)
         if not self._controller:
             self._last_skip_reason = "no_controller"
             return False

@@ -306,6 +306,11 @@ class Terrarium:
         c = self._creatures.get(cid)
         if c is None:
             raise KeyError(f"creature {cid!r} not in engine")
+        with _identity.reserve_graph_model_bindings(self, c.graph_id):
+            await self._remove_creature_reserved(cid)
+
+    async def _remove_creature_reserved(self, cid: str) -> None:
+        c = self._creatures[cid]
         old_gid = c.graph_id
         if c.is_running:
             await c.stop(requested=False)

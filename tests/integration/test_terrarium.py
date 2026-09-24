@@ -23,6 +23,7 @@ coordination are all real.
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,7 @@ from kohakuterrarium.core.config_types import (
     InputConfig,
     OutputConfig,
 )
+from kohakuterrarium.modules.plugin.base import PluginContext
 from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.session.store import SessionStore
 import kohakuterrarium.terrarium.session_coord as _session_coord
@@ -806,6 +808,14 @@ class TestTerrariumIntegration:
             agents=["alice", "bob", "carol"],
         )
         await service.engine.attach_session(gid, store)
+        alice_state = PluginContext(
+            _host_agent=engine.get_creature("alice").agent, _plugin_name="counter"
+        )
+        carol_state = PluginContext(
+            _host_agent=engine.get_creature("carol").agent, _plugin_name="counter"
+        )
+        alice_state.set_state("count", 3)
+        await carol_state.set_state_async("count", 7)
 
         # --- AUTO-SPLIT: remove the bridge creature -------------------
         events: list = []
@@ -848,6 +858,9 @@ class TestTerrariumIntegration:
         assert store_alice is not store_carol
         assert store_alice.meta["parent_session_ids"] == [gid]
         assert store_carol.meta["parent_session_ids"] == [gid]
+        assert await alice_state.get_state_async("count") == 3
+        assert carol_state.get_state("count") == 7
+        await alice_state.set_state_async("count", 4)
 
         # --- AUTO-MERGE: connect across the two graphs ----------------
         merge_res = await service.connect("alice", "carol", channel="reunite")
@@ -875,6 +888,9 @@ class TestTerrariumIntegration:
             store_carol.session_id,
         }
         assert "merged_at" in merged_store.meta
+        assert alice_state.get_state("count") == 4
+        assert await carol_state.get_state_async("count") == 7
+        carol_state.set_state("count", 8)
 
         # --- AUTO-SPLIT via disconnect (the other split trigger) -------
         # The merged graph has exactly one channel (``reunite``) joining
@@ -897,6 +913,8 @@ class TestTerrariumIntegration:
         assert post_store_alice is not post_store_carol
         assert post_store_alice.meta["parent_session_ids"] == [merged_store.session_id]
         assert post_store_carol.meta["parent_session_ids"] == [merged_store.session_id]
+        assert await alice_state.get_state_async("count") == 4
+        assert carol_state.get_state("count") == 8
         # The post-split environments are distinct, freshly minted.
         assert (
             engine._environments[a3.graph_id] is not engine._environments[c3.graph_id]
@@ -1820,13 +1838,14 @@ class TestTerrariumIntegration:
         per-graph repositories (design §6.6-6.7): ``connect`` merges A + B so the
         survivor's manager holds BOTH graphs' Drives (B's rehomed); ``disconnect``
         splits so each assigned Drive follows its assignee's child graph. WAITING
-        Drives keep this deterministic — no delivery, pure row movement."""
+        Drives with future wake times stay undelivered during row movement."""
         svc = ActorRef("service", "ops")
 
         def _req(graph_id: str, assignee: str) -> CreateDriveRequest:
             return CreateDriveRequest(
                 kind="generic",
                 title=f"watch-{assignee}",
+                not_before=datetime.max.replace(tzinfo=timezone.utc),
                 scope_type="graph",
                 scope_id=graph_id,
                 owner=svc,

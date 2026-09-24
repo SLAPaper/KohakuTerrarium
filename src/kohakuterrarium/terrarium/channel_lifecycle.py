@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import kohakuterrarium.terrarium.session_coord as _session_coord
 import kohakuterrarium.terrarium.topology as _topo
 from kohakuterrarium.core.environment import Environment
+from kohakuterrarium.terrarium.graph_identity_engine import guard_graph_model_bindings
 from kohakuterrarium.terrarium.channels import (
     bind_creature_to_environment,
     inject_channel_trigger,
@@ -71,6 +72,7 @@ async def disconnect_creatures(
         return DisconnectionResult(channels=[], delta_kind="nothing")
 
     gid = sender_creature.graph_id
+    guard_graph_model_bindings(engine, gid)
     g = engine._topology.graphs[gid]
     targets = (
         [channel]
@@ -225,6 +227,7 @@ async def remove_channel_from_graph(
     if name not in g.channels:
         raise KeyError(f"channel {name!r} not in graph {graph_id!r}")
 
+    guard_graph_model_bindings(engine, graph_id)
     # 1. Tear down listen triggers on every listener.
     for cid, listens in list(g.listen_edges.items()):
         if name not in listens:

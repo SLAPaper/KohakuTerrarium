@@ -10,6 +10,7 @@ scratchpad values are migrated when applied.
 import json
 from typing import TYPE_CHECKING, Any
 
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.core.native_tool_validation import validate_native_tool_options
 from kohakuterrarium.utils.logging import get_logger
 
@@ -58,6 +59,7 @@ class NativeToolOptions:
 
         Returns the **full** post-merge override dict for the tool.
         """
+        require_model_mutation_available(self._agent)
         incoming = values or {}
         # An empty mapping is reserved for explicit reset, not partial update.
         if not incoming:
@@ -85,6 +87,7 @@ class NativeToolOptions:
 
     def apply(self) -> None:
         """Load persisted overrides, migrate legacy state, and update tools."""
+        require_model_mutation_available(self._agent)
         data = self._load_private_state()
         legacy = self._load_legacy_scratchpad()
         if legacy:

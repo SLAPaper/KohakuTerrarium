@@ -310,14 +310,15 @@ class TestCreatureCommand:
 
 
 class TestCreatureModel:
-    def test_switch_model(self, monkeypatch):
-        from types import SimpleNamespace as SN
+    async def test_switch_model(self, monkeypatch):
+        async def switch(profile):
+            return f"switched-{profile}"
 
-        agent = SN(switch_model=lambda p: f"switched-{p}")
-        creature = SN(agent=agent)
+        agent = SimpleNamespace(switch_model_async=switch)
+        creature = SimpleNamespace(agent=agent)
         monkeypatch.setattr(cm_mod, "find_creature", lambda e, s, c: creature)
-        monkeypatch.setattr(cm_mod, "as_engine", lambda s: SN())
-        out = cm_mod.switch_model(SN(), "_", "alice", "openai/gpt-4")
+        monkeypatch.setattr(cm_mod, "as_engine", lambda s: SimpleNamespace())
+        out = await cm_mod.switch_model(SimpleNamespace(), "_", "alice", "openai/gpt-4")
         assert out == "switched-openai/gpt-4"
 
     def test_set_native_tool_options_missing_helper(self, monkeypatch):

@@ -85,6 +85,10 @@ class LLMError(KTError):
     """LLM provider construction or call failure."""
 
 
+class HistoryCompatibilityError(KTError, ValueError):
+    """Raw conversation history cannot safely continue in a target context."""
+
+
 class LLMNotConfiguredError(LLMError, ValueError):
     """No usable LLM could be resolved from the available configuration."""
 

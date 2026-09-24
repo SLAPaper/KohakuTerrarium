@@ -323,9 +323,13 @@ class TestSessionsModelForward:
     async def test_switch_forward_returns_the_new_model(self, studio_engine):
         s, engine = studio_engine
         agent = engine.get_creature("alice").agent
-        agent.switch_model = lambda profile: f"switched-to-{profile}"
+
+        async def switch(profile):
+            return f"switched-to-{profile}"
+
+        agent.switch_model_async = switch
         gid = engine.get_creature("alice").graph_id
-        out = s.sessions.model.switch(gid, "alice", "claude-opus")
+        out = await s.sessions.model.switch(gid, "alice", "claude-opus")
         assert out == "switched-to-claude-opus"
 
     async def test_native_tool_options_forward_returns_options(self, studio_engine):

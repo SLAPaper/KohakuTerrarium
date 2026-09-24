@@ -17,6 +17,7 @@ Usage in config.yaml:
           log_tasks: true      # Retain a bounded task preview per active job.
 """
 
+import asyncio
 import time
 from typing import Any
 
@@ -39,6 +40,7 @@ class SubagentTrackerPlugin(BasePlugin):
         self._active: dict[str, dict] = {}  # Job IDs correlate pre/post hooks.
         self._completed = 0
         self._total_tokens = 0
+        self._totals_lock = asyncio.Lock()
         self._ctx: PluginContext | None = None
 
     async def on_load(self, context: PluginContext) -> None:
@@ -58,7 +60,7 @@ class SubagentTrackerPlugin(BasePlugin):
 
         logger.info(
             "Sub-agent spawned",
-            name=name,
+            subagent_name=name,
             background=is_bg,
             active=len(self._active),
         )
@@ -79,17 +81,14 @@ class SubagentTrackerPlugin(BasePlugin):
 
         info = self._active.pop(job_id, None)
         elapsed = (time.monotonic() - info["start"]) if info else 0
-        self._completed += 1
-
         tokens = getattr(result, "total_tokens", 0)
-        self._total_tokens += tokens
 
         success = getattr(result, "success", True)
         turns = getattr(result, "turns", 0)
 
         logger.info(
             "Sub-agent finished",
-            name=name,
+            subagent_name=name,
             success=success,
             turns=turns,
             tokens=tokens,
@@ -97,8 +96,14 @@ class SubagentTrackerPlugin(BasePlugin):
         )
 
         if self._ctx:
-            self._ctx.set_state("completed", self._completed)
-            self._ctx.set_state("total_tokens", self._total_tokens)
+            async with self._totals_lock:
+                self._completed += 1
+                self._total_tokens += tokens
+                await self._ctx.set_state_async("completed", self._completed)
+                await self._ctx.set_state_async("total_tokens", self._total_tokens)
+        else:
+            self._completed += 1
+            self._total_tokens += tokens
 
         return None
 

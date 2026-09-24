@@ -51,6 +51,50 @@ scratchpad, registry, controller, subagent manager, and helper methods like
 `switch_model(...)`, `inject_event(...)`, and `inject_message_before_llm(...)`.
 Plugins can also declare a static filter with `applies_to = {agent_names, model_patterns}`.
 
+### Persisted plugin state
+
+Async hooks should use `await ctx.get_state_async(key)` and
+`await ctx.set_state_async(key, value)`. The session store's affinity worker
+executes reads, legacy-key migration, and writes; successful completion means
+the operation has executed, and storage errors propagate to the caller.
+State is isolated by the host creature's storage namespace and plugin name.
+A context without a session store returns `None` for reads and ignores writes.
+
+Write values are copied before submission, when the coroutine starts executing;
+read values are copied on the worker. Mutating either the input after submission
+or a returned value does not change stored state. Cancelling a waiting coroutine
+does not roll back an accepted write: store shutdown drains accepted work.
+These are individual operations, not a multi-key transaction. Protect concurrent
+read-modify-write sequences with a plugin-local lock, as in the timing example.
+
+Existing `get_state` and `set_state` remain **synchronous**; they were not renamed
+or changed to return awaitables. Both submit storage operations to the same store
+worker and block the calling thread until acknowledgement or error. Calling them
+from an async hook therefore stalls its event loop, including time queued behind
+other store operations. This is an intentional transitional compatibility policy;
+plugin authors should use the async interfaces to avoid these stalls. It is not
+write-behind, and a successful return is not merely acceptance into a queue.
+
+Calls already executing inside the same store worker execute inline rather than
+queueing a synchronous wait onto themselves. Both interfaces copy values across
+the worker boundary: modify a returned object locally, then explicitly call
+`set_state` or `set_state_async` to persist it. Mutating a returned object alone
+is not a supported persistence mechanism.
+
+Arbitrary plugin hooks are not automatically relocated to threads. Synchronous
+prompt and applicability collectors remain synchronous. Framework code remains
+responsible for store ownership, shutdown ordering, and deadlock avoidance;
+the compatibility policy does not transfer these responsibilities to plugins.
+
+Legacy `plugin:<plugin>:<key>` values migrate only when persisted session identity
+establishes a unique owning creature. Ambiguous ownership or conflicting new and
+legacy values raises `ConflictError` instead of selecting a value silently.
+
+For model changes, `await ctx.switch_model_async(name)` is the live entry point;
+`ctx.switch_model(name)` is limited to pre-start/bootstrap use. A model change
+requested from an active turn or its callback is rejected rather than waiting
+on that same turn.
+
 ---
 
 ## LLM hooks

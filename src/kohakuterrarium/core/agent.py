@@ -15,6 +15,7 @@ from kohakuterrarium.core.agent_compact import (
 from kohakuterrarium.core.agent_construct import AgentConstructMixin
 from kohakuterrarium.core.agent_event_loop import AgentEventLoopMixin
 from kohakuterrarium.core.agent_extensions import AgentExtensionsMixin
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.core.agent_turn import AgentTurnMixin
 from kohakuterrarium.core.agent_handlers import AgentHandlersMixin
 from kohakuterrarium.core.agent_lifecycle import AgentLifecycleMixin
@@ -840,6 +841,7 @@ class Agent(
         Wires scratchpad + plugin-hook observers so Wave B
         ``scratchpad_write`` / ``plugin_hook_timing`` events flow.
         """
+        require_model_mutation_available(self)
         self.session_store = store
         # Controller needs direct access for artifact writes.
         if hasattr(self, "controller") and self.controller is not None:
@@ -925,6 +927,7 @@ class Agent(
             content: New content to append (or full replacement if replace=True)
             replace: If True, replace entire system prompt. If False, append.
         """
+        require_model_mutation_available(self)
         sys_msg = self.controller.conversation.get_system_message()
         if sys_msg is None:
             return
