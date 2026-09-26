@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,10 +13,20 @@ from kohakuterrarium.core.agent_runtime_tools import (
 from kohakuterrarium.core.agent_tools_metrics import (
     emit_completion_metrics as _emit_completion_metrics,
 )
+from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.backgroundify import BackgroundifyHandle, PromotionResult
+from kohakuterrarium.core.interrupted_history import (
+    append_pending_result,
+    claim_job_terminal,
+)
 from kohakuterrarium.core.controller import Controller
 from kohakuterrarium.core.events import create_tool_complete_event
-from kohakuterrarium.core.job import JobResult
+from kohakuterrarium.core.job import JobResult, generate_job_id
+from kohakuterrarium.core.tool_origin import (
+    capture_tool_context,
+    promote_tool_context,
+    tool_completion_context,
+)
 from kohakuterrarium.core.tool_output import render_content_text
 from kohakuterrarium.llm.message import content_parts_to_dicts
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode
@@ -33,7 +44,11 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
     """Provide tool execution, result handling, and background job management."""
 
     async def _start_tool_async(
-        self, tool_call: ToolCallEvent
+        self,
+        tool_call: ToolCallEvent,
+        *,
+        tool_call_id: str | None = None,
+        run_bg: bool = False,
     ) -> tuple[str, asyncio.Task, bool]:
         """Start a tool asynchronously and return its ID, task, and wait mode."""
         try:
@@ -43,8 +58,18 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
             if tool and isinstance(tool, BaseTool):
                 is_direct = tool.execution_mode == ExecutionMode.DIRECT
 
+            job_id = generate_job_id(tool_call.name)
+            completion_context = capture_tool_context(
+                self,
+                job_id,
+                "direct" if is_direct and not run_bg else "background",
+                tool_call_id,
+            )
             job_id = await self.executor.submit_from_event(
-                tool_call, is_direct=is_direct
+                tool_call,
+                is_direct=is_direct,
+                job_id=job_id,
+                completion_context=completion_context,
             )
             task = self.executor.get_task(job_id)
             if task is None:
@@ -126,9 +151,59 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                     self._clear_direct_job_tracking(jid)
                     had_promotions = True
                 else:
-                    results[jid] = result
-                    self._emit_direct_completion_activity(jid, result)
-                    self._clear_direct_job_tracking(jid)
+                    captured = deepcopy(result)
+
+                    def commit():
+                        if not claim_job_terminal(self, jid):
+                            self._clear_direct_job_tracking(jid)
+                            prior = self._job_terminal_claims[jid]
+                            if prior is not None and not prior["feedback_taken"]:
+                                feedback = deepcopy(prior["result"])
+                                prior["feedback_taken"] = True
+                                return None, prior["admitted"], feedback
+                            return None
+                        try:
+                            meta = deepcopy(self._direct_job_meta.get(jid, {}))
+                            meta["completion_context"] = tool_completion_context(
+                                self, jid
+                            ) or meta.get("completion_context", {})
+                            accepted = True
+                            if native_mode and tool_call_ids:
+                                accepted = (
+                                    jid
+                                    in self._add_native_results_to_conversation(
+                                        controller,
+                                        [jid],
+                                        {jid: captured},
+                                        tool_call_ids,
+                                        require_pending=True,
+                                    )
+                                )
+                        except BaseException:
+                            self._job_terminal_claims.pop(jid, None)
+                            raise
+                        self._job_terminal_claims[jid] = {
+                            "result": captured,
+                            "admitted": accepted,
+                            "feedback_taken": True,
+                        }
+                        self._clear_direct_job_tracking(jid)
+                        return meta, accepted, captured
+
+                    meta = await submit_internal_session_state(self, commit)
+                    if meta is not None:
+                        meta, accepted, outcome = meta
+                        if accepted:
+                            results[jid] = outcome
+                        else:
+                            logger.warning(
+                                "Direct result rejected by current native occurrence",
+                                job_id=jid,
+                            )
+                        if meta is not None:
+                            self._emit_direct_completion_activity(
+                                jid, outcome, meta=meta
+                            )
 
         return results, had_promotions
 
@@ -142,6 +217,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         """Handle a task that was promoted to background mid-wait."""
         tool_name, label = _make_job_label(job_id)
         logger.info("Task promoted to background", job_id=job_id)
+        promote_tool_context(self, job_id)
 
         # Native tool-call protocols require a result even when the real result
         # will arrive in a later turn.
@@ -183,7 +259,24 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
             if job and hasattr(job, "subagent"):
                 job.subagent.cancel()
         handle.task.cancel()
-        asyncio.create_task(self._finalize_interrupted_direct_job(job_id))
+        finalizers = getattr(self, "_interruption_tasks", None)
+        if finalizers is None:
+            finalizers = self._interruption_tasks = set()
+        task = asyncio.create_task(self._finalize_interrupted_direct_job(job_id))
+        finalizers.add(task)
+
+        def completed(task):
+            finalizers.discard(task)
+            if task.cancelled():
+                logger.error("Interrupted job finalizer cancelled", job_id=job_id)
+            elif task.exception() is not None:
+                logger.error(
+                    "Interrupted job finalizer failed",
+                    job_id=job_id,
+                    error=str(task.exception()),
+                )
+
+        task.add_done_callback(completed)
         return True
 
     def _register_direct_job(
@@ -199,6 +292,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         self._direct_job_meta[job_id] = {
             "kind": kind,
             "name": name,
+            "completion_context": tool_completion_context(self, job_id),
             "tool_call_id": tool_call_id or job_id,
             "background": False,
             "interruptible": True,
@@ -212,9 +306,12 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         self._direct_job_meta.pop(job_id, None)
         self._bg_controller_notify.pop(job_id, None)
 
-    def _emit_interrupted_activity(self, job_id: str, result: Any) -> None:
+    def _emit_interrupted_activity(
+        self, job_id: str, result: Any, *, meta=None
+    ) -> None:
         """Emit terminal activity for an interrupted direct job."""
-        meta = self._direct_job_meta.get(job_id, {})
+        if meta is None:
+            meta = self._direct_job_meta.get(job_id, {})
         kind = meta.get("kind", "tool")
         _, label = _make_job_label(job_id)
         error = getattr(result, "error", None) or "User manually interrupted this job."
@@ -248,6 +345,9 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
             activity_meta["tools_used"] = getattr(result, "metadata", {}).get(
                 "tools_used", []
             )
+        activity_meta.update(
+            tool_completion_context(self, job_id) or meta.get("completion_context", {})
+        )
         self.output_router.notify_activity(
             activity,
             f"[{label}] INTERRUPTED: {error}",
@@ -280,13 +380,41 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 metadata={"interrupted": True, "final_state": "interrupted"},
             )
 
-        self._emit_interrupted_activity(job_id, result)
-        self._append_interrupted_tool_message(job_id, meta, result)
-        self._clear_direct_job_tracking(job_id)
+        feedback = JobResult(
+            job_id=job_id,
+            output=deepcopy(getattr(result, "output", "")),
+            error=getattr(result, "error", None)
+            or "User manually interrupted this job.",
+            metadata={"interrupted": True, "final_state": "interrupted"},
+        )
+
+        def commit():
+            if not claim_job_terminal(self, job_id):
+                self._clear_direct_job_tracking(job_id)
+                return False
+            try:
+                paired = self._append_interrupted_tool_message(job_id, meta, result)
+            except BaseException:
+                self._job_terminal_claims.pop(job_id, None)
+                raise
+            native = (
+                getattr(getattr(self.controller, "config", None), "tool_format", None)
+                == "native"
+            )
+            self._job_terminal_claims[job_id] = {
+                "result": feedback,
+                "admitted": paired or not native,
+                "feedback_taken": False,
+            }
+            self._clear_direct_job_tracking(job_id)
+            return True
+
+        if await submit_internal_session_state(self, commit):
+            self._emit_interrupted_activity(job_id, result, meta=meta)
 
     def _append_interrupted_tool_message(
         self, job_id: str, meta: dict[str, Any], result: Any
-    ) -> None:
+    ) -> bool:
         """Add the tool response required for an interrupted direct job.
 
         Interrupting ``_processing_task`` can prevent the normal result path from
@@ -296,45 +424,18 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         Existing responses are preserved because cancellation can race with the
         normal result path.
         """
-        controller = getattr(self, "controller", None)
-        conversation = getattr(controller, "conversation", None)
-        if conversation is None:
-            return
-        tool_call_id = meta.get("tool_call_id") or job_id
-        if not tool_call_id:
-            return
-        try:
-            existing = conversation.get_messages()
-        except Exception:  # pragma: no cover - defensive
-            return
-        for msg in existing:
-            if getattr(msg, "role", None) == "tool" and (
-                getattr(msg, "tool_call_id", None) == tool_call_id
-            ):
-                return
-        tool_name = meta.get("name") or _make_job_label(job_id)[0]
         error_text = getattr(result, "error", None) or "User cancelled this job."
-        try:
-            conversation.append(
-                "tool",
-                f"Interrupted: {error_text}",
-                tool_call_id=tool_call_id,
-                name=tool_name,
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "Synthetic interrupted-tool append failed",
-                job_id=job_id,
-                error=str(exc),
-                exc_info=True,
-            )
+        return append_pending_result(self, job_id, meta, f"Interrupted: {error_text}")
 
-    async def _on_backgroundify_complete(self, job_id: str, result: Any) -> None:
+    async def _on_backgroundify_complete(
+        self, job_id: str, result: Any, *, completion_context: dict | None = None
+    ) -> None:
         """Callback when a promoted (backgroundified) task completes.
 
         Builds a TriggerEvent and reuses the existing ``_on_bg_complete``
         path for activity notification and event processing.
         """
+        promote_tool_context(self, job_id)
         # ``CancelledError`` is a ``BaseException`` and must precede the generic
         # arm so cancellation is reported as an interrupt rather than an error.
         if isinstance(result, asyncio.CancelledError):
@@ -393,12 +494,21 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 job_id=job_id, content=str(result) if result else ""
             )
 
+        context = tool_completion_context(self, job_id) or deepcopy(
+            completion_context or {}
+        )
+        if isinstance(context.get("origin"), dict):
+            context["execution_class"] = "background"
+            context["origin"]["execution_class"] = "background"
+        event.context.update(context)
         self._on_bg_complete(event)
 
-    def _emit_direct_completion_activity(self, job_id: str, result: Any) -> None:
+    def _emit_direct_completion_activity(
+        self, job_id: str, result: Any, *, meta=None
+    ) -> None:
         """Emit terminal activity immediately when a direct job finishes."""
         # The post-stop sweep already emitted a terminal state for this job.
-        if not self._running:
+        if not self._running and meta is None:
             return
         # Termination checkers need the recent result tail to evaluate stopping.
         checker = getattr(self, "_termination_checker", None)
@@ -407,7 +517,11 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 checker.record_tool_result(result)
             except Exception:  # pragma: no cover — defensive
                 pass
-        meta = self._direct_job_meta.get(job_id, {})
+        if meta is None:
+            meta = self._direct_job_meta.get(job_id, {})
+        completion = meta.get("completion_context") or tool_completion_context(
+            self, job_id
+        )
         kind = meta.get("kind", "subagent" if job_id.startswith("agent_") else "tool")
         _, label = _make_job_label(job_id)
         is_subagent = kind == "subagent"
@@ -424,7 +538,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         )
         metric_name = meta.get("name") or job_id.rsplit("_", 1)[0]
 
-        if isinstance(result, Exception):
+        if isinstance(result, (asyncio.CancelledError, Exception)):
             interrupted = isinstance(result, asyncio.CancelledError)
             error_text = (
                 "User manually interrupted this job." if interrupted else str(result)
@@ -454,7 +568,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
             self.output_router.notify_activity(
                 error_activity,
                 f"[{label}] {'INTERRUPTED' if interrupted else 'FAILED'}: {error_text}",
-                metadata=metadata,
+                metadata={**metadata, **completion},
             )
             status = "interrupted" if interrupted else "error"
             _emit_completion_metrics(is_subagent, metric_name, status, duration_ms)
@@ -491,7 +605,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
             self.output_router.notify_activity(
                 error_activity,
                 f"[{label}] {state_label}: {result.error}",
-                metadata=metadata,
+                metadata={**metadata, **completion},
             )
             _emit_completion_metrics(is_subagent, metric_name, final_state, duration_ms)
             return
@@ -551,7 +665,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         self.output_router.notify_activity(
             done_activity if succeeded else error_activity,
             f"[{label}] {status}",
-            metadata=metadata,
+            metadata={**metadata, **completion},
         )
         _emit_completion_metrics(
             is_subagent,
@@ -566,8 +680,11 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         handle_order: list[str],
         results: dict[str, Any],
         tool_call_ids: dict[str, str],
-    ) -> None:
+        *,
+        require_pending: bool = False,
+    ) -> set[str]:
         """Add completed results as role='tool' messages (native mode)."""
+        added = set()
         for job_id in handle_order:
             if job_id not in results:
                 continue  # Promoted jobs already have a protocol placeholder.
@@ -576,7 +693,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
             tool_name, _ = _make_job_label(job_id)
             tool_call_id = tool_call_ids.get(job_id, job_id)
 
-            if isinstance(result, Exception):
+            if isinstance(result, (asyncio.CancelledError, Exception)):
                 interrupted = isinstance(result, asyncio.CancelledError)
                 error_text = (
                     "User manually interrupted this job."
@@ -603,9 +720,37 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
             else:
                 content = ""
 
-            controller.conversation.append(
-                "tool", content, tool_call_id=tool_call_id, name=tool_name
-            )
+            if require_pending:
+                if append_pending_result(
+                    self,
+                    job_id,
+                    {"tool_call_id": tool_call_id, "name": tool_name},
+                    content,
+                ):
+                    added.add(job_id)
+            else:
+                existing = controller.conversation.get_messages()
+                index = next(
+                    (
+                        i
+                        for i in reversed(range(len(existing)))
+                        if any(
+                            call.get("id") == tool_call_id
+                            for call in (existing[i].tool_calls or [])
+                        )
+                    ),
+                    None,
+                )
+                if index is not None and any(
+                    m.role == "tool" and m.tool_call_id == tool_call_id
+                    for m in existing[index + 1 :]
+                ):
+                    continue
+                controller.conversation.append(
+                    "tool", content, tool_call_id=tool_call_id, name=tool_name
+                )
+                added.add(job_id)
+        return added
 
     def _format_text_results(
         self,
@@ -620,7 +765,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
 
             result = results[job_id]
 
-            if isinstance(result, Exception):
+            if isinstance(result, (asyncio.CancelledError, Exception)):
                 interrupted = isinstance(result, asyncio.CancelledError)
                 error_text = (
                     "User manually interrupted this job."

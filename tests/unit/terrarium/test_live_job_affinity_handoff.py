@@ -79,6 +79,14 @@ async def test_live_tool_terminal_and_plugin_state_follow_handoff(tmp_path, oper
             terminals = [event for event in records if event["type"] == "tool_result"]
             assert len(terminals) == 1
             assert "completed-from-alice" in str(terminals[0])
+            call = next(event for event in records if event["type"] == "tool_call")
+            assert terminals[0]["origin"] == call["origin"]
+            assert terminals[0]["execution_class"] == "background"
+            assert terminals[0]["job_id"] == call["job_id"]
+            assert (terminals[0]["turn_index"], terminals[0]["branch_id"]) == (
+                call["turn_index"],
+                call["branch_id"],
+            )
             assert await context.get_state_async("terminal") == "finished"
             assert await bob_context.get_state_async("dispatch") == "bob"
             assert await bob_context.get_state_async("terminal") is None

@@ -1,11 +1,20 @@
 import asyncio
+from functools import partial
 
 from kohakuterrarium.core.backgroundify import BackgroundifyHandle
+from kohakuterrarium.core.background_publication import schedule_background_terminal
 from kohakuterrarium.core.controller import Controller
 from kohakuterrarium.core.events import TriggerEvent
+from kohakuterrarium.core.job import generate_job_id
 from kohakuterrarium.core.job_label import make_job_label
 from kohakuterrarium.core.tool_output import render_content_text
+from kohakuterrarium.core.tool_origin import (
+    capture_tool_context,
+    tool_completion_context,
+)
+from kohakuterrarium.errors import InvalidRequestError
 from kohakuterrarium.llm.message import content_parts_to_dicts
+from kohakuterrarium.modules.subagent.manager import subagent_background_requested
 from kohakuterrarium.parsing import CommandResultEvent, SubAgentCallEvent, ToolCallEvent
 from kohakuterrarium.utils.logging import get_logger
 
@@ -55,6 +64,7 @@ class AgentRuntimeToolsMixin:
             "args": full_args,
             "background": not is_direct,
         }
+        metadata.update(tool_completion_context(self, job_id))
         if tool_call_id:
             metadata.update(
                 tool_call_id=tool_call_id, tool_call_arguments=parse_event.raw
@@ -132,28 +142,83 @@ class AgentRuntimeToolsMixin:
         if hasattr(self.output_router.default_output, "reset"):
             self.output_router.default_output.reset()
 
-    async def _start_subagent_async(self, event: SubAgentCallEvent) -> tuple[str, bool]:
+    async def _start_subagent_async(
+        self, event: SubAgentCallEvent, *, tool_call_id: str | None = None
+    ) -> tuple[str, bool]:
         """Start a sub-agent execution."""
         logger.info(
             "Starting sub-agent",
             subagent_type=event.name,
             task=event.args.get("task", "")[:50],
         )
+        job_id = generate_job_id(f"agent_{event.name}")
+        context = capture_tool_context(self, job_id, "direct", tool_call_id)
+        if tool_call_id:
+            context["tool_call_arguments"] = event.raw
+        is_background = False
         try:
-            return await self.subagent_manager.spawn_from_event(event)
-        except ValueError as e:
-            logger.error(
-                "Sub-agent not registered", subagent_name=event.name, error=str(e)
+            is_background = subagent_background_requested(event.args)
+            if is_background:
+                context["execution_class"] = context["origin"]["execution_class"] = (
+                    "background"
+                )
+            return await self.subagent_manager.spawn_from_event(
+                event, job_id=job_id, completion_context=context
             )
-            return f"error_{event.name}", True
+        except Exception as e:
+            logger.error(
+                "Sub-agent dispatch rejected", subagent_name=event.name, error=str(e)
+            )
+            self.subagent_manager.record_rejection(event.name, job_id, str(e), context)
+            return job_id, is_background
 
     def _on_bg_complete(self, event: TriggerEvent) -> None:
         """Handle background tool/sub-agent completion."""
+        context = event.context or {}
+        classified = any(key in context for key in ("origin", "execution_class"))
         if not self._running:
+            owner = getattr(self, "_session_state_owner", None)
+            if (
+                classified
+                and getattr(self, "_model_switch_closing", False)
+                and owner is not None
+                and owner.task is not None
+                and not owner.task.done()
+            ):
+                return self._admit_bg_terminal(event, notify=False)
             return
+        if classified:
+            return self._admit_bg_terminal(
+                event,
+                notify=False if getattr(self, "_model_switch_closing", False) else None,
+            )
+        return self._publish_bg_complete(event)
+
+    def _admit_bg_terminal(self, event, *, notify=None):
+        try:
+            return schedule_background_terminal(self, event, notify=notify)
+        except InvalidRequestError as exc:
+            logger.error(
+                "Background terminal rejected", job_id=event.job_id, error=str(exc)
+            )
+            return None
+
+    def _publish_bg_complete(self, event: TriggerEvent, *, consume=True, retry=False):
+        """Emit a detached outcome and return its canonical persistence receipt."""
+        emit = (
+            self.output_router.notify_activity
+            if consume
+            else partial(self.output_router.notify_terminal_activity, retry=retry)
+        )
+        receipt = None
         job_id = getattr(event, "job_id", "")
         is_subagent = job_id.startswith("agent_")
         context = event.context or {}
+        origin_metadata = {
+            key: context[key]
+            for key in ("origin", "execution_class", "tool_call_id")
+            if key in context
+        }
         error = context.get("error")
         exit_code = context.get("exit_code")
         try:
@@ -183,11 +248,12 @@ class AgentRuntimeToolsMixin:
             state_label = (
                 "INTERRUPTED" if interrupted else "CANCELLED" if cancelled else "ERROR"
             )
-            self.output_router.notify_activity(
+            receipt = emit(
                 activity_error,
                 f"[{label}] {state_label}: {error}",
                 metadata={
                     "job_id": job_id,
+                    **origin_metadata,
                     "subagent": sa_meta.get("subagent", ""),
                     "llm_name": sa_meta.get("llm_name", ""),
                     "model": sa_meta.get("model", ""),
@@ -208,11 +274,12 @@ class AgentRuntimeToolsMixin:
             )
         elif is_subagent:
             tools_summary = ", ".join(tools_used[:10]) if tools_used else "none"
-            self.output_router.notify_activity(
+            receipt = emit(
                 activity_done,
                 f"[{label}] tools: {tools_summary}",
                 metadata={
                     "job_id": job_id,
+                    **origin_metadata,
                     "subagent": sa_meta.get("subagent", ""),
                     "llm_name": sa_meta.get("llm_name", ""),
                     "model": sa_meta.get("model", ""),
@@ -247,13 +314,15 @@ class AgentRuntimeToolsMixin:
                 session_metadata = result_metadata.get("session_metadata")
                 if isinstance(session_metadata, dict):
                     metadata["tool_metadata"] = dict(session_metadata)
-            self.output_router.notify_activity(
+            receipt = emit(
                 activity_done,
                 f"[{label}] DONE",
-                metadata=metadata,
+                metadata={**metadata, **origin_metadata},
             )
 
         logger.info("Background job completed", job_id=job_id)
+        if not consume:
+            return receipt
         if self._should_notify_controller_on_background_complete(job_id):
             asyncio.create_task(self._process_event(event))
         else:

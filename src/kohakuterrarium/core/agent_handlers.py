@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+from functools import partial
 
 from kohakuterrarium.errors import AgentNotRunningError
 from kohakuterrarium.core.agent_mid_turn import AgentMidTurnMixin
@@ -25,6 +26,7 @@ from kohakuterrarium.core.events import (
     create_tool_complete_event,
 )
 from kohakuterrarium.core.pending_input import stamp_pending_id
+from kohakuterrarium.core.tool_origin import tool_completion_context
 from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.modules.tool.base import ExecutionMode
 from kohakuterrarium.parsing import (
@@ -244,8 +246,11 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             # tool-selection rounds have their own assistant messages.
             self._emit_assistant_reasoning(controller)
 
-            # Check interrupt after LLM turn (before waiting for tools)
-            if self._interrupt_requested:
+            # Check admission before waiting for tools after an accepted owner commit.
+            stop_lock = getattr(self, "_stop_lock", None)
+            if self._interrupt_requested or (
+                stop_lock is not None and stop_lock.locked()
+            ):
                 self._cancel_handles(round_result.handles)
                 self.output_router.notify_activity(
                     "interrupt", "[system] Processing interrupted"
@@ -342,7 +347,9 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
         tool_call_id = parse_event.args.pop("_tool_call_id", None)
         run_bg = parse_event.args.pop("run_in_background", False)
 
-        job_id, task, is_direct = await self._start_tool_async(parse_event)
+        job_id, task, is_direct = await self._start_tool_async(
+            parse_event, tool_call_id=tool_call_id, run_bg=run_bg
+        )
         # A tool the executor submitted as background (is_direct=False at
         # submit time) gets its completion delivered by the executor's own
         # ``_on_complete`` callback. The backgroundify handle below must
@@ -377,7 +384,10 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             on_bg_complete=(
                 None
                 if executor_delivers_completion
-                else self._on_backgroundify_complete
+                else partial(
+                    self._on_backgroundify_complete,
+                    completion_context=tool_completion_context(self, job_id),
+                )
             ),
             background_init=not is_direct,
         )
@@ -429,10 +439,10 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             direct=is_direct,
         )
 
-        await self._flush_output()
         self._notify_tool_start(
             parse_event, job_id, is_direct, tool_call_id=tool_call_id
         )
+        await self._flush_output()
 
     async def _dispatch_subagent_event(
         self,
@@ -449,7 +459,9 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             return
         sa_tool_call_id = parse_event.args.pop("_tool_call_id", None)
         full_task = parse_event.args.get("task", "")
-        job_id, is_bg = await self._start_subagent_async(parse_event)
+        job_id, is_bg = await self._start_subagent_async(
+            parse_event, tool_call_id=sa_tool_call_id
+        )
         cfg = self.subagent_manager._configs.get(parse_event.name)
         notify_controller_on_background_complete = True
         if cfg is not None:
@@ -463,7 +475,10 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             backgroundify(
                 sa_task,
                 job_id,
-                on_bg_complete=self._on_backgroundify_complete,
+                on_bg_complete=partial(
+                    self._on_backgroundify_complete,
+                    completion_context=tool_completion_context(self, job_id),
+                ),
                 background_init=is_bg,
             )
             if sa_task
@@ -504,7 +519,6 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             if sa_tool_call_id and native_tool_call_ids is not None:
                 native_tool_call_ids[job_id] = sa_tool_call_id
 
-        await self._flush_output()
         _, label = _make_job_label(job_id)
         subagent = self.subagent_manager.get_live_subagent(job_id)
         provider = getattr(subagent, "llm", None)
@@ -515,11 +529,13 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                 "job_id": job_id,
                 "task": full_task,
                 "background": is_bg,
+                **tool_completion_context(self, job_id),
                 "subagent": parse_event.name,
                 "llm_name": getattr(provider, "_llm_identifier", "") or "",
                 "model": _provider_model(provider),
             },
         )
+        await self._flush_output()
 
     def _check_termination(self, round_text: list[str]) -> bool:
         """Check if termination conditions are met. Returns True to stop.
@@ -607,9 +623,6 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             )
             if results:
                 if native_mode and native_tool_call_ids:
-                    self._add_native_results_to_conversation(
-                        controller, handle_order, results, native_tool_call_ids
-                    )
                     native_results_added = True
                 else:
                     text = self._format_text_results(handle_order, results)

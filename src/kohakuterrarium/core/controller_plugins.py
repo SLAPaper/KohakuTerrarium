@@ -4,6 +4,10 @@ import importlib
 from typing import TYPE_CHECKING
 
 from kohakuterrarium.commands.base import Command
+from kohakuterrarium.core.controller_history import (
+    capture_rewrite_target,
+    apply_rewrite,
+)
 from kohakuterrarium.modules.plugin.base import BasePlugin
 from kohakuterrarium.packages.resolve import ensure_package_importable
 from kohakuterrarium.packages.walk import list_packages
@@ -30,8 +34,7 @@ async def run_post_llm_call_chain(
     plugins = controller.plugins
     if plugins is None:
         return
-    last = controller.conversation.get_last_assistant_message()
-    original = last.get_text_content() if last else ""
+    last, original = await capture_rewrite_target(controller)
     current = original
     edited_by: list[str] = []
     base_method = getattr(BasePlugin, "post_llm_call", None)
@@ -60,8 +63,8 @@ async def run_post_llm_call_chain(
             edited_by.append(getattr(plugin, "name", "?"))
 
     if edited_by and current != original and last is not None:
-        last.content = current
-        _emit_edit_marker(controller, original, current, edited_by)
+        if await apply_rewrite(controller, last, original, current):
+            _emit_edit_marker(controller, original, current, edited_by)
 
 
 def _emit_edit_marker(

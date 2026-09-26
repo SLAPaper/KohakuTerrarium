@@ -10,7 +10,6 @@ from kohakuterrarium.core.job import (
     JobState,
     JobStatus,
     JobStore,
-    JobType,
     generate_job_id,
 )
 from kohakuterrarium.core.tool_output import normalize_tool_result
@@ -136,6 +135,7 @@ class Executor:
         args: dict[str, Any],
         job_id: str | None = None,
         is_direct: bool = False,
+        completion_context: dict[str, Any] | None = None,
     ) -> str:
         """Submit a tool for execution and return its job id.
 
@@ -149,13 +149,7 @@ class Executor:
         if job_id is None:
             job_id = generate_job_id(tool_name)
 
-        status = JobStatus(
-            job_id=job_id,
-            job_type=JobType.TOOL,
-            type_name=tool_name,
-            state=JobState.RUNNING,
-        )
-        self.job_store.register(status)
+        self.job_store.register_tool(job_id, tool_name, completion_context)
 
         task = asyncio.create_task(self._run_tool(job_id, tool, args, is_direct))
         self._tasks[job_id] = task
@@ -170,17 +164,24 @@ class Executor:
         return job_id
 
     async def submit_from_event(
-        self, event: ToolCallEvent, is_direct: bool = False
+        self,
+        event: ToolCallEvent,
+        is_direct: bool = False,
+        *,
+        job_id: str | None = None,
+        completion_context: dict[str, Any] | None = None,
     ) -> str:
         """Submit a parsed tool-call event and return its job id."""
-        return await self.submit(event.name, event.args, is_direct=is_direct)
+        return await self.submit(
+            event.name,
+            event.args,
+            job_id=job_id,
+            is_direct=is_direct,
+            completion_context=completion_context,
+        )
 
     def _manual_read_gate_active(self) -> bool:
-        """Return whether first-use documentation gating is actionable.
-
-        Inlined docs make the gate redundant; a missing ``info`` tool makes it
-        impossible to satisfy.
-        """
+        """Return whether first-use documentation gating is actionable."""
         agent = self._agent
         if agent is None:
             return True
@@ -193,11 +194,7 @@ class Executor:
         return True
 
     def _requires_manual_read(self, tool: Tool) -> bool:
-        """Return whether this tool must be documented before its first use.
-
-        Either the tool declares it, or its resolved tier withheld the
-        parameter prose that would let the model call it correctly.
-        """
+        """Return whether this tool must be documented before its first use."""
         if not isinstance(tool, BaseTool):
             return False
         if tool.require_manual_read:
@@ -303,7 +300,16 @@ class Executor:
                     exit_code=1,
                     error=error_msg,
                 )
+                completion = self.job_store.completion_context(job_id)
                 self.job_store.store_result(job_result)
+                if not is_direct:
+                    self._publish_completion(
+                        completion,
+                        job_id=job_id,
+                        content=output_msg,
+                        exit_code=1,
+                        error=error_msg,
+                    )
                 return job_result
 
             context = self._build_tool_context()
@@ -364,6 +370,7 @@ class Executor:
                 preview=normalized.stats.preview,
                 error=result.error,
             )
+            completion = self.job_store.completion_context(job_id)
             self.job_store.store_result(job_result)
 
             status = "done" if result.success else "failed"
@@ -373,16 +380,14 @@ class Executor:
             # Direct calls are already awaited by the processing loop; publishing a
             # completion event would process the same result twice.
             if not is_direct:
-                event = create_tool_complete_event(
+                self._publish_completion(
+                    completion,
                     job_id=job_id,
                     content=normalized.output if normalized.output else "",
                     exit_code=result.exit_code,
                     error=result.error,
                     result_metadata=metadata,
                 )
-                if self._on_complete:
-                    self._on_complete(event)
-                await self._event_queue.put(event)
 
             return job_result
 
@@ -397,18 +402,17 @@ class Executor:
             )
 
             job_result = JobResult(job_id=job_id, error=error_msg)
+            completion = self.job_store.completion_context(job_id)
             self.job_store.store_result(job_result)
             if not is_direct:
-                event = create_tool_complete_event(
+                self._publish_completion(
+                    completion,
                     job_id=job_id,
                     content="",
                     error=error_msg,
                     cancelled=True,
                     final_state="cancelled",
                 )
-                if self._on_complete:
-                    self._on_complete(event)
-                await self._event_queue.put(event)
 
             return job_result
 
@@ -422,17 +426,16 @@ class Executor:
             )
 
             job_result = JobResult(job_id=job_id, error=str(e))
+            completion = self.job_store.completion_context(job_id)
             self.job_store.store_result(job_result)
 
             if not is_direct:
-                event = create_tool_complete_event(
+                self._publish_completion(
+                    completion,
                     job_id=job_id,
                     content="",
                     error=str(e),
                 )
-                if self._on_complete:
-                    self._on_complete(event)
-                await self._event_queue.put(event)
 
             return job_result
 
@@ -455,15 +458,27 @@ class Executor:
             error=error_msg,
         )
         result = JobResult(job_id=job_id, error=error_msg)
+        completion = self.job_store.completion_context(job_id)
         self.job_store.store_result(result)
         if is_direct:
             return
-        event = create_tool_complete_event(
+        self._publish_completion(
+            completion,
             job_id=job_id,
             content="",
             error=error_msg,
             cancelled=True,
             final_state="cancelled",
+        )
+
+    def _publish_completion(
+        self, context: dict, *, job_id: str, content: Any, **outcome: Any
+    ) -> None:
+        """Deliver one terminal event with detached authoritative context."""
+        event = create_tool_complete_event(
+            job_id=job_id,
+            content=content,
+            **{**context, **outcome},
         )
         if self._on_complete:
             self._on_complete(event)

@@ -8,6 +8,8 @@ import kohakuterrarium.core.agent_messages as agent_messages_module
 
 from kohakuterrarium.core.agent_messages import AgentMessagesMixin
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.event_inbox import EventInbox
+from kohakuterrarium.core.session_state_owner import SessionStateOwner
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.session.history import InvalidBranchViewError
 from kohakuterrarium.session.raw_history import UserMessageSelector
@@ -87,7 +89,7 @@ class _FakeAgent(AgentMessagesMixin):
 
 
 @pytest.fixture
-def agent(tmp_path):
+async def agent(tmp_path):
     path = tmp_path / "session.kohakutr.v2"
     store = SessionStore(str(path))
     store.init_meta(
@@ -97,7 +99,27 @@ def agent(tmp_path):
         pwd=str(tmp_path),
         agents=["alice"],
     )
-    return _FakeAgent(store)
+    agent = _FakeAgent(store)
+    agent._processing_lock = asyncio.Lock()
+    agent._event_inbox = EventInbox()
+    agent._session_state_owner = SessionStateOwner()
+    agent._session_state_owner.start()
+
+    async def consume():
+        while True:
+            await agent._event_inbox.wait_nonempty()
+            for envelope in agent._event_inbox.drain_all():
+                await agent._process_event(envelope.event)
+                envelope.future.set_result(None)
+
+    consumer = asyncio.create_task(consume())
+    try:
+        yield agent
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await agent._session_state_owner.close()
+        await asyncio.to_thread(store.close)
 
 
 # ── rewind_to ────────────────────────────────────────────────────
@@ -631,18 +653,15 @@ class TestReloadConversationUnderBranchView:
 
 
 class TestEdgeBranches:
-    async def test_regenerate_turn_with_missing_position_logs(self, agent):
-        """If user_position cannot be resolved for the turn, regenerate
-        bails — exercised via a custom event setup."""
+    async def test_regenerate_turn_with_ambiguous_position_is_noop(self, agent):
+        """Ambiguous legacy content cannot identify the requested user message."""
         agent._apply_user_input("u1")
         agent._emit_assistant("a1")
-        # Wipe the user_message events so user_position resolution fails.
-        # Direct dict manipulation — the events list is a SQLite blob,
-        # we approximate by monkeypatching _live_user_turns to lie.
-        agent._live_user_turns = lambda branch_view=None: []  # type: ignore[method-assign]
+        agent.controller.conversation.append("user", "u1")
+        before = agent.controller.conversation.get_messages()[:]
         await agent.regenerate_last_response(turn_index=1)
-        # Bailed without invoking _rerun.
         assert agent._rerun_calls == []
+        assert agent.controller.conversation.get_messages() == before
 
     async def test_user_message_content_no_store_returns_none(self, agent):
         agent.session_store = None

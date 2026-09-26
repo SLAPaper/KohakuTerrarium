@@ -69,7 +69,9 @@ def _extras(message: dict[str, Any]) -> bool:
     return bool(set(message) - _STANDARD) or bool(message.get("name"))
 
 
-def _native_groups(messages: list[dict[str, Any]]) -> dict[int, int]:
+def _native_groups(
+    messages: list[dict[str, Any]], *, allow_pending_tail: bool = False
+) -> dict[int, int]:
     """Validate raw pairing before private/legacy context can admit a message."""
     groups = {}
     seen = set()
@@ -126,7 +128,7 @@ def _native_groups(messages: list[dict[str, Any]]) -> dict[int, int]:
                 )
             pending.remove(call_id)
             end += 1
-        if pending:
+        if pending and not (allow_pending_tail and end == len(messages)):
             raise HistoryCompatibilityError("Missing adjacent native result in history")
         groups[index] = end
         index = end
@@ -198,6 +200,7 @@ def validate_history_compatibility(
     target_source: dict[str, Any],
     *,
     current_source: dict[str, Any] | None = None,
+    allow_pending_tail: bool = False,
 ) -> str:
     """Return portable/native/private classification or raise before any mutation.
 
@@ -208,7 +211,7 @@ def validate_history_compatibility(
     current = _source(current_source) if current_source is not None else {}
     raw = [_raw(message) for message in messages]
     origins = [_origin(message) for message in raw]
-    groups = _native_groups(raw)
+    groups = _native_groups(raw, allow_pending_tail=allow_pending_tail)
     classification = "portable"
     index = 0
     while index < len(raw):

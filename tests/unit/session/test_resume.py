@@ -2439,6 +2439,7 @@ class TestResumeAgent:
                         "tool_calls": [
                             {
                                 "id": "c1",
+                                "type": "function",
                                 "function": {
                                     "name": "read",
                                     "arguments": '{"path": "big.py"}',
@@ -2455,6 +2456,7 @@ class TestResumeAgent:
                         "tool_calls": [
                             {
                                 "id": "c2",
+                                "type": "function",
                                 "function": {
                                     "name": "grep",
                                     "arguments": '{"pattern": "x"}',
@@ -2496,6 +2498,7 @@ class TestResumeAgent:
                         "tool_calls": [
                             {
                                 "id": "c1",
+                                "type": "function",
                                 "function": {"name": "read", "arguments": "{}"},
                             }
                         ],

@@ -10,6 +10,7 @@ import asyncio
 
 from kohakuterrarium.core.agent_mid_turn import _to_serializable_content
 from kohakuterrarium.core.agent_runtime_tools import _make_job_label
+from kohakuterrarium.core.background_admission import admit_background_run
 from kohakuterrarium.core.event_inbox import EventEnvelope, TurnOutcome
 from kohakuterrarium.core.metrics_hook import metrics
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
@@ -112,6 +113,13 @@ class AgentEventLoopMixin:
                 # queue may hold events while paused; they drain on resume).
                 if not self._consumer_resume.is_set():
                     continue
+                admission = getattr(self, "_history_rerun_ready", None)
+                if admission is not None:
+                    await admission.wait()
+                if not self._running:
+                    break
+                if not self._consumer_resume.is_set():
+                    continue
                 batch = self._event_inbox.drain_all()
                 for run in segment_stackable(batch):
                     if not self._running:
@@ -136,6 +144,23 @@ class AgentEventLoopMixin:
         Awaiting captures (``run`` / ``run_stream`` / ``run_event``) attach
         BEFORE the turn so they record it from the start and detach after.
         The turn mutex is held for the whole turn so ``stop()`` can join."""
+        handoff = []
+        async with self._processing_lock:
+            self._turn_lock_holder = asyncio.current_task()
+            try:
+                run = await admit_background_run(self, run)
+                if run:
+                    handoff = await self._run_admitted_batch(run)
+            finally:
+                self._turn_lock_holder = None
+                self._active_turn_stackable = True
+        if handoff and self._running:
+            await self._run_turn_for_batch(handoff)
+
+    async def _run_admitted_batch(
+        self, run: list[EventEnvelope]
+    ) -> list[EventEnvelope]:
+        """Drive a lineage-admitted batch while holding the processing lock."""
         events = [env.event for env in run]
         primary = events[0]
         captures = [env.capture for env in run if env.capture is not None]
@@ -146,25 +171,19 @@ class AgentEventLoopMixin:
         for cap in captures:
             self.output_router.add_secondary(cap)
         interrupted = False
-        handoff: list[EventEnvelope] = []
+        handoff = []
         try:
-            async with self._processing_lock:
-                self._turn_lock_holder = asyncio.current_task()
-                self._active_turn_stackable = primary.stackable
-                try:
-                    if not self._running:
-                        self._reject_run(run, status="rejected")
-                        return
-                    require_model_mutation_available(self)
-                    await self._begin_batch(events)
-                    await self._process_batch_with_controller(events, self.controller)
-                    interrupted = bool(primary.context.get("interrupted_by_user"))
-                finally:
-                    self._turn_lock_holder = None
-                    self._active_turn_stackable = True
-                if interrupted:
-                    self._flush_trigger_backlog_stash()
-                    handoff = self._event_inbox.drain_all()
+            self._active_turn_stackable = primary.stackable
+            if not self._running:
+                self._reject_run(run, status="rejected")
+                return []
+            require_model_mutation_available(self)
+            await self._begin_batch(events)
+            await self._process_batch_with_controller(events, self.controller)
+            interrupted = bool(primary.context.get("interrupted_by_user"))
+            if interrupted:
+                self._flush_trigger_backlog_stash()
+                handoff = self._event_inbox.drain_all()
         finally:
             for cap in captures:
                 self.output_router.remove_secondary(cap)
@@ -179,8 +198,7 @@ class AgentEventLoopMixin:
             status="interrupted" if interrupted else "ok",
             interrupted=interrupted,
         )
-        if handoff and self._running:
-            await self._run_turn_for_batch(handoff)
+        return handoff
 
     def _resolve_run(
         self, run: list[EventEnvelope], *, status: str, interrupted: bool = False

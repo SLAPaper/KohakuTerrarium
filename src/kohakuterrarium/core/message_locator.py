@@ -25,6 +25,14 @@ def _content_signature(content: object) -> tuple[str, str]:
     )
 
 
+def is_turn_user_message(message: object) -> bool:
+    """Identify user input rather than replayed subagent feedback."""
+    metadata = getattr(message, "metadata", None)
+    return getattr(message, "role", None) == "user" and not (
+        isinstance(metadata, dict) and metadata.get("kind") == "tool_results"
+    )
+
+
 def user_message_indices_for_turn(
     messages: list[object],
     turn_index: int,
@@ -34,7 +42,7 @@ def user_message_indices_for_turn(
     for idx, msg in enumerate(messages):
         metadata = getattr(msg, "metadata", None)
         if (
-            getattr(msg, "role", None) == "user"
+            is_turn_user_message(msg)
             and isinstance(metadata, dict)
             and metadata.get("turn_index") == turn_index
         ):
@@ -51,6 +59,6 @@ def user_message_indices_for_content(
     return [
         idx
         for idx, msg in enumerate(messages)
-        if getattr(msg, "role", None) == "user"
+        if is_turn_user_message(msg)
         and _content_signature(getattr(msg, "content", None)) == signature
     ]

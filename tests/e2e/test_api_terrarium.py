@@ -675,7 +675,7 @@ class TestApiTerrariumJourney:
         assert {session_id, second_id} <= graph_ids
         # Merge the second session into the first.
         resp = client.post(f"/api/sessions/topology/{session_id}/merge/{second_id}")
-        assert resp.status_code == 200
+        assert resp.status_code == 200, resp.text
         merge_body = resp.json()
         assert merge_body["merged"] is True
         survivor = merge_body["session_id"]

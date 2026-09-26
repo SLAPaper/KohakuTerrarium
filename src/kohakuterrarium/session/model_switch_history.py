@@ -13,7 +13,12 @@ from kohakuterrarium.errors import HistoryCompatibilityError
 
 
 def validate_switch_history(
-    messages, selected_raw_events, all_switch_events, target_source
+    messages,
+    selected_raw_events,
+    all_switch_events,
+    target_source,
+    *,
+    allow_pending_tail=False,
 ):
     """Use selected coordinates and the first subsequent global switch.
 
@@ -50,7 +55,7 @@ def validate_switch_history(
         if event.get("type") == "assistant_tool_calls":
             ids = tuple(call.get("id") for call in event.get("tool_calls", []))
             announcements.setdefault(ids, []).append(event.get("event_id"))
-    groups = _native_groups(raw)
+    groups = _native_groups(raw, allow_pending_tail=allow_pending_tail)
     index = 0
     while index < len(raw):
         message = raw[index]

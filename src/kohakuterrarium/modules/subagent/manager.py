@@ -1,6 +1,7 @@
 """Manage task and interactive sub-agent lifecycle, jobs, and results."""
 
 import asyncio
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,6 +28,19 @@ from kohakuterrarium.parsing.events import SubAgentCallEvent
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+def subagent_background_requested(args: dict[str, Any]) -> bool:
+    """Resolve native or bracket wait intent to a boolean."""
+    value = args.get("run_in_background", True)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value.strip().lower() in {"true", "1", "yes", "y", "on"}:
+            return True
+        if value.strip().lower() in {"false", "0", "no", "n", "off"}:
+            return False
+    raise ValueError("run_in_background must be a boolean")
 
 
 class SubAgentManager(InteractiveManagerMixin):
@@ -140,8 +154,10 @@ class SubAgentManager(InteractiveManagerMixin):
         task: str,
         job_id: str | None = None,
         background: bool = True,
+        completion_context: dict[str, Any] | None = None,
     ) -> str:
         """Spawn a registered sub-agent and optionally await its completion."""
+        completion_context = deepcopy(completion_context or {})
         config = self._configs.get(name)
         if config is None:
             raise ValueError(f"Sub-agent not registered: {name}")
@@ -160,19 +176,7 @@ class SubAgentManager(InteractiveManagerMixin):
             if job_id is None:
                 job_id = generate_job_id(f"agent_{name}")
 
-            error_result = SubAgentResult(success=False, error=error_msg)
-            self._results[job_id] = error_result
-
-            status = JobStatus(
-                job_id=job_id,
-                job_type=JobType.SUBAGENT,
-                type_name=name,
-                state=JobState.ERROR,
-                error=error_msg,
-            )
-            self.job_store.register(status)
-
-            return job_id
+            return self.record_rejection(name, job_id, error_msg, completion_context)
 
         if job_id is None:
             job_id = generate_job_id(f"agent_{name}")
@@ -199,7 +203,6 @@ class SubAgentManager(InteractiveManagerMixin):
 
         # Preserve the legacy shared-budget contract when configured.
         subagent.iteration_budget = self._resolve_child_budget(config)
-        await load_and_wrap_plugins(plugin_manager, subagent, llm, self.agent_path)
 
         if self._on_tool_activity:
             sa_name = name
@@ -229,11 +232,15 @@ class SubAgentManager(InteractiveManagerMixin):
             job_type=JobType.SUBAGENT,
             type_name=name,
             state=JobState.RUNNING,
+            context=completion_context,
         )
         self.job_store.register(status)
 
         task_obj = asyncio.create_task(self._run_subagent(job_id, job, task))
         self._tasks[job_id] = task_obj
+        task_obj.add_done_callback(
+            lambda done: self._finalize_cancelled_task(job_id, done)
+        )
 
         if not background:
             await task_obj
@@ -247,11 +254,58 @@ class SubAgentManager(InteractiveManagerMixin):
 
         return job_id
 
-    async def spawn_from_event(self, event: SubAgentCallEvent) -> tuple[str, bool]:
+    def _finalize_cancelled_task(self, job_id: str, task: asyncio.Task) -> None:
+        """Record cancellation when the runner never produced a result."""
+        status = self.job_store.get_status(job_id)
+        if not task.cancelled() or status is None or status.state != JobState.RUNNING:
+            return
+        error = "Sub-agent was cancelled before execution."
+        self._results[job_id] = SubAgentResult(
+            success=False, error=error, cancelled=True
+        )
+        self.job_store.update_status(job_id, state=JobState.CANCELLED, error=error)
+
+    def record_rejection(
+        self, name: str, job_id: str, error: str, context: dict
+    ) -> str:
+        """Register a dispatch rejection for ordinary result delivery."""
+        result = SubAgentResult(success=False, error=error)
+        self._results[job_id] = result
+        self.job_store.register(
+            JobStatus(
+                job_id=job_id,
+                job_type=JobType.SUBAGENT,
+                type_name=name,
+                state=JobState.ERROR,
+                error=error,
+                context=deepcopy(context),
+            )
+        )
+
+        async def deliver_result():
+            return result
+
+        self._tasks[job_id] = asyncio.create_task(deliver_result())
+        return job_id
+
+    async def spawn_from_event(
+        self,
+        event: SubAgentCallEvent,
+        *,
+        job_id: str | None = None,
+        completion_context: dict[str, Any] | None = None,
+    ) -> tuple[str, bool]:
         """Spawn from a parsed call while preserving the model's wait intent."""
         task = event.args.get("task", event.args.get("content", ""))
-        is_background = event.args.pop("run_in_background", True)
-        job_id = await self.spawn(event.name, task, background=True)
+        is_background = subagent_background_requested(event.args)
+        event.args.pop("run_in_background", None)
+        job_id = await self.spawn(
+            event.name,
+            task,
+            job_id=job_id,
+            background=True,
+            completion_context=completion_context,
+        )
         return job_id, is_background
 
     def _update_persisted_result(self, job_id: str, result: SubAgentResult) -> None:
@@ -307,6 +361,9 @@ class SubAgentManager(InteractiveManagerMixin):
     ) -> SubAgentResult:
         """Run sub-agent and update status."""
         try:
+            await load_and_wrap_plugins(
+                job.subagent.plugins, job.subagent, job.subagent.llm, self.agent_path
+            )
             result = await job.run(task)
             # Result-site hooks may transform output without mutating shared job methods.
             pm = self._parent_plugins

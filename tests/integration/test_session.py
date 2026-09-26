@@ -18,15 +18,20 @@ the agent from the ``config_path`` in meta and re-injects state;
 """
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.errors import HistoryCompatibilityError
+from kohakuterrarium.core import agent_model
 from kohakuterrarium.core.agent import Agent
+from kohakuterrarium.llm.generation import provider_source
 from kohakuterrarium.core.events import create_user_input_event
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
 from kohakuterrarium.modules.trigger.timer import TimerTrigger
@@ -172,7 +177,9 @@ def _new_store(path, *, config_path: str, agents: list[str]) -> SessionStore:
 class TestSessionIntegration:
     """Each method = one full session workflow, start to finish."""
 
-    async def test_run_record_close_reopen_resume(self, patched_llm, tmp_path):
+    async def test_run_record_close_reopen_resume(
+        self, patched_llm, tmp_path, monkeypatch
+    ):
         """The canonical session integration workflow.
 
         init store → real Agent attaches it → run chat turns that write
@@ -197,9 +204,41 @@ class TestSessionIntegration:
         agent.executor.register_tool(echo)
         agent.attach_session_store(store)
         await agent.start()
+        captures = []
+        conversation_type = type(agent.controller.conversation)
+        snapshot_messages = conversation_type.snapshot_messages
+
+        def observe_snapshot(conversation, **kwargs):
+            if conversation is agent.controller.conversation:
+                captures.append(
+                    (asyncio.current_task(), agent._processing_lock.locked())
+                )
+            return snapshot_messages(conversation, **kwargs)
+
+        monkeypatch.setattr(conversation_type, "snapshot_messages", observe_snapshot)
+        writes = []
+        append_message = conversation_type.append
+
+        def observe_append(conversation, role, content, **kwargs):
+            if conversation is agent.controller.conversation and role in (
+                "user",
+                "assistant",
+            ):
+                writes.append(asyncio.current_task())
+            return append_message(conversation, role, content, **kwargs)
+
+        monkeypatch.setattr(conversation_type, "append", observe_append)
         try:
             await agent._process_event(create_user_input_event("introduce yourself"))
             await agent._process_event(create_user_input_event("use the echo tool"))
+            assert writes and all(
+                task is agent._session_state_owner.task for task in writes
+            )
+            assert len(captures) >= 2
+            assert all(
+                task is agent._session_state_owner.task and locked
+                for task, locked in captures
+            )
             await store.run(lambda: None)
             generation_events = await store.run(store.get_events, "scribe")
             starts = [
@@ -816,6 +855,411 @@ class TestSessionIntegration:
         finally:
             forked_session.store.close()
         host_store.close()
+
+        selected_path = tmp_path / "selected-rerun.kohakutr"
+        selected_store = _new_store(
+            selected_path, config_path=config_path, agents=["scribe"]
+        )
+        patched_llm["script"] = ["original branch answer", "regenerated branch answer"]
+        selecting = Agent.from_path(config_path)
+        selecting.attach_session_store(selected_store)
+        await selecting.start()
+        try:
+            assert (
+                await selecting.run("branch question", timeout=5)
+            ).text == "original branch answer"
+            original_conversation = selecting.controller.conversation
+            original_user = next(
+                m for m in original_conversation.get_messages() if m.role == "user"
+            )
+            await selecting.regenerate_last_response(request_id="integration-retry")
+            assert selecting.controller.conversation is original_conversation
+            assert (
+                next(
+                    m for m in original_conversation.get_messages() if m.role == "user"
+                )
+                is original_user
+            )
+            assert [
+                m.content
+                for m in original_conversation.get_messages()
+                if m.role == "assistant"
+            ] == ["regenerated branch answer"]
+            await selecting.select_branch({1: 1})
+            assert [
+                m.content
+                for m in selecting.controller.conversation.get_messages()
+                if m.role == "assistant"
+            ] == ["original branch answer"]
+        finally:
+            await selecting.stop()
+            await asyncio.to_thread(selected_store.close)
+        corrupted = SessionStore(str(selected_path))
+        original_snapshot = corrupted.load_conversation("scribe")
+        tampered = deepcopy(original_snapshot)
+        claim = next(m for m in tampered if m["role"] == "assistant")["metadata"][
+            "generation"
+        ]
+        claim["source"]["model"] = "unsupported-snapshot-model"
+        corrupted.save_conversation("scribe", tampered)
+        corrupted.close()
+        with pytest.raises(HistoryCompatibilityError, match="snapshot generation"):
+            await resume_agent_async(selected_path)
+        repaired = SessionStore(str(selected_path), writer_lock=True)
+        try:
+            assert repaired.load_conversation("scribe") == tampered
+            repaired.save_conversation("scribe", original_snapshot)
+        finally:
+            repaired.close()
+        orphaned = [
+            *deepcopy(original_snapshot),
+            {"role": "tool", "content": "unannounced", "tool_call_id": "orphan"},
+        ]
+        corrupted_native = SessionStore(str(selected_path))
+        corrupted_native.save_conversation("scribe", orphaned)
+        corrupted_native.close()
+        with pytest.raises(HistoryCompatibilityError, match="Orphan native"):
+            await resume_agent_async(selected_path)
+        repaired_native = SessionStore(str(selected_path), writer_lock=True)
+        try:
+            assert repaired_native.load_conversation("scribe") == orphaned
+            repaired_native.save_conversation("scribe", original_snapshot)
+        finally:
+            repaired_native.close()
+        patched_llm["script"] = ["continued selected branch"]
+        continued, continued_store = await resume_agent_async(selected_path)
+        try:
+            assert continued._branch_id == 1
+            assert [
+                m.content
+                for m in continued.controller.conversation.get_messages()
+                if m.role == "assistant"
+            ] == ["original branch answer"]
+            await continued.start()
+            assert (
+                await continued.run("follow selected branch", timeout=5)
+            ).text == "continued selected branch"
+            assert continued._parent_branch_path == [(1, 1)]
+            raw = await continued_store.run(continued_store.get_events, "scribe")
+            assert {
+                e["branch_id"]
+                for e in raw
+                if e["type"] == "user_message" and e["turn_index"] == 1
+            } == {1, 2}
+            assert all(
+                e["parent_branch_path"] == [[1, 1]]
+                for e in raw
+                if e["type"] == "user_message" and e["turn_index"] == 2
+            )
+            edit_target = next(
+                e for e in raw if e["type"] == "user_message" and e["turn_index"] == 2
+            )
+            assert await continued.edit_and_rerun(
+                -1,
+                "edited selected continuation",
+                target=UserMessageSelector(edit_target["event_id"], 2, 1),
+                request_id="integration-canonical-edit",
+            )
+            edited_user = [
+                m
+                for m in continued.controller.conversation.get_messages()
+                if m.role == "user"
+            ][-1]
+            raw_after = await continued_store.run(continued_store.get_events, "scribe")
+            canonical = next(
+                e
+                for e in raw_after
+                if e["type"] == "user_message"
+                and e["turn_index"] == 2
+                and e["branch_id"] == 2
+            )
+            assert edited_user.metadata["event_id"] == canonical["event_id"]
+            assert canonical["content"] == "edited selected continuation"
+            assert continued._parent_branch_path == [(1, 1)]
+        finally:
+            await continued.stop()
+            await asyncio.to_thread(continued_store.close)
+        edited_resume, edited_store = await resume_agent_async(selected_path)
+        try:
+            assert edited_resume._branch_id == 2
+            assert [
+                m.content
+                for m in edited_resume.controller.conversation.get_messages()
+                if m.role == "user"
+            ] == ["branch question", "edited selected continuation"]
+            assert edited_resume._parent_branch_path == [(1, 1)]
+            await edited_resume.start()
+            rewind_messages = edited_resume.controller.conversation.get_messages()[:-1]
+            await edited_resume.rewind_to(len(rewind_messages))
+            assert (
+                edited_resume.controller.conversation.get_messages() == rewind_messages
+            )
+        finally:
+            await edited_resume.stop()
+            await asyncio.to_thread(edited_store.close)
+        rewound, rewound_store = await resume_agent_async(selected_path)
+        try:
+            assert (
+                rewound.controller.conversation.get_messages()[-1].content
+                == "edited selected continuation"
+            )
+            assert rewound.controller.conversation.get_messages()[-1].role == "user"
+            await rewound.start()
+            assert (await rewound.run("after rewind", timeout=5)).ok
+            assert rewound._parent_branch_path == [(1, 1), (2, 2)]
+        finally:
+            await rewound.stop()
+            await asyncio.to_thread(rewound_store.close)
+
+        child_path = tmp_path / "children-without-snapshot.kohakutr"
+        child_store = _new_store(child_path, config_path=config_path, agents=["scribe"])
+        child_store.append_event(
+            "scribe",
+            "user_message",
+            {"content": "child question"},
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        for native in (False, True):
+            identity = {
+                "job_id": f"agent_child_{native}",
+                "name": "child",
+                "task": "work",
+                "background": False,
+            }
+            if native:
+                identity.update(
+                    tool_call_id="provider-child",
+                    tool_call_arguments='{ "task": "work" }',
+                )
+            child_store.append_event(
+                "scribe",
+                "subagent_call",
+                identity,
+                turn_index=1,
+                branch_id=1,
+                parent_branch_path=[],
+            )
+            child_store.append_event(
+                "scribe",
+                "subagent_result",
+                {**identity, "output": f"child output {native}"},
+                turn_index=1,
+                branch_id=1,
+                parent_branch_path=[],
+            )
+        child_store.close()
+        child_llm = ScriptedLLM(["child history continued"])
+        restored_child, child_store = await resume_agent_async(
+            child_path, llm=child_llm
+        )
+        try:
+            messages = restored_child.controller.conversation.get_messages()
+            assert any(
+                m.metadata.get("kind") == "tool_results"
+                and "child output False" in m.content
+                for m in messages
+            )
+            assert any(
+                m.role == "tool"
+                and m.tool_call_id == "provider-child"
+                and m.content == "child output True"
+                for m in messages
+            )
+            assert (
+                child_llm.call_count == 0 and not restored_child.subagent_manager._tasks
+            )
+            await restored_child.start()
+            assert (
+                await restored_child.run("continue", timeout=5)
+            ).text == "child history continued"
+        finally:
+            await restored_child.stop()
+            await asyncio.to_thread(child_store.close)
+
+        pending_path = tmp_path / "pending-snapshot.kohakutr"
+        pending_store = _new_store(
+            pending_path, config_path=config_path, agents=["scribe"]
+        )
+        pending_store.append_event(
+            "scribe",
+            "user_message",
+            {"content": "pending question"},
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        pending_identity = {
+            "job_id": "agent_pending",
+            "tool_call_id": "pending-provider",
+            "name": "child",
+            "background": False,
+            "execution_class": "direct",
+        }
+        pending_store.append_event(
+            "scribe",
+            "subagent_call",
+            {
+                **pending_identity,
+                "task": "work",
+                "tool_call_arguments": '{"task":"work"}',
+            },
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        pending_store.save_conversation(
+            "scribe",
+            [
+                {"role": "assistant", "content": "preserved summary"},
+                {
+                    "role": "user",
+                    "content": "pending question",
+                    "metadata": {"turn_index": 1, "branch_id": 1},
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "pending-provider",
+                            "type": "function",
+                            "function": {
+                                "name": "child",
+                                "arguments": '{"task":"work"}',
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+        pending_store.state["scribe:snapshot_event_id"] = pending_store.max_event_id(
+            "scribe"
+        )
+        pending_store.append_event(
+            "scribe",
+            "subagent_result",
+            {**pending_identity, "output": "completed after snapshot"},
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        pending_store.close()
+        for attempt in range(2):
+            recovery_llm = ScriptedLLM(["snapshot continued"])
+            recovered, recovered_store = await resume_agent_async(
+                pending_path, llm=recovery_llm
+            )
+            try:
+                messages = recovered.controller.conversation.get_messages()
+                assert any(m.content == "preserved summary" for m in messages)
+                assert [
+                    m.content
+                    for m in messages
+                    if m.role == "tool" and m.tool_call_id == "pending-provider"
+                ] == ["completed after snapshot"]
+                assert recovery_llm.call_count == 0
+                raw = await recovered_store.run(recovered_store.get_events, "scribe")
+                assert len([e for e in raw if e["type"] == "subagent_result"]) == 1
+                if attempt:
+                    await recovered.start()
+                    assert (
+                        await recovered.run("continue", timeout=5)
+                    ).text == "snapshot continued"
+                    await recovered.stop()
+            finally:
+                await asyncio.to_thread(recovered_store.close)
+
+        provider_path = tmp_path / "effective-provider.kohakutr"
+        saved_provider = ScriptedLLM(["effective provider continued"])
+        saved_provider.provider_name = "openai"
+        saved_provider.backend_type = "openai"
+        saved_provider.backend_key = "saved-route"
+        saved_provider.model = "model"
+        saved_provider._llm_identifier = "saved-route/model"
+        generation = {
+            "schema": 1,
+            "generation_id": "saved-g",
+            "source": provider_source(saved_provider, "bracket"),
+        }
+        provider_store = _new_store(
+            provider_path, config_path=config_path, agents=["scribe"]
+        )
+        provider_store.append_event(
+            "scribe",
+            "user_message",
+            {"content": "saved private question"},
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        provider_store.append_event(
+            "scribe",
+            "assistant_generation_start",
+            deepcopy(generation),
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        provider_store.save_conversation(
+            "scribe",
+            [
+                {"role": "system", "content": "provider saved system"},
+                {
+                    "role": "user",
+                    "content": "saved private question",
+                    "metadata": {"turn_index": 1, "branch_id": 1},
+                },
+                {
+                    "role": "assistant",
+                    "content": "saved private answer",
+                    "reasoning_content": "private data",
+                    "metadata": {"generation": generation},
+                },
+            ],
+        )
+        provider_store.state["scribe:model_selection"] = "saved-route/model"
+        provider_store.state["scribe:snapshot_event_id"] = provider_store.max_event_id(
+            "scribe"
+        )
+        provider_store.close()
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                agent_model, "resolve_controller_llm", lambda *a, **k: SimpleNamespace()
+            )
+            patch.setattr(
+                agent_model,
+                "profile_to_identifier",
+                lambda profile: "saved-route/model",
+            )
+            patch.setattr(
+                agent_model,
+                "create_llm_from_profile_name",
+                lambda selector: saved_provider,
+            )
+            recovered, recovered_store = await resume_agent_async(
+                provider_path, llm=ScriptedLLM(["wrong initial provider"])
+            )
+            try:
+                assert (
+                    recovered.llm is saved_provider
+                    and recovered.controller.llm is saved_provider
+                    and recovered.subagent_manager.llm is saved_provider
+                )
+                assert (
+                    recovered.controller.conversation.get_system_message().content
+                    == "provider saved system"
+                )
+                assert "private data" in recovered.controller.conversation.to_json()
+                assert saved_provider.call_count == 0
+                await recovered.start()
+                assert (
+                    await recovered.run("continue", timeout=5)
+                ).text == "effective provider continued"
+            finally:
+                await recovered.stop()
+                await asyncio.to_thread(recovered_store.close)
 
     async def test_memory_index_and_search_finds_exact_turn(
         self, patched_llm, tmp_path

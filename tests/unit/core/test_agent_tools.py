@@ -925,7 +925,9 @@ class TestStartToolAsync:
         # Stub submit_from_event to return our pre-cached job id, with
         # no Task entry in ``_tasks`` — exercising the synthetic-task path.
 
-        async def _fake_submit(event, is_direct=False):
+        async def _fake_submit(
+            event, is_direct=False, *, job_id=None, completion_context=None
+        ):
             return "pre"
 
         ex.submit_from_event = _fake_submit

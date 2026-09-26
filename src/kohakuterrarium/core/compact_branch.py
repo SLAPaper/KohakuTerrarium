@@ -40,6 +40,33 @@ def current_path(agent: Any) -> set[tuple[int, int]]:
     return path
 
 
+def snapshot_branch_view(agent: Any) -> dict[int, int] | None:
+    """Project the explicit branch view with current ancestry and coordinates."""
+    if agent is None:
+        return None
+    view = getattr(agent, "_branch_view", None)
+    pairs = list(view.items()) if isinstance(view, dict) else []
+    pairs.extend(getattr(agent, "_parent_branch_path", None) or [])
+    pairs.append(
+        (getattr(agent, "_turn_index", None), getattr(agent, "_branch_id", None))
+    )
+    selected: dict[int, int] = {}
+    for pair in pairs:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            continue
+        turn, branch = pair
+        if (
+            isinstance(turn, int)
+            and not isinstance(turn, bool)
+            and turn > 0
+            and isinstance(branch, int)
+            and not isinstance(branch, bool)
+            and branch > 0
+        ):
+            selected[turn] = branch
+    return selected or None
+
+
 def persist_compacted(
     store: Any,
     agent_name: str,
@@ -158,6 +185,7 @@ def tag_snapshot_branch(store: Any, agent: Any, agent_name: str) -> None:
             "turn_index": ti,
             "branch_id": bi,
             "parent_branch_path": getattr(agent, "_parent_branch_path", None),
+            "branch_view": snapshot_branch_view(agent),
         }
     except Exception:  # pragma: no cover - defensive
         pass

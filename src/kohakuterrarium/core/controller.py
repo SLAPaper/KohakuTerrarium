@@ -21,16 +21,17 @@ from kohakuterrarium.commands.read import (
     WaitCommand,
 )
 from kohakuterrarium.core.controller_metrics import time_llm_call
+from kohakuterrarium.core.controller_history import (
+    append_assistant,
+    capture_turn_messages,
+)
 from kohakuterrarium.core.controller_generation import start_generation
 from kohakuterrarium.core.controller_plugins import (
     register_controller_command,
     run_post_llm_call_chain,
 )
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
-from kohakuterrarium.core.conversation_elide import (
-    TOOL_FEEDBACK_KIND,
-)
-from kohakuterrarium.core.events import EventType, TriggerEvent
+from kohakuterrarium.core.events import TriggerEvent
 from kohakuterrarium.core.controller_context import format_events_for_context
 from kohakuterrarium.core.executor import Executor
 from kohakuterrarium.core.job import JobResult, JobStatus, JobStore
@@ -493,7 +494,7 @@ class Controller:
         # execution event. Background handlers may append a tool placeholder as
         # soon as the event is yielded, and provider protocols require that result
         # to follow the assistant message which introduced its tool_call_id.
-        self.conversation.append("assistant", final_content, **append_kwargs)
+        await append_assistant(self, final_content, **append_kwargs)
 
         for event in pending_native_events:
             yield event
@@ -830,16 +831,10 @@ class Controller:
             and not e.context.get("edited")
             for e in events
         )
-        if not skip_empty:
-            msg = self.conversation.append("user", user_content)
-            # Pure tool-feedback rounds are tagged so their results can
-            # be elided once the round is no longer the latest; a batch
-            # carrying any real user input is never tagged (and never
-            # elided).
-            if events and all(e.type == EventType.TOOL_COMPLETE for e in events):
-                msg.metadata["kind"] = TOOL_FEEDBACK_KIND
-
-        messages = self.conversation.to_messages()
+        messages = await capture_turn_messages(self, events, user_content, skip_empty)
+        stop_lock = getattr(getattr(self, "_state_host", None), "_stop_lock", None)
+        if self._interrupted or (stop_lock is not None and stop_lock.locked()):
+            return
         messages = await self._resolve_message_files(messages)
 
         # Insert after all system messages so plugin context is early while
@@ -891,8 +886,8 @@ class Controller:
                         source_name=part.source_name,
                         revised_prompt=getattr(part, "revised_prompt", None),
                     )
-            self.conversation.append(
-                "assistant",
+            await append_assistant(
+                self,
                 _merge_text_and_parts(self._last_assistant_content, structured),
                 metadata={"generation": deepcopy(self._active_generation)},
                 extra_fields=(

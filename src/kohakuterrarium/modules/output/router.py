@@ -34,6 +34,7 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
         suppress_subagent_blocks: bool = True,
     ):
         """Initialize output targets, suppression state, and event queues."""
+        self._terminal_publications: set[asyncio.Task] = set()
         self.default_output = default_output
         self.named_outputs = named_outputs or {}
         self.suppress_tool_blocks = suppress_tool_blocks
@@ -244,6 +245,54 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
             )
         )
 
+    def notify_terminal_activity(self, activity_type, detail, metadata, *, retry=False):
+        """Return the sole canonical receipt and isolate noncanonical observers."""
+        targets = [self.default_output, *self._secondary_outputs]
+        canonical = [
+            target
+            for target in targets
+            if getattr(type(target), "_kt_canonical_session_output", False)
+        ]
+        if len(canonical) > 1:
+            raise RuntimeError("Ambiguous canonical terminal destination")
+        canonical_metadata = {
+            **deepcopy(metadata),
+            "_terminal_publication": True,
+            "_terminal_retry": retry,
+        }
+        receipt = (
+            canonical[0].record_terminal_activity(
+                activity_type, detail, canonical_metadata
+            )
+            if canonical
+            else None
+        )
+        for target in targets:
+            if target in canonical:
+                continue
+            try:
+                if hasattr(target, "on_activity_with_metadata"):
+                    target.on_activity_with_metadata(
+                        activity_type, detail, deepcopy(metadata)
+                    )
+                else:
+                    target.on_activity(activity_type, detail)
+            except Exception:
+                logger.warning("Terminal observer failed", exc_info=True)
+        return receipt
+
+    async def drain_terminal_publications(self):
+        """Join accepted publications without cancelling their canonical writes."""
+        while self._terminal_publications:
+            tasks = tuple(self._terminal_publications)
+            outcomes = await asyncio.shield(
+                asyncio.gather(*tasks, return_exceptions=True)
+            )
+            self._terminal_publications.difference_update(tasks)
+            for outcome in outcomes:
+                if isinstance(outcome, Exception):
+                    raise outcome
+
     async def start(self) -> None:
         """Start the router and output modules."""
         await self.default_output.start()
@@ -254,6 +303,7 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
 
     async def stop(self) -> None:
         """Stop the router and output modules."""
+        await self.drain_terminal_publications()
         for name, output in self.named_outputs.items():
             await output.stop()
             logger.debug("Named output stopped", output_name=name)
@@ -266,6 +316,7 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
 
     async def flush(self) -> None:
         """Flush output modules."""
+        await self.drain_terminal_publications()
         await self.default_output.flush()
         for output in self.named_outputs.values():
             await output.flush()
@@ -292,6 +343,7 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
 
     async def on_processing_end(self) -> None:
         """Notify all output modules that processing has ended."""
+        await self.drain_terminal_publications()
         await self.default_output.on_processing_end()
         for output in self.named_outputs.values():
             await output.on_processing_end()

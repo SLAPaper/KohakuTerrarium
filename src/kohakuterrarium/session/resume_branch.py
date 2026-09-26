@@ -8,11 +8,13 @@ agent resumes onto, or must be rebuilt from the event log.
 from typing import Any
 
 from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
-from kohakuterrarium.session.history import (
-    normalize_resumable_events,
-    replay_conversation,
-    select_live_event_ids,
-)
+from kohakuterrarium.session.history import select_live_event_ids
+from kohakuterrarium.session.resume_admission import validate_resume_snapshot
+from kohakuterrarium.session.resume_reconciliation import reconcile_snapshot
+from kohakuterrarium.session.resume_replay import replay_resume_history
+from kohakuterrarium.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def snapshot_has_turn_metadata(snapshot: list[dict]) -> bool:
@@ -51,7 +53,11 @@ def snapshot_has_turn_metadata(snapshot: list[dict]) -> bool:
     )
 
 
-def backfill_turn_metadata(snapshot: list[dict], events: list[dict]) -> list[dict]:
+def backfill_turn_metadata(
+    snapshot: list[dict],
+    events: list[dict],
+    branch_view: dict[int, int] | None = None,
+) -> list[dict]:
     """Backfill user-turn metadata onto a legacy metadata-less snapshot.
 
     The snapshot is the canonical persisted state (compaction exists only
@@ -64,7 +70,7 @@ def backfill_turn_metadata(snapshot: list[dict], events: list[dict]) -> list[dic
     summarizes the prefix and keeps only the live zone), so they map to the
     LAST ``user_message`` events, not the first ones.
     """
-    live_ids = set(select_live_event_ids(events))
+    live_ids = set(select_live_event_ids(events, branch_view=branch_view))
     meta_by_pos: list[dict] = []
     pos_by_key: dict[tuple[int, int], int] = {}
     type_by_key: dict[tuple[int, int], str] = {}
@@ -173,33 +179,67 @@ def _safe_branch_path(raw: Any) -> list[tuple[int, int]]:
     return out
 
 
-def snapshot_mismatches_branch(store: Any, agent: Any, agent_name: str) -> bool:
+def snapshot_mismatches_branch(
+    store: Any,
+    agent: Any,
+    agent_name: str,
+    *,
+    branch_view: dict[int, int] | None = None,
+) -> bool:
     """Whether the saved snapshot belongs to a different branch than the one
-    resume lands on (the latest live subtree, restored by
-    ``_restore_turn_branch_state``).
+    resume lands on.
 
     A snapshot tagged with a branch that is an ANCESTOR of the target branch
     is still usable — resume appends the post-snapshot tail. Only a snapshot
     whose path diverges (a sibling branch) must be discarded and rebuilt.
+
+    When ``branch_view`` is the resolved selected map, the target path is
+    that map — never the agent's pre-restore coordinates, which still point
+    at latest until restore runs.
     """
     try:
-        branch = store.state.get(f"{agent_name}:snapshot_branch")
+        key = f"{agent_name}:snapshot_branch"
+        if key not in store.state:
+            return False
+        branch = store.state.get(key)
     except (KeyError, TypeError):
         return False
     if not isinstance(branch, dict):
-        return False  # legacy snapshot without a tag -> trust it
+        return False  # caller fail-closes claimed-but-unreadable tags
     ti = branch.get("turn_index")
     bi = branch.get("branch_id")
     if not isinstance(ti, int) or not isinstance(bi, int) or ti <= 0 or bi <= 0:
         return False
-    a_ti = getattr(agent, "_turn_index", None)
-    a_bi = getattr(agent, "_branch_id", None)
-    a_ppath = getattr(agent, "_parent_branch_path", None) or []
-    # An agent with no live selection (core code can set turn/branch to 0) has
-    # no branch to compare against — treat it as "no mismatch" and trust the
-    # snapshot rather than triggering an unnecessary replay.
-    if not isinstance(a_ti, int) or not isinstance(a_bi, int) or a_ti <= 0 or a_bi <= 0:
-        return False
+    if branch_view:
+        turns = sorted(branch_view)
+        a_ti = turns[-1]
+        a_bi = branch_view[a_ti]
+        a_ppath = [(turn, branch_view[turn]) for turn in turns if turn < a_ti]
+        # A compacted ancestor is on the saved path but not in the live view.
+        # Compare only turns the view still contains; dropping those ancestors
+        # is not a sibling mismatch and must not discard the snapshot.
+        viewed = set(branch_view)
+        snapshot_parent = [
+            pair
+            for pair in _safe_branch_path(branch.get("parent_branch_path"))
+            if pair[0] in viewed
+        ]
+        snapshot_path = snapshot_parent + [(ti, bi)]
+        agent_path = _safe_branch_path(a_ppath) + [(a_ti, a_bi)]
+        return not is_path_prefix(snapshot_path, agent_path)
+    else:
+        a_ti = getattr(agent, "_turn_index", None)
+        a_bi = getattr(agent, "_branch_id", None)
+        a_ppath = getattr(agent, "_parent_branch_path", None) or []
+        # An agent with no live selection (core code can set turn/branch to 0)
+        # has no branch to compare against — trust the snapshot.
+        if (
+            not isinstance(a_ti, int)
+            or not isinstance(a_bi, int)
+            or a_ti <= 0
+            or a_bi <= 0
+        ):
+            return False
     snapshot_path = _safe_branch_path(branch.get("parent_branch_path")) + [(ti, bi)]
     agent_path = _safe_branch_path(a_ppath) + [(a_ti, a_bi)]
     return not is_path_prefix(snapshot_path, agent_path)
@@ -209,12 +249,14 @@ def replayed_messages_for(
     store: Any,
     agent_name: str,
     events: list[dict] | None = None,
+    branch_view: dict[int, int] | None = None,
 ) -> list[dict]:
-    """Replay the latest live subtree from the event log (branch-aware).
+    """Replay the selected live subtree from the event log (branch-aware).
 
     Used by resume when the saved snapshot belongs to a different branch.
     ``events`` is the caller's shared raw read; without it the store is
-    read here.
+    read here. ``branch_view`` pins the replay to the resolved selection
+    instead of the latest compatible subtree.
     """
     if events is None:
         try:
@@ -223,6 +265,231 @@ def replayed_messages_for(
             return []
     if not events:
         return []
-    return replay_conversation(
-        normalize_resumable_events(events), include_metadata=True
-    )
+    return replay_resume_history(events, branch_view)
+
+
+def load_conversation_with_replay_fallback(
+    store: Any,
+    agent_name: str,
+    events: list[dict] | None = None,
+    branch_view: dict[int, int] | None = None,
+    *,
+    origins: dict | None = None,
+) -> list[dict] | None:
+    """Load the conversation snapshot and replay events when it is stale.
+
+    Post-snapshot events are appended when branch ancestry is unchanged; new
+    branch forks require a full replay to preserve coherent selection.
+    ``events`` (when given) is the caller's single raw read of the event
+    log, shared across the resume helpers so one scan serves them all;
+    without it the store is read here.
+
+    ``branch_view`` is the resolved selected map (sparse overrides already
+    expanded). It filters backfill, tail replay, and full replay so a
+    non-latest selection never loads the latest coordinates. ``None`` keeps
+    latest-compatible selection, including legacy snapshots that have no view.
+
+    A compacted snapshot is kept when its own turn metadata still lies on
+    the selected view, even if raw events for the compacted prefix are gone.
+    The view existing is not itself a reason to discard that snapshot.
+
+    Deliberately NO counter-based freshness shortcut: the persisted event
+    counter is NOT an upper bound of the event table. ``append_event``
+    flushes the events cache BEFORE ``persist_event_counter`` runs, and
+    that persist swallows failures (session/store.py), so the stored
+    counter can lag the table by any amount. A snapshot watermarked at a
+    lagging counter would then pass a ``cached_up_to >= counter`` check
+    while newer events exist, silently dropping the tail replay.
+    """
+    snapshot = store.load_conversation(agent_name)
+    if events is None:
+        events = store.get_events(agent_name)
+    if origins is not None and snapshot is not None:
+        return _load_validated_snapshot(
+            store, agent_name, snapshot, events, branch_view, origins
+        )
+    if not events:
+        return snapshot
+    last_event_id = 0
+    for evt in events:
+        eid = evt.get("event_id")
+        if isinstance(eid, int) and eid > last_event_id:
+            last_event_id = eid
+    try:
+        cached_up_to = store.state.get(f"{agent_name}:snapshot_event_id")
+    except (KeyError, TypeError):
+        cached_up_to = None
+    if snapshot is not None and isinstance(cached_up_to, int):
+        if cached_up_to >= last_event_id:
+            if snapshot_has_turn_metadata(snapshot):
+                return snapshot
+            logger.info(
+                "Legacy snapshot lacks turn metadata — backfill",
+                agent=agent_name,
+            )
+            return backfill_turn_metadata(snapshot, events, branch_view)
+        # Compaction exists only in the snapshot, so replay just its normalized tail.
+        tail = [
+            evt
+            for evt in events
+            if isinstance(evt.get("event_id"), int) and evt["event_id"] > cached_up_to
+        ]
+        # A new post-snapshot branch can supersede earlier turns; appending it
+        # to the snapshot would retain incompatible history. With a resolved
+        # view, "fork" means the tail (or the snapshot's own coordinates)
+        # leaves that view — not merely "some branch id > 1 exists", which is
+        # exactly the non-latest selection this resume must keep.
+        if branch_view is not None:
+            tail_has_forks = _selection_leaves_view(snapshot, tail, branch_view)
+        else:
+            pre_pairs = {
+                (evt.get("turn_index"), evt.get("branch_id"))
+                for evt in events
+                if isinstance(evt.get("event_id"), int)
+                and evt["event_id"] <= cached_up_to
+            }
+            tail_has_forks = any(
+                isinstance(evt.get("branch_id"), int)
+                and evt["branch_id"] > 1
+                and (evt.get("turn_index"), evt["branch_id"]) not in pre_pairs
+                for evt in tail
+            )
+        if not tail_has_forks:
+            appended = replay_resume_history(tail, branch_view)
+            # A legacy snapshot portion must be backfilled too, otherwise the
+            # resumed conversation becomes a mix of metadata-less (snapshot)
+            # and metadata-bearing (tail) user messages. Backfill uses only
+            # events up to the snapshot watermark so the tail's user turns do
+            # not shift the mapping.
+            base = snapshot
+            if not snapshot_has_turn_metadata(snapshot):
+                pre_events = [
+                    evt
+                    for evt in events
+                    if isinstance(evt.get("event_id"), int)
+                    and evt["event_id"] <= cached_up_to
+                ]
+                base = backfill_turn_metadata(snapshot, pre_events, branch_view)
+            logger.info(
+                "Resume appended post-snapshot tail",
+                agent=agent_name,
+                snapshot_event_id=cached_up_to,
+                last_event_id=last_event_id,
+                appended=len(appended),
+            )
+            return list(base) + appended
+        logger.info(
+            "Post-snapshot tail contains branch forks — full replay",
+            agent=agent_name,
+            snapshot_event_id=cached_up_to,
+        )
+    if snapshot is not None and cached_up_to is None:
+        if snapshot_has_turn_metadata(snapshot):
+            return snapshot
+        logger.info(
+            "Legacy snapshot lacks turn metadata — backfill",
+            agent=agent_name,
+        )
+        return backfill_turn_metadata(snapshot, events, branch_view)
+    replayed = replay_resume_history(events, branch_view)
+    if replayed:
+        logger.info(
+            "Resume rebuilt conversation via replay",
+            agent=agent_name,
+            snapshot_event_id=cached_up_to,
+            last_event_id=last_event_id,
+            messages=len(replayed),
+        )
+        return replayed
+    return snapshot
+
+
+def _load_validated_snapshot(store, name, snapshot, events, view, origins):
+    watermark = store.state.get(f"{name}:snapshot_event_id")
+    selected_ids = select_live_event_ids(events, branch_view=view)
+    selected = [
+        event
+        for event in events
+        if not isinstance(event.get("event_id"), int)
+        or event["event_id"] in selected_ids
+    ]
+    tail = [
+        event
+        for event in selected
+        if type(watermark) is int
+        and type(event.get("event_id")) is int
+        and event["event_id"] > watermark
+    ]
+    if view is not None:
+        leaves_view = _selection_leaves_view(snapshot, tail, view)
+    else:
+        prior = {
+            (event.get("turn_index"), event.get("branch_id"))
+            for event in selected
+            if type(watermark) is int
+            and type(event.get("event_id")) is int
+            and event["event_id"] <= watermark
+        }
+        leaves_view = any(
+            type(event.get("branch_id")) is int
+            and event["branch_id"] > 1
+            and (event.get("turn_index"), event["branch_id"]) not in prior
+            for event in tail
+        )
+    if leaves_view:
+        return replay_resume_history(events, view)
+    validate_resume_snapshot(snapshot, origins)
+    base, consumed = reconcile_snapshot(snapshot, selected, watermark)
+    if not snapshot_has_turn_metadata(base):
+        prior_events = [
+            event
+            for event in selected
+            if watermark is None
+            or type(event.get("event_id")) is int
+            and event["event_id"] <= watermark
+        ]
+        base = backfill_turn_metadata(base, prior_events, view)
+    remaining = [event for event in tail if event.get("event_id") not in consumed]
+    if remaining:
+        base = list(base) + replay_resume_history(remaining, view)
+    validate_resume_snapshot(base, origins)
+    return base
+
+
+def _selection_leaves_view(
+    snapshot: list[dict],
+    tail: list[dict],
+    branch_view: dict[int, int],
+) -> bool:
+    """Whether snapshot or tail coordinates leave the resolved selection.
+
+    A snapshot turn absent from the view (compacted prefix whose raw events
+    are gone) is not a fork. A snapshot turn the view selects differently,
+    or a tail event on another branch of a viewed turn, is.
+    """
+    for message in snapshot:
+        if not isinstance(message, dict):
+            continue
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict) or metadata.get("kind") == TOOL_FEEDBACK_KIND:
+            continue
+        turn = metadata.get("turn_index")
+        branch = metadata.get("branch_id")
+        if not isinstance(turn, int) or not isinstance(branch, int):
+            continue
+        selected = branch_view.get(turn)
+        if selected is not None and selected != branch:
+            return True
+    for event in tail:
+        turn = event.get("turn_index")
+        branch = event.get("branch_id")
+        if not isinstance(turn, int) or not isinstance(branch, int):
+            continue
+        selected = branch_view.get(turn)
+        if selected is not None and selected != branch:
+            return True
+        if selected is None and branch > 1:
+            # A brand-new turn after the selected tip is a continuation
+            # (branch 1). A sibling (>1) of an unviewed turn is a fork.
+            return True
+    return False

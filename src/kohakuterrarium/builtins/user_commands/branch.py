@@ -1,6 +1,7 @@
 """List or switch the live response branch within the current session."""
 
 from kohakuterrarium.builtins.user_commands.registry import register_user_command
+from kohakuterrarium.core.branch_selection import select_branch
 from kohakuterrarium.modules.user_command.base import (
     BaseUserCommand,
     CommandLayer,
@@ -10,8 +11,6 @@ from kohakuterrarium.modules.user_command.base import (
 from kohakuterrarium.session.history import (
     collect_branch_metadata,
     collect_user_groups,
-    dedupe_adjacent_duplicate_events,
-    replay_conversation,
 )
 from kohakuterrarium.utils.logging import get_logger
 
@@ -67,9 +66,9 @@ class BranchCommand(BaseUserCommand):
         agent = context.agent
         if not agent or agent.session_store is None:
             return UserCommandResult(error="No agent / session store in context.")
-        events = dedupe_adjacent_duplicate_events(
-            agent.session_store.get_events(agent.config.name)
-        )
+        store = agent.session_store
+        namespace = agent.config.name
+        events = await store.run(store.get_events, namespace)
         meta = collect_branch_metadata(events)
         user_groups = collect_user_groups(events)
 
@@ -78,14 +77,9 @@ class BranchCommand(BaseUserCommand):
             return UserCommandResult(output=_format_listing(meta, user_groups))
 
         if tokens[0] == "latest":
-            # An empty branch view makes replay select each turn's latest branch.
-            agent._branch_view = {}
-            replayed = replay_conversation(events, include_metadata=True)
-            agent.controller.conversation = _rebuild_conv(
-                replayed, agent.controller.conversation.__class__
-            )
+            count = await select_branch(agent, None)
             return UserCommandResult(
-                output=f"Switched every turn back to its latest branch ({len(replayed)} messages)."
+                output=f"Switched every turn back to its latest branch ({count} messages)."
             )
 
         if len(tokens) < 2:
@@ -109,20 +103,13 @@ class BranchCommand(BaseUserCommand):
                 )
             )
 
-        # The persisted view and rebuilt conversation must agree so subsequent
-        # turns use the selected history.
         view = dict(getattr(agent, "_branch_view", {}) or {})
         view[turn_index] = branch_id
-        agent._branch_view = view
-
-        replayed = replay_conversation(events, branch_view=view, include_metadata=True)
-        agent.controller.conversation = _rebuild_conv(
-            replayed, agent.controller.conversation.__class__
-        )
+        count = await select_branch(agent, view)
         return UserCommandResult(
             output=(
                 f"Switched turn {turn_index} → branch {branch_id} "
-                f"({len(replayed)} messages live)."
+                f"({count} messages live)."
             )
         )
 

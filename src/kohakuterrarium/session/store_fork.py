@@ -394,7 +394,9 @@ def perform_fork(
         # Snapshot markers and conversation caches may include post-fork events,
         # so the child must rebuild conversation state from its truncated log.
         state_keys = [
-            k for k in _iter_keys(source.state) if not k.endswith(":snapshot_event_id")
+            k
+            for k in _iter_keys(source.state)
+            if not k.endswith((":snapshot_event_id", ":snapshot_branch"))
         ]
         _copy_table(source.state, dest.state, keys=state_keys)
         _copy_table(source.channels, dest.channels)

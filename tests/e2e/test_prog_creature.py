@@ -21,6 +21,7 @@ over a deterministic embedder — is the production collaborator.
 """
 
 import asyncio
+import hashlib
 
 import numpy as np
 import pytest
@@ -55,12 +56,7 @@ pytestmark = pytest.mark.timeout(60)
 
 
 class _HashEmbedder(BaseEmbedder):
-    """Deterministic hashed bag-of-words embedder.
-
-    Identical text maps to an identical vector, so an exact-phrase
-    semantic query is its own nearest neighbour — the memory-search
-    milestone can assert an EXACT hit.
-    """
+    """Stable hashed bag-of-words vectors for the memory-search journey."""
 
     dimensions = 64
 
@@ -68,7 +64,8 @@ class _HashEmbedder(BaseEmbedder):
         out = np.zeros((len(texts), self.dimensions), dtype=np.float32)
         for row, text in enumerate(texts):
             for token in text.lower().split():
-                out[row, hash(token) % self.dimensions] += 1.0
+                digest = hashlib.sha256(token.encode("utf-8")).digest()
+                out[row, int.from_bytes(digest[:8], "big") % self.dimensions] += 1.0
             norm = float(np.linalg.norm(out[row]))
             if norm > 0:
                 out[row] /= norm
@@ -687,7 +684,10 @@ class TestProgCreatureJourney:
 
         # Semantic search over the deterministic embedder: the exact
         # phrase embeds to the exact stored vector → top hit is itself.
-        sem_memory = SessionMemory(str(session_path), embedder=_HashEmbedder())
+        embedder = _HashEmbedder()
+        phrase_vectors = embedder.encode(recorded_user_turns)
+        assert not np.array_equal(phrase_vectors[0], phrase_vectors[1])
+        sem_memory = SessionMemory(str(session_path), embedder=embedder)
         sem_memory.index_events("pilot", events)
         assert sem_memory.has_vectors
         sem_hits = sem_memory.search("first recorded question", mode="semantic", k=5)

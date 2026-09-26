@@ -3,12 +3,22 @@
 from typing import Any, Protocol
 
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.runtime_context_replacement_prepare import (
+    _validate_complete_tool_pairs,
+    _validate_selected_tool_events,
+)
+from kohakuterrarium.core.selected_subagent_history import (
+    project_selected_subagents,
+    restore_text_subagent_feedback,
+)
 from kohakuterrarium.llm.message import dicts_to_messages
 from kohakuterrarium.session.history import (
     compact_path_from_event,
     normalize_tool_call_events,
     replay_conversation,
 )
+from kohakuterrarium.session.history_feedback import canonicalize_provider_tool_order
+from kohakuterrarium.session.history_support import compact_replay_events
 from kohakuterrarium.session.raw_history import (
     UserMessageSelector,
     select_raw_history_prefix,
@@ -46,6 +56,7 @@ def reload_raw_prefix_for_target(
     target: UserMessageSelector,
     *,
     branch_view: dict[int, int] | None = None,
+    strict_pairs: bool = False,
 ) -> None:
     """Reseat one agent on the branch prefix ending at target.
 
@@ -115,12 +126,28 @@ def reload_raw_prefix_for_target(
     # restore stream order so replay sees a monotonic event stream (its
     # pending-summary flush/drop logic assumes one).
     raw_events.sort(key=lambda evt: evt.get("event_id", 0))
+    text_subagents = {}
+    if strict_pairs:
+        raw_events, text_subagents = project_selected_subagents(raw_events)
+    normalized = normalize_tool_call_events(raw_events)
+    if strict_pairs:
+        normalized = canonicalize_provider_tool_order(normalized)
+        _validate_selected_tool_events(normalized)
+        visible = compact_replay_events(
+            raw_events, covering_compacts, prefix.branch_view
+        )
+        normalized = canonicalize_provider_tool_order(
+            normalize_tool_call_events(visible)
+        )
     messages = replay_conversation(
-        normalize_tool_call_events(raw_events),
+        normalized,
         branch_view=prefix.branch_view,
         include_metadata=True,
     )
+    messages = restore_text_subagent_feedback(messages, text_subagents)
     persisted_messages = dicts_to_messages(messages)
+    if strict_pairs:
+        _validate_complete_tool_pairs(persisted_messages)
     for raw_message, message in zip(messages, persisted_messages):
         metadata = raw_message.get("metadata")
         if isinstance(metadata, dict):

@@ -11,6 +11,7 @@ import asyncio
 from concurrent.futures import Future
 from typing import Any, Callable
 
+from kohakuterrarium.core.compact_branch import snapshot_branch_view
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.session.history import replay_conversation
@@ -25,6 +26,7 @@ from kohakuterrarium.session.output_generation import (
     begin_generation,
     stamp_generation,
 )
+from kohakuterrarium.session.output_snapshot import capture_turn_snapshot
 from kohakuterrarium.session.text_buffer import (
     OpenTextSegment,
     last_persisted_turn_branch,
@@ -105,7 +107,11 @@ class SessionOutput(SessionActivityMixin, OutputModule):
             return None
         return [tuple(p) for p in path]
 
-    def _record(self, event_type: str, data: dict) -> None:
+    def _current_branch_view(self) -> dict[int, int] | None:
+        """Project the current selection for a conversation snapshot."""
+        return snapshot_branch_view(self._agent)
+
+    def _record(self, event_type: str, data: dict) -> Future:
         """Record a non-text event, closing the open text segment first.
 
         A routed non-text event defines a segment boundary, so buffered text
@@ -113,7 +119,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         """
         self._recover_open_text()
         self._flush_text_segment()
-        self._append_event(event_type, data)
+        return self._append_event(event_type, data)
 
     def _append_event(self, event_type: str, data: dict) -> Future:
         """Append one event under this sink's configured namespace."""
@@ -316,40 +322,13 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         # the snapshot watermark below cannot run ahead of the log.
         await self.drain()
 
-        # Agent-side inputs are read here; the store writes and the
-        # fallback event scan run on the store's affinity thread (inline
-        # for duck-typed stores without submit).
-        messages: list | None = None
-        branch_tag: dict | None = None
-        state_kwargs: dict = {}
         try:
-            if self._agent and hasattr(self._agent, "controller"):
-                messages = self._agent.controller.conversation.snapshot_messages()
-            agent = self._agent
-            turn_index = getattr(agent, "_turn_index", None) if agent else None
-            branch_id = getattr(agent, "_branch_id", None) if agent else None
-            if (
-                isinstance(turn_index, int)
-                and turn_index > 0
-                and isinstance(branch_id, int)
-                and branch_id > 0
-            ):
-                # Tag the snapshot with the agent's branch so resume can
-                # reject it when the target branch differs and rebuild via
-                # replay instead.
-                branch_tag = {
-                    "turn_index": turn_index,
-                    "branch_id": branch_id,
-                    "parent_branch_path": getattr(agent, "_parent_branch_path", None),
-                }
-            if agent and hasattr(agent, "session") and agent.session:
-                pad = agent.session.scratchpad
-                if hasattr(pad, "to_dict"):
-                    state_kwargs["scratchpad"] = pad.to_dict()
+            messages, branch_tag, state_kwargs = await capture_turn_snapshot(
+                self._agent
+            )
         except Exception as e:
-            # A controller-read failure must not abort persistence; the
-            # dispatched unit rebuilds the conversation via event replay.
             logger.warning("Conversation snapshot failed", error=str(e))
+            messages, branch_tag, state_kwargs = None, None, {}
 
         persist = getattr(self._store, "run", None)
         if callable(persist):
@@ -430,6 +409,23 @@ class SessionOutput(SessionActivityMixin, OutputModule):
             logger.warning(
                 "Events flush at turn end failed", error=str(e), exc_info=True
             )
+
+    def record_terminal_activity(self, activity_type: str, detail: str, metadata: dict):
+        """Return the canonical terminal append receipt, not a flush acknowledgement."""
+        if activity_type not in (
+            "tool_done",
+            "tool_error",
+            "subagent_done",
+            "subagent_error",
+        ):
+            raise ValueError("A terminal activity is required")
+        if not self._capture_activity:
+            return None
+        name, info = _parse_detail(detail)
+        receipt = self._record_activity(activity_type, name, info, metadata)
+        if not isinstance(receipt, Future):
+            raise RuntimeError("Terminal persistence did not return a receipt")
+        return receipt
 
     def on_activity(self, activity_type: str, detail: str) -> None:
         if not self._capture_activity:

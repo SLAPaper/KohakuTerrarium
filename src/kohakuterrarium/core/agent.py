@@ -19,6 +19,11 @@ from kohakuterrarium.core.model_switch_guard import require_model_mutation_avail
 from kohakuterrarium.core.agent_turn import AgentTurnMixin
 from kohakuterrarium.core.agent_handlers import AgentHandlersMixin
 from kohakuterrarium.core.agent_lifecycle import AgentLifecycleMixin
+from kohakuterrarium.core.agent_state import (
+    run_session_state,
+    start_agent,
+    submit_session_state,
+)
 from kohakuterrarium.core.agent_messages import AgentMessagesMixin
 from kohakuterrarium.core.agent_mcp import init_mcp, inject_mcp_tools_into_prompt
 from kohakuterrarium.core.agent_model import AgentModelMixin
@@ -131,6 +136,7 @@ class Agent(
         self.config = config
         self._strict = strict
         self._running = False
+        self._session_state_owner = None
         # Warm-pause admission gate (UXI-11): when True, new turns are
         # buffered instead of run; the runtime stays live.
         self._paused = False
@@ -257,6 +263,10 @@ class Agent(
         sync_emergency_drop_conversation(self, messages)
 
     async def start(self) -> None:
+        """Start the session-state owner, then existing modules."""
+        await start_agent(self)
+
+    async def _start_modules(self) -> None:
         """Start all agent modules."""
         logger.info("Starting agent", agent_name=self.config.name)
 
@@ -957,6 +967,12 @@ class Agent(
             "message_count": len(self.conversation_history),
             "pending_jobs": self.executor.get_pending_count() if self.executor else 0,
         }
+
+    def _run_session_state(self, callback):
+        return run_session_state(self, callback)
+
+    async def _submit_session_state(self, callback):
+        return await submit_session_state(self, callback)
 
     def session_info(self, tokens_view: str = "own") -> dict[str, Any]:
         """Build a session snapshot with the requested token accounting view."""

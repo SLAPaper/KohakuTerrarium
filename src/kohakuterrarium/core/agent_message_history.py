@@ -8,6 +8,7 @@ from kohakuterrarium.core.conversation_elide import (
     estimate_tokens,
 )
 from kohakuterrarium.core.message_locator import (
+    is_turn_user_message,
     user_message_indices_for_content,
     user_message_indices_for_turn,
 )
@@ -67,7 +68,7 @@ def resolve_edit_message_index(
             return None
         seen = -1
         for idx, msg in enumerate(msgs):
-            if msg.role != "user":
+            if not is_turn_user_message(msg):
                 continue
             seen += 1
             if seen == user_position:

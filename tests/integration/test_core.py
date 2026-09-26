@@ -25,6 +25,7 @@ side effect (conversation contents, tool output text, engine state).
 
 import asyncio
 import re
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -636,6 +637,23 @@ class TestCoreIntegration:
             # call would be scheduled right here by the second completion.
             await asyncio.sleep(0.3)
             assert agent.llm.call_count == 4
+            bg_status = next(
+                status
+                for status in agent.executor.job_store.get_completed_jobs()
+                if status.type_name == "slowbg"
+            )
+            before_duplicate = agent.controller.conversation.to_json()
+            replayed = create_tool_complete_event(
+                job_id=bg_status.job_id,
+                content="DUPLICATE RESULT",
+                **agent.executor.job_store.completion_context(bg_status.job_id),
+            )
+            assert await agent._process_event(replayed) is False
+            agent._on_bg_complete(replayed)
+            agent._on_bg_complete(deepcopy(replayed))
+            await agent.output_router.flush()
+            assert agent.llm.call_count == 4
+            assert agent.controller.conversation.to_json() == before_duplicate
 
             # Re-bind a fresh scripted LLM for the remaining turns so the
             # ``match``-keyed entries below resolve order-independently.
@@ -715,8 +733,6 @@ class TestCoreIntegration:
             assert agent.get_system_prompt() == "Replaced entirely."
 
             # --- session_info snapshot ----------------------------------
-            # No session store attached → the ``own`` view is an empty
-            # token dict, the ``all_loops`` view an empty list.
             info = agent.session_info()
             assert info["agent"] == "solo"
             assert info["tokens"] == {}
@@ -934,6 +950,73 @@ class TestCoreIntegration:
                     and event.metadata.get("job_id") == completion["job_id"]
                 )
                 assert start.metadata["background"] is (mode == "background")
+                assert completion["origin"] == start.metadata["origin"]
+                assert completion["execution_class"] == (
+                    "background" if mode == "background" else "direct"
+                )
+                assert completion["origin"]["delivery_id"].endswith(
+                    ":" + completion["job_id"]
+                )
+                if mode == "background":
+                    before_duplicate = agent.controller.conversation.to_json()
+                    duplicate = create_tool_complete_event(
+                        job_id=completion["job_id"],
+                        content="duplicate must not replace image",
+                        **agent.executor.job_store.completion_context(
+                            completion["job_id"]
+                        ),
+                    )
+                    agent._on_bg_complete(duplicate)
+                    agent._on_bg_complete(deepcopy(duplicate))
+                    await agent.output_router.flush()
+                    raw = await agent.session_store.run(
+                        agent.session_store.get_events, agent.config.name
+                    )
+                    terminals = [
+                        e
+                        for e in raw
+                        if e["type"] == "tool_result"
+                        and e.get("job_id") == completion["job_id"]
+                    ]
+                    assert (
+                        len(terminals) == 1
+                        and terminals[0]["canvas_preview"] == expected
+                    )
+                    assert agent.controller.conversation.to_json() == before_duplicate
+                    assert canvas_llm.call_count == 2
+
+            stop_entered = asyncio.Event()
+
+            class StopBackground(BaseTool):
+                tool_name = "stopbackground"
+                description = "Wait for shutdown"
+                execution_mode = ExecutionMode.BACKGROUND
+
+                async def _execute(self, args, **kwargs):
+                    stop_entered.set()
+                    await asyncio.Event().wait()
+
+            agent.add_tool(StopBackground())
+            stop_llm = ScriptedLLM(["[/stopbackground][stopbackground/]"])
+            agent.llm = agent.controller.llm = stop_llm
+            await _drain_chat(creature, "stop with running background work")
+            await asyncio.wait_for(stop_entered.wait(), 3)
+            await agent.stop()
+            raw = await agent.session_store.run(
+                agent.session_store.get_events, agent.config.name
+            )
+            stopped_results = [
+                event
+                for event in raw
+                if event["type"] == "tool_result" and event["name"] == "stopbackground"
+            ]
+            assert len(stopped_results) == 1
+            assert stopped_results[0]["interrupted"] is True
+            assert (
+                stopped_results[0]["origin"]["delivery_id"]
+                in agent._background_terminals
+            )
+            assert stop_llm.call_count == 1
 
         # Engine __aexit__ stopped the creature.
         assert creature.is_running is False
@@ -946,6 +1029,11 @@ class TestCoreIntegration:
             assert [
                 event["canvas_preview"] for event in canvas_results
             ] == expected_previews
+            for event in canvas_results:
+                assert event["turn_index"] == event["origin"]["turn_index"]
+                assert event["branch_id"] == event["origin"]["branch_id"]
+                assert event["execution_class"] == event["origin"]["execution_class"]
+                assert event["job_id"] == event["call_id"]
 
         # --- A separate EPHEMERAL creature: conversation resets per turn.
         # ``ephemeral=True`` flips ``ControllerConfig.ephemeral`` so the
@@ -980,7 +1068,7 @@ class TestCoreIntegration:
             assert roles_after_2 == ["system"]
         assert eph_creature.is_running is False
 
-    async def test_subagent_dispatch_and_result_routing(self, make_creature):
+    async def test_subagent_dispatch_and_result_routing(self, make_creature, tmp_path):
         """Controller dispatches a registered sub-agent; the sub-agent
         runs its own LLM loop; its result routes back into the parent
         conversation and drives a follow-up turn.
@@ -993,17 +1081,23 @@ class TestCoreIntegration:
             script=[
                 # Parent round 1: delegate to the explore sub-agent.
                 ScriptEntry(
-                    "[/explore]survey the repo[explore/]",
+                    "[/explore]@@run_in_background=false\nsurvey the repo[explore/]",
                     match="investigate",
                 ),
                 # Parent round 2: sub-agent result fed back, summarise.
                 ScriptEntry("summary: exploration complete", match="explored:done"),
                 # Turn 2: delegate to a SECOND sub-agent (multi-turn).
-                ScriptEntry("[/planner]draft a plan[planner/]", match="now plan"),
+                ScriptEntry(
+                    "[/planner]@@run_in_background=false\ndraft a plan[planner/]",
+                    match="now plan",
+                ),
                 ScriptEntry("summary: plan received", match="planned:ready"),
                 # Turn 3: a gate plugin rewrites the explore task — the
                 # spawned sub-agent's task carries the "[gated]" suffix.
-                ScriptEntry("[/explore]check again[explore/]", match="gated rerun"),
+                ScriptEntry(
+                    "[/explore]@@run_in_background=false\ncheck again[explore/]",
+                    match="gated rerun",
+                ),
                 ScriptEntry("summary: gated run complete", match="explored:gated"),
                 # Turn 4: dispatch the FORBIDDEN sub-agent — the gate
                 # plugin vetoes it; the synthesised block result is
@@ -1042,7 +1136,7 @@ class TestCoreIntegration:
         # " [gated]" to every task — the explore sub-agent's third spawn
         # receives a task ending in "[gated]", so its scripted reply is
         # keyed on that exact substring.
-        agent.subagent_manager.llm = ScriptedLLM(
+        child_llm = ScriptedLLM(
             [
                 "explored:done",
                 "planned:ready",
@@ -1050,8 +1144,9 @@ class TestCoreIntegration:
             ]
         )
 
-        async with Terrarium() as engine:
+        async with Terrarium(session_dir=tmp_path / "child-sessions") as engine:
             await engine.add_creature(creature)
+            agent.subagent_manager.llm = child_llm
             # Both registered sub-agents are visible on the property.
             assert set(agent.subagents) == {"explore", "planner"}
 
@@ -1100,6 +1195,45 @@ class TestCoreIntegration:
             )
             assert "explored:gated ok" in convo_text3
             assert agent.llm.call_count == 6
+            await agent.output_router.flush()
+            persisted = await agent.session_store.run(
+                agent.session_store.get_events, agent.config.name
+            )
+            dispatches = {
+                e["job_id"]: e for e in persisted if e["type"] == "subagent_call"
+            }
+            terminals = [e for e in persisted if e["type"] == "subagent_result"]
+            assert len(terminals) == len(dispatches) == 3
+            for terminal in terminals:
+                dispatch = dispatches[terminal["job_id"]]
+                assert terminal["origin"] == dispatch["origin"]
+                assert terminal["turn_index"] == dispatch["turn_index"]
+                assert terminal["execution_class"] == "direct"
+            await agent.select_branch(None)
+            selected_text = agent.controller.conversation.to_json()
+            for expected in ("explored:done", "planned:ready", "explored:gated ok"):
+                assert expected in selected_text
+            assert not any(
+                m.tool_calls or m.role == "tool"
+                for m in agent.controller.conversation.get_messages()
+            )
+            assert agent.llm.call_count == 6
+            previous_llm = agent.llm
+            edit_llm = ScriptedLLM(["edited third turn"])
+            agent.llm = agent.controller.llm = edit_llm
+            assert await agent.edit_and_rerun(
+                -1,
+                "edited third question",
+                turn_index=3,
+                branch_view={1: 1, 2: 1, 3: 1},
+            )
+            retained = agent.controller.conversation.to_json()
+            assert "explored:done" in retained and "planned:ready" in retained
+            assert "explored:gated ok" not in retained
+            assert "edited third turn" in retained
+            assert (agent._turn_index, agent._branch_id) == (3, 2)
+            assert edit_llm.call_count == 1
+            agent.llm = agent.controller.llm = previous_llm
 
             # --- Turn 4: pre_subagent_run VETOES a forbidden delegate --
             # The gate plugin raises PluginBlockError for "planner";
@@ -1418,7 +1552,7 @@ class TestCoreIntegration:
             )
             assert "background-kaboom" in (bgboom_result.error or "")
 
-    async def test_history_ops(self, make_creature, tmp_path):
+    async def test_history_ops(self, make_creature, tmp_path, monkeypatch):
         """One workflow over the three history operations: run a turn,
         ``regenerate_last_response`` opens a new branch, ``edit_and_rerun``
         replaces the user message and re-runs, ``rewind_to`` drops the
@@ -1684,7 +1818,24 @@ class TestCoreIntegration:
                 )
                 service = LocalTerrariumService(engine)
                 agent = creature.agent
-                assert (await creature.run("seed", timeout=5)).ok
+                native_writers = []
+                append = type(agent.controller.conversation).append
+
+                def observe_append(conversation, role, content, **kwargs):
+                    if conversation is agent.controller.conversation and role == "tool":
+                        native_writers.append(asyncio.current_task())
+                    return append(conversation, role, content, **kwargs)
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(
+                        type(agent.controller.conversation), "append", observe_append
+                    )
+                    assert (await creature.run("seed", timeout=5)).ok
+                if mode == "native":
+                    assert native_writers and all(
+                        task is agent._session_state_owner.task
+                        for task in native_writers
+                    )
                 assert agent.scratchpad.get("history") == "preserved"
                 pending = asyncio.create_task(
                     creature.run("original", timeout=5, raise_on_error=False)

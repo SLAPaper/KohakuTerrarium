@@ -495,6 +495,7 @@ class AgentInitMixin:
             executor=self.executor,
             registry=self.registry,
         )
+        controller._state_host = self
         if hasattr(self, "output_router"):
             controller.output_router = self.output_router
         if getattr(self, "plugins", None):

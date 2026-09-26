@@ -10,6 +10,7 @@ session records, while background completions share a delivery banner.
 import asyncio
 from typing import Any
 
+from kohakuterrarium.core.background_admission import admit_background_run
 from kohakuterrarium.core.controller import Controller
 from kohakuterrarium.core.controller_context import format_events_for_context
 from kohakuterrarium.core.events import TriggerEvent
@@ -108,7 +109,7 @@ class AgentMidTurnMixin:
 
     async def _drain_mid_turn_pending_inputs(self, controller: Controller) -> int:
         """Claim every queued event into the active controller turn."""
-        claimed = self._event_inbox.drain_all()
+        claimed = await admit_background_run(self, self._event_inbox.drain_all())
         if not claimed:
             return 0
 

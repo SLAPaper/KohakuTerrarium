@@ -98,9 +98,11 @@ def load_plugin_selection(
     return [p for p in parsed if isinstance(p, str)], True
 
 
-def restore_selections(agent: Any, store: Any | None = None) -> None:
+def restore_selections(
+    agent: Any, store: Any | None = None, *, restore_model: bool = True
+) -> None:
     """Restore committed model intent strictly and legacy caches best-effort."""
-    selector = load_model_selection(agent, store)
+    selector = load_model_selection(agent, store) if restore_model else None
     if selector:
         switch = getattr(agent, "switch_model", None)
         if callable(switch):

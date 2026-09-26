@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from kohakuterrarium.builtins.inputs import create_builtin_input
@@ -13,16 +14,13 @@ from kohakuterrarium.core.conversation_elide import (
     elide_stale_tool_results,
     estimate_tokens,
 )
-from kohakuterrarium.errors import SessionError, SessionNotResumableError
+from kohakuterrarium.errors import ConflictError, SessionError, SessionNotResumableError
 from kohakuterrarium.modules.input.base import InputModule
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.packages.resolve import resolve_any_path
 from kohakuterrarium.session.history import (
     dedupe_adjacent_duplicate_events,
-    index_parent_paths,
     normalize_resumable_events,
-    replay_conversation,
-    resolve_selected_branches,
 )
 from kohakuterrarium.session.resume_open import (
     # Re-exported for callers that still import it from this module.
@@ -31,10 +29,17 @@ from kohakuterrarium.session.resume_open import (
     preflight_legacy_workspace,
 )
 from kohakuterrarium.session.resume_branch import (
-    backfill_turn_metadata,
+    load_conversation_with_replay_fallback as _load_conversation_with_replay_fallback,
     replayed_messages_for,
-    snapshot_has_turn_metadata,
     snapshot_mismatches_branch,
+)
+from kohakuterrarium.session.resume_admission import validate_resume_snapshot
+from kohakuterrarium.session.resume_provider import prepare_resume_provider
+from kohakuterrarium.session.resume_selection import (
+    apply_branch_coordinates,
+    latest_selected_branches,
+    resolve_resume_branch_view,
+    validate_selected_raw_events,
 )
 from kohakuterrarium.session.resume_build import (
     build_conversation as _build_conversation,
@@ -75,137 +80,31 @@ def _create_io_modules(
             )
 
 
-def _load_conversation_with_replay_fallback(
-    store: SessionStore,
-    agent_name: str,
-    events: list[dict] | None = None,
-) -> list[dict] | None:
-    """Load the conversation snapshot and replay events when it is stale.
-
-    Post-snapshot events are appended when branch ancestry is unchanged; new
-    branch forks require a full replay to preserve coherent selection.
-    ``events`` (when given) is the caller's single raw read of the event
-    log, shared across the resume helpers so one scan serves them all;
-    without it the store is read here.
-
-    Deliberately NO counter-based freshness shortcut: the persisted event
-    counter is NOT an upper bound of the event table. ``append_event``
-    flushes the events cache BEFORE ``persist_event_counter`` runs, and
-    that persist swallows failures (session/store.py), so the stored
-    counter can lag the table by any amount. A snapshot watermarked at a
-    lagging counter would then pass a ``cached_up_to >= counter`` check
-    while newer events exist, silently dropping the tail replay.
-    """
-    snapshot = store.load_conversation(agent_name)
-    if events is None:
-        events = store.get_events(agent_name)
-    if not events:
-        return snapshot
-    last_event_id = 0
-    for evt in events:
-        eid = evt.get("event_id")
-        if isinstance(eid, int) and eid > last_event_id:
-            last_event_id = eid
-    try:
-        cached_up_to = store.state.get(f"{agent_name}:snapshot_event_id")
-    except (KeyError, TypeError):
-        cached_up_to = None
-    if snapshot is not None and isinstance(cached_up_to, int):
-        if cached_up_to >= last_event_id:
-            if snapshot_has_turn_metadata(snapshot):
-                return snapshot
-            logger.info(
-                "Legacy snapshot lacks turn metadata — backfill",
-                agent=agent_name,
-            )
-            return backfill_turn_metadata(snapshot, events)
-        # Compaction exists only in the snapshot, so replay just its normalized tail.
-        tail = [
-            evt
-            for evt in events
-            if isinstance(evt.get("event_id"), int) and evt["event_id"] > cached_up_to
-        ]
-        # A new post-snapshot branch can supersede earlier turns; appending it to
-        # the snapshot would retain incompatible history.
-        pre_pairs = {
-            (evt.get("turn_index"), evt.get("branch_id"))
-            for evt in events
-            if isinstance(evt.get("event_id"), int) and evt["event_id"] <= cached_up_to
-        }
-        tail_has_forks = any(
-            isinstance(evt.get("branch_id"), int)
-            and evt["branch_id"] > 1
-            and (evt.get("turn_index"), evt["branch_id"]) not in pre_pairs
-            for evt in tail
-        )
-        if not tail_has_forks:
-            appended = replay_conversation(
-                normalize_resumable_events(tail), include_metadata=True
-            )
-            # A legacy snapshot portion must be backfilled too, otherwise the
-            # resumed conversation becomes a mix of metadata-less (snapshot)
-            # and metadata-bearing (tail) user messages. Backfill uses only
-            # events up to the snapshot watermark so the tail's user turns do
-            # not shift the mapping.
-            base = snapshot
-            if not snapshot_has_turn_metadata(snapshot):
-                pre_events = [
-                    evt
-                    for evt in events
-                    if isinstance(evt.get("event_id"), int)
-                    and evt["event_id"] <= cached_up_to
-                ]
-                base = backfill_turn_metadata(snapshot, pre_events)
-            logger.info(
-                "Resume appended post-snapshot tail",
-                agent=agent_name,
-                snapshot_event_id=cached_up_to,
-                last_event_id=last_event_id,
-                appended=len(appended),
-            )
-            return list(base) + appended
-        logger.info(
-            "Post-snapshot tail contains branch forks — full replay",
-            agent=agent_name,
-            snapshot_event_id=cached_up_to,
-        )
-    if snapshot is not None and cached_up_to is None:
-        if snapshot_has_turn_metadata(snapshot):
-            return snapshot
-        logger.info(
-            "Legacy snapshot lacks turn metadata — backfill",
-            agent=agent_name,
-        )
-        return backfill_turn_metadata(snapshot, events)
-    replayed = replay_conversation(
-        normalize_resumable_events(events), include_metadata=True
-    )
-    if replayed:
-        logger.info(
-            "Resume rebuilt conversation via replay",
-            agent=agent_name,
-            snapshot_event_id=cached_up_to,
-            last_event_id=last_event_id,
-            messages=len(replayed),
-        )
-        return replayed
-    return snapshot
-
-
 def _restore_turn_branch_state(
     agent,
     store: SessionStore,
     agent_name: str,
     events: list[dict] | None = None,
+    branch_view: dict[int, int] | None = None,
 ) -> None:
-    """Set turn / branch / parent-path state on the agent from saved events.
+    """Set turn / branch / parent-path / view on the agent from saved events.
 
-    Picks the latest live subtree on resume (parent path = the latest
-    branch of every prior turn). This matches ``replay_conversation``
-    default selection so the in-memory conversation, the saved
-    snapshot, and the agent's branch counters all agree. ``events`` is
-    the caller's shared raw read; omit it to read the store here.
+    ``branch_view`` is the resolved selected map (already expanded against
+    raw ancestry). When it is set, those coordinates are installed as-is so
+    a non-latest selection cannot fall back to the latest live subtree.
+    Without it, resume picks the latest compatible subtree, matching
+    ``replay_conversation``'s default. ``events`` is the caller's shared
+    raw read; omit it to read the store here.
     """
+    if branch_view is not None:
+        apply_branch_coordinates(agent, branch_view)
+        logger.debug(
+            "Turn/branch state restored from selected view",
+            agent=agent_name,
+            turn_index=getattr(agent, "_turn_index", None),
+            branch_id=getattr(agent, "_branch_id", None),
+        )
+        return
     if events is None:
         try:
             events = store.get_events(agent_name)
@@ -216,24 +115,16 @@ def _restore_turn_branch_state(
                 exc_info=True,
             )
             return
-    # Use replay's path-aware selector so restored branch ancestry actually existed.
-    events_list = list(events)
-    parent_paths = index_parent_paths(events_list)
-    selected = resolve_selected_branches(events_list, parent_paths, None)
+    selected = latest_selected_branches(list(events))
     if not selected:
         return
-    max_turn = max(selected.keys())
-    agent._turn_index = max_turn
-    agent._branch_id = selected[max_turn]
-    agent._parent_branch_path = [
-        (t, selected[t]) for t in sorted(selected.keys()) if t < max_turn
-    ]
+    apply_branch_coordinates(agent, selected)
     logger.debug(
         "Turn/branch state restored",
         agent=agent_name,
-        turn_index=max_turn,
-        branch_id=agent._branch_id,
-        parent_path_len=len(agent._parent_branch_path),
+        turn_index=getattr(agent, "_turn_index", None),
+        branch_id=getattr(agent, "_branch_id", None),
+        parent_path_len=len(getattr(agent, "_parent_branch_path", []) or []),
     )
 
 
@@ -296,38 +187,79 @@ def _reapply_options(agent: Any, agent_name: str, attribute: str) -> None:
         logger.warning(message, agent=agent_name, error=str(exc))
 
 
+def _reject_running_injection(agent: Any) -> None:
+    """Refuse injection once the session-state owner has started.
+
+    Injection mutates conversation and branch coordinates. A started owner
+    is already committing that state; doing it from the store worker races
+    the owner. The check is local — it must not await the owner.
+    """
+    owner = getattr(agent, "_session_state_owner", None)
+    if owner is not None and getattr(owner, "has_started", False):
+        raise ConflictError(
+            "Saved-state injection is only allowed before Agent start; "
+            "build a fresh Agent to resume"
+        )
+
+
 def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
     """Restore identity, conversation, branch state, scratchpad, and triggers.
 
     Future writes remain in the saved namespace, and interrupted events are
     queued for the rebuilt agent's resume flow.
+
+    A persisted ``snapshot_branch.branch_view`` is the selected raw map.
+    Snapshot acceptance, replay/backfill/tail, coordinates, and
+    ``agent._branch_view`` all use that same map. A non-latest selection
+    never loads the latest coordinates. A view that disagrees with raw
+    ancestry raises :class:`SessionError`.
     """
-    align_agent_name(agent, agent_name)
+    _reject_running_injection(agent)
     # ONE raw read of the event log feeds every consumer below (conversation
     # replay, branch restore, mismatch replay) — not the old 3-4 scans.
     events = store.get_events(agent_name)
-    saved_messages = _load_conversation_with_replay_fallback(store, agent_name, events)
-    if saved_messages:
-        agent.controller.conversation = _build_conversation(saved_messages)
-        _apply_restore_elision(agent)
-        logger.info(
-            "Conversation restored", agent=agent_name, messages=len(saved_messages)
-        )
-
-    _restore_turn_branch_state(agent, store, agent_name, events)
-
-    # A snapshot saved on a DIFFERENT branch (a sibling path) is stale for
-    # the restored target branch: discard it and rebuild via the branch-aware
-    # replay so the restored conversation matches the branch the agent is on.
-    if snapshot_mismatches_branch(store, agent, agent_name):
+    # Resolve before normalize/replay. Generation provenance is checked on
+    # this same selected raw slice, still before normalize drops links.
+    branch_view = resolve_resume_branch_view(events, store, agent_name)
+    origins = validate_selected_raw_events(events, branch_view)
+    coordinates = SimpleNamespace(
+        _turn_index=getattr(agent, "_turn_index", 0),
+        _branch_id=getattr(agent, "_branch_id", 0),
+        _parent_branch_path=list(getattr(agent, "_parent_branch_path", [])),
+        _branch_view=dict(getattr(agent, "_branch_view", {}) or {}),
+    )
+    _restore_turn_branch_state(
+        coordinates, store, agent_name, events, branch_view=branch_view
+    )
+    if snapshot_mismatches_branch(
+        store, coordinates, agent_name, branch_view=branch_view
+    ):
         logger.info(
             "Snapshot belongs to another branch — replaying target branch",
             agent=agent_name,
         )
-        replayed = replayed_messages_for(store, agent_name, events)
-        if replayed:
-            agent.controller.conversation = _build_conversation(replayed)
-            _apply_restore_elision(agent)
+        saved_messages = replayed_messages_for(store, agent_name, events, branch_view)
+    else:
+        saved_messages = _load_conversation_with_replay_fallback(
+            store, agent_name, events, branch_view, origins=origins
+        )
+    validate_resume_snapshot(saved_messages, origins)
+    conversation = _build_conversation(saved_messages) if saved_messages else None
+    provider = prepare_resume_provider(
+        agent, store, agent_name, saved_messages, events, branch_view
+    )
+    provider.publish(agent)
+    align_agent_name(agent, agent_name)
+    agent._turn_index = coordinates._turn_index
+    agent._branch_id = coordinates._branch_id
+    agent._parent_branch_path = coordinates._parent_branch_path
+    agent._branch_view = coordinates._branch_view
+    if conversation is not None:
+        agent.controller.conversation = conversation
+        _apply_restore_elision(agent)
+        logger.info(
+            "Conversation restored", agent=agent_name, messages=len(saved_messages)
+        )
 
     pad_data = store.load_scratchpad(agent_name)
     if pad_data:
@@ -364,7 +296,7 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
         )
 
     try:
-        restore_selections(agent, store)
+        restore_selections(agent, store, restore_model=False)
     except SessionError:
         raise
     except Exception:  # pragma: no cover - resume continues without selections

@@ -1,6 +1,7 @@
 """Status and result tracking for background runtime jobs."""
 
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -150,6 +151,37 @@ class JobStore:
     def register(self, status: JobStatus) -> None:
         """Register a new job."""
         self._statuses[status.job_id] = status
+
+    def register_tool(
+        self, job_id: str, tool_name: str, context: dict[str, Any] | None = None
+    ) -> None:
+        """Register running tool identity with detached, outcome-independent context."""
+        if context and set(context) & {
+            "job_id",
+            "content",
+            "exit_code",
+            "error",
+            "result_metadata",
+            "cancelled",
+            "final_state",
+        }:
+            raise ValueError(
+                "Completion context cannot override terminal outcome fields"
+            )
+        self.register(
+            JobStatus(
+                job_id=job_id,
+                job_type=JobType.TOOL,
+                type_name=tool_name,
+                state=JobState.RUNNING,
+                context=deepcopy(context or {}),
+            )
+        )
+
+    def completion_context(self, job_id: str) -> dict[str, Any]:
+        """Detach terminal delivery context from the authoritative job status."""
+        status = self.get_status(job_id)
+        return deepcopy(status.context) if status is not None else {}
 
     def get_status(self, job_id: str) -> JobStatus | None:
         """Get job status by ID."""

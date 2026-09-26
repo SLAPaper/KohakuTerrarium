@@ -1680,8 +1680,8 @@ class TestStopFinalizesInflightJobs:
                 return orig(kind, message, metadata=metadata, **kwargs)
 
             agent.output_router.notify_activity = spy
-            agent._finalize_inflight_jobs_for_stop()
-            agent._finalize_inflight_jobs_for_stop()
+            await agent._finalize_inflight_jobs_for_stop()
+            await agent._finalize_inflight_jobs_for_stop()
             assert emitted == ["tool_error"], (
                 "repeat sweep must find nothing — the first sweep "
                 f"transitions the status off RUNNING; got {emitted}"
@@ -3943,7 +3943,10 @@ class TestDispatchSubAgentDirect:
 
         agent = make_agent()
 
-        async def fake_spawn(event):
+        async def fake_spawn(event, *, job_id, completion_context):
+            assert completion_context["tool_call_id"] == "call_sa"
+            assert completion_context["execution_class"] == "direct"
+            assert completion_context["origin"]["delivery_id"].endswith(job_id)
             jid = "agent_direct_1"
             # Pending task that doesn't complete.
 
@@ -3958,7 +3961,7 @@ class TestDispatchSubAgentDirect:
         agent.subagent_manager.spawn_from_event = fake_spawn
         evt = SubAgentCallEvent(
             name="explore",
-            args={"task": "x", "_tool_call_id": "call_sa"},
+            args={"task": "x", "_tool_call_id": "call_sa", "run_in_background": False},
             raw="",
         )
         await agent.start()

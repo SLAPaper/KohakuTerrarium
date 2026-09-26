@@ -12,6 +12,9 @@ from kohakuterrarium.core.agent_runtime_tools import (
 )
 from kohakuterrarium.core.backgroundify import BackgroundifyHandle
 from kohakuterrarium.core.events import EventType, TriggerEvent
+from kohakuterrarium.core.registry import Registry
+from kohakuterrarium.modules.subagent.manager import SubAgentManager
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.llm.message import ImagePart
 from kohakuterrarium.parsing.events import (
     CommandResultEvent,
@@ -46,7 +49,7 @@ class _Mgr:
     def __init__(self):
         self.spawn = AsyncMock(return_value=("agent_123", True))
 
-    async def spawn_from_event(self, event):
+    async def spawn_from_event(self, event, *, job_id=None, completion_context=None):
         return await self.spawn(event)
 
 
@@ -252,11 +255,18 @@ class TestStartSubagentAsync:
 
     async def test_spawn_raises_value_error(self):
         a = _make_mixin()
-        a.subagent_manager.spawn.side_effect = ValueError("not registered")
+        a.subagent_manager = SubAgentManager(Registry(), ScriptedLLM(["unused"]))
         evt = SubAgentCallEvent(name="ghost", args={"task": "x"}, raw="")
         job_id, is_bg = await a._start_subagent_async(evt)
-        assert job_id == "error_ghost"
+        assert job_id.startswith("agent_ghost_")
         assert is_bg is True
+        result = await a.subagent_manager.wait_for(job_id)
+        assert "not registered" in result.error
+        assert (
+            a.subagent_manager.job_store.get_status(job_id)
+            .context["origin"]["delivery_id"]
+            .endswith(job_id)
+        )
 
 
 # ── _should_notify_controller_on_background_complete ─────────────

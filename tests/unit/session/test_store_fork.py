@@ -24,6 +24,40 @@ def _store(tmp_path, name="src.kohakutr") -> SessionStore:
     return SessionStore(str(tmp_path / name))
 
 
+def test_fork_discards_parent_snapshot_selection(tmp_path):
+    source = _store(tmp_path)
+    child = None
+    try:
+        source.append_event(
+            "alice", "user_message", {"content": "before"}, turn_index=1, branch_id=1
+        )
+        source.append_event(
+            "alice",
+            "user_message",
+            {"content": "after"},
+            turn_index=2,
+            branch_id=1,
+            parent_branch_path=[(1, 1)],
+        )
+        tag = {
+            "turn_index": 2,
+            "branch_id": 1,
+            "parent_branch_path": [(1, 1)],
+            "branch_view": {1: 1, 2: 1},
+        }
+        source.state["alice:snapshot_branch"] = tag
+        source.state["alice:snapshot_event_id"] = 2
+        child = perform_fork(source, str(tmp_path / "child.kohakutr"), at_event_id=1)
+        assert "alice:snapshot_branch" not in child.state
+        assert "alice:snapshot_event_id" not in child.state
+        assert source.state["alice:snapshot_branch"] == tag
+        assert [e["content"] for e in child.get_events("alice")] == ["before"]
+    finally:
+        if child is not None:
+            child.close()
+        source.close()
+
+
 # ── small helpers ─────────────────────────────────────────────────
 
 

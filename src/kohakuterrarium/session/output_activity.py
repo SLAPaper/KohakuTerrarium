@@ -9,6 +9,7 @@ import json
 from typing import Any
 
 from kohakuterrarium.core.job_label import canonical_tool_name, make_job_label
+from kohakuterrarium.session.output_tool_origin import record_tool_activity
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -48,10 +49,10 @@ class SessionActivityMixin:
 
     def _record_activity(
         self, activity_type: str, name: str, detail: str, metadata: dict
-    ) -> None:
+    ):
         handler_name = self._ACTIVITY_HANDLERS.get(activity_type)
         if handler_name:
-            getattr(self, handler_name)(name, detail, metadata)
+            return getattr(self, handler_name)(name, detail, metadata)
         elif activity_type.startswith("subagent_tool_"):
             self._handle_subagent_tool(activity_type, name, detail, metadata)
         else:
@@ -97,12 +98,9 @@ class SessionActivityMixin:
         if metadata.get("tool_call_id"):
             data["tool_call_id"] = metadata["tool_call_id"]
             data["tool_call_arguments"] = metadata.get("tool_call_arguments")
-        self._record(
-            "tool_call",
-            data,
-        )
+        record_tool_activity(self, "tool_call", data, metadata)
 
-    def _handle_tool_done(self, name: str, detail: str, metadata: dict) -> None:
+    def _handle_tool_done(self, name: str, detail: str, metadata: dict):
         event_data: dict[str, Any] = {
             "name": _tool_name(name, metadata),
             "call_id": metadata.get("job_id", ""),
@@ -116,10 +114,11 @@ class SessionActivityMixin:
         tool_metadata = metadata.get("tool_metadata")
         if isinstance(tool_metadata, dict):
             event_data["tool_metadata"] = dict(tool_metadata)
-        self._record("tool_result", event_data)
+        return record_tool_activity(self, "tool_result", event_data, metadata)
 
-    def _handle_tool_error(self, name: str, detail: str, metadata: dict) -> None:
-        self._record(
+    def _handle_tool_error(self, name: str, detail: str, metadata: dict):
+        return record_tool_activity(
+            self,
             "tool_result",
             {
                 "name": _tool_name(name, metadata),
@@ -131,6 +130,7 @@ class SessionActivityMixin:
                 "cancelled": bool(metadata.get("cancelled", False)),
                 "final_state": metadata.get("final_state", "error"),
             },
+            metadata,
         )
 
     def _handle_subagent_start(self, name: str, detail: str, metadata: dict) -> None:
@@ -145,7 +145,8 @@ class SessionActivityMixin:
                 "llm_name": metadata.get("llm_name", ""),
                 "model": metadata.get("model", ""),
             }
-        self._record(
+        record_tool_activity(
+            self,
             "subagent_call",
             {
                 "name": name,
@@ -155,14 +156,16 @@ class SessionActivityMixin:
                 "llm_name": metadata.get("llm_name", ""),
                 "model": metadata.get("model", ""),
             },
+            metadata,
         )
 
-    def _handle_subagent_done(self, name: str, detail: str, metadata: dict) -> None:
+    def _handle_subagent_done(self, name: str, detail: str, metadata: dict):
         job_id = metadata.get("job_id", "")
         task_record = self._subagent_tasks.get(job_id) or {}
         name = _subagent_name(name, metadata)
         output_text = metadata.get("result", detail)
-        self._record(
+        receipt = record_tool_activity(
+            self,
             "subagent_result",
             {
                 "name": name,
@@ -176,11 +179,18 @@ class SessionActivityMixin:
                 "model": metadata.get("model", "") or task_record.get("model", ""),
                 **_token_metadata(metadata),
             },
+            metadata,
         )
         # Preserve history for child runs outside SubAgentManager.
         self._persist_subagent_conversation(
-            name, job_id, output_text, success=True, metadata=metadata
+            name,
+            job_id,
+            output_text,
+            success=True,
+            metadata=metadata,
+            after=receipt if metadata.get("_terminal_publication") else None,
         )
+        return receipt
 
     def _handle_subagent_token_update(
         self, name: str, detail: str, metadata: dict
@@ -194,12 +204,13 @@ class SessionActivityMixin:
             },
         )
 
-    def _handle_subagent_error(self, name: str, detail: str, metadata: dict) -> None:
+    def _handle_subagent_error(self, name: str, detail: str, metadata: dict):
         job_id = metadata.get("job_id", "")
         task_record = self._subagent_tasks.get(job_id) or {}
         name = _subagent_name(name, metadata)
         output_text = metadata.get("result", detail)
-        self._record(
+        receipt = record_tool_activity(
+            self,
             "subagent_result",
             {
                 "name": name,
@@ -218,10 +229,17 @@ class SessionActivityMixin:
                 "model": metadata.get("model", "") or task_record.get("model", ""),
                 **_token_metadata(metadata),
             },
+            metadata,
         )
         self._persist_subagent_conversation(
-            name, job_id, output_text, success=False, metadata=metadata
+            name,
+            job_id,
+            output_text,
+            success=False,
+            metadata=metadata,
+            after=receipt if metadata.get("_terminal_publication") else None,
         )
+        return receipt
 
     def _persist_subagent_conversation(
         self,
@@ -231,6 +249,7 @@ class SessionActivityMixin:
         *,
         success: bool,
         metadata: dict,
+        after=None,
     ) -> None:
         """Persist a minimal conversation when no full child history exists.
 
@@ -239,9 +258,14 @@ class SessionActivityMixin:
         find-then-write runs as one queued unit so it observes previously
         submitted writes and stays atomic with them.
         """
-        task_record = self._subagent_tasks.pop(job_id, None)
+        task_record = (
+            self._subagent_tasks.get(job_id)
+            if after is not None
+            else self._subagent_tasks.pop(job_id, None)
+        )
         self._submit_store_write(
-            self._write_subagent_conversation,
+            self._write_subagent_after,
+            after,
             name,
             job_id,
             output_text,
@@ -249,6 +273,11 @@ class SessionActivityMixin:
             metadata=metadata,
             task_record=task_record,
         )
+
+    def _write_subagent_after(self, receipt, *args, **kwargs):
+        if receipt is not None:
+            receipt.result()
+        return self._write_subagent_conversation(*args, **kwargs)
 
     def _write_subagent_conversation(
         self,

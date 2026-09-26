@@ -15,11 +15,12 @@ from kohakuterrarium.core.agent_message_history import (
     turn_index_for_user_position as _turn_index_for_user_position,
     user_message_content_for_turn as _user_message_content_for_turn,
 )
-from kohakuterrarium.core.agent_raw_history import (
-    raw_target_content,
-    reload_raw_prefix_for_target,
-)
+from kohakuterrarium.core.branch_edit_prepare import EditRequest
+from kohakuterrarium.core.branch_rerun import request_rerun
+from kohakuterrarium.core.branch_rewind import rewind
+from kohakuterrarium.core.branch_selection import select_branch as _select_branch
 from kohakuterrarium.core.events import EventType, TriggerEvent
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.llm.message import normalize_content_parts
 from kohakuterrarium.session.history import replay_conversation
@@ -34,6 +35,10 @@ logger = get_logger(__name__)
 
 class AgentMessagesMixin:
     """Message edit / regenerate / rewind operations."""
+
+    async def select_branch(self, branch_view: dict[int, int] | None = None) -> int:
+        """Select a persisted branch without regenerating. Local idle only."""
+        return await _select_branch(self, branch_view)
 
     async def regenerate_last_response(
         self,
@@ -64,95 +69,25 @@ class AgentMessagesMixin:
         the resolved ``turn_index`` so the original branch is preserved
         and addressable via the ``<x/N>`` navigator.
         """
-        if target is not None:
-            await self.edit_and_rerun(
-                message_idx=-1,
-                new_content=raw_target_content(self, target, branch_view=branch_view),
-                turn_index=target.turn_index,
-                branch_view=branch_view,
+        if target is not None or turn_index is not None:
+            await request_rerun(
+                self,
+                append_user_event_pair,
                 request_id=request_id,
-                target=target,
+                edit=EditRequest(
+                    turn_index=turn_index,
+                    branch_view=branch_view,
+                    target=target,
+                    regenerate=True,
+                ),
             )
             return
 
-        if turn_index is not None:
-            # Reusing the selected branch's content gives regeneration the same
-            # branching semantics as an edit without changing the message.
-            prev_content = self._user_message_content_for_turn(
-                turn_index, branch_view=branch_view
-            )
-            if prev_content is None:
-                logger.warning(
-                    "Cannot find user_message for turn",
-                    turn=turn_index,
-                )
-                return
-            user_position = self._user_position_for_turn_index(
-                turn_index, branch_view=branch_view
-            )
-            if user_position is None:
-                logger.warning(
-                    "Cannot resolve user_position for turn",
-                    turn=turn_index,
-                )
-                return
-            await self.edit_and_rerun(
-                message_idx=-1,
-                new_content=prev_content,
-                turn_index=turn_index,
-                user_position=user_position,
-                branch_view=branch_view,
-            )
-            return
-
-        async with self._get_message_mutation_lock():
-            await self._regenerate_tail_response(request_id=request_id)
+        await self._regenerate_tail_response(request_id=request_id)
 
     async def _regenerate_tail_response(self, *, request_id: str | None) -> None:
-        """Regenerate the current tail while holding the mutation lock."""
-        await self._wait_for_history_finalization()
-        self._ensure_history_mutation_idle()
-        self._ensure_rerun_available()
-        conv = self.controller.conversation
-        last_user = conv.find_last_user_index()
-        if last_user < 0:
-            logger.warning("No user message to regenerate from")
-            return
-        removed = conv.truncate_from(last_user + 1)
-        # Open a new branch of the current turn.
-        self._branch_id = self._max_branch_id_for_turn(self._turn_index) + 1
-        logger.info(
-            "Regenerating",
-            dropped=len(removed),
-            turn_index=self._turn_index,
-            branch_id=self._branch_id,
-        )
-        # Emit fresh user_input + user_message events for the new
-        # branch so replay (and the resume display surfaces that
-        # group by ``user_input``) see a self-contained branch.
-        # Pure regen mirrors the previous branch's wording — the
-        # in-memory conversation already has the original user
-        # message; the controller does NOT re-append on rerun.
-        prev_content = self._previous_branch_user_content()
-        if self.session_store is not None and prev_content is not None:
-            # Pure regen keeps the existing parent path — we are
-            # opening a sibling branch of the SAME turn, so the path
-            # of prior turns is unchanged.
-            ppath = [tuple(p) for p in getattr(self, "_parent_branch_path", [])]
-            await self.session_store.run(
-                append_user_event_pair,
-                self.session_store,
-                self.config.name,
-                {"content": prev_content},
-                self._turn_index,
-                self._branch_id,
-                ppath,
-            )
-        self._branch_request_id = request_id
-        try:
-            await self._rerun_from_last()
-        finally:
-            self._branch_request_id = None
+        """Persist tail regeneration before publishing its context and rerun."""
+        await request_rerun(self, append_user_event_pair, request_id=request_id)
 
     async def edit_and_rerun(
         self,
@@ -165,164 +100,19 @@ class AgentMessagesMixin:
         request_id: str | None = None,
         target: UserMessageSelector | None = None,
     ) -> bool:
-        """Serialize conversation reconstruction and the resulting rerun turn."""
-        async with self._get_message_mutation_lock():
-            return await self._edit_and_rerun_locked(
-                message_idx,
-                new_content,
-                turn_index=turn_index,
-                user_position=user_position,
-                branch_view=branch_view,
-                request_id=request_id,
-                target=target,
-            )
-
-    async def _edit_and_rerun_locked(
-        self,
-        message_idx: int,
-        new_content: str,
-        *,
-        turn_index: int | None = None,
-        user_position: int | None = None,
-        branch_view: dict[int, int] | None = None,
-        request_id: str | None = None,
-        target: UserMessageSelector | None = None,
-    ) -> bool:
-        """Replace a user message and re-run from there.
-
-        ``message_idx`` remains the raw in-memory conversation index for
-        CLI/back-compat callers. Frontend callers should pass a stable
-        ``turn_index`` or visible ``user_position`` so system/tool
-        messages cannot shift the target.
-
-        ``branch_view`` lets a caller edit on a NON-LATEST branch.
-        When provided, the agent's in-memory conversation is replayed
-        from events under the chosen view BEFORE the edit, so the
-        truncation target resolves correctly even when the user has
-        switched to an older subtree in the UI.
-        """
-        await self._wait_for_history_finalization()
-        self._ensure_history_mutation_idle()
-        self._ensure_rerun_available()
-        # Canonical persisted targets reconstruct original context before
-        # mutating in-memory state, deliberately bypassing compact snapshots.
-        if target is not None:
-            reload_raw_prefix_for_target(self, target, branch_view=branch_view)
-            turn_index = target.turn_index
-            user_position = None
-        elif branch_view:
-            self._reload_conversation_under_branch_view(branch_view)
-
-        conv = self.controller.conversation
-        msgs = conv.get_messages()
-        resolved_idx = self._resolve_edit_message_index(
-            msgs,
-            message_idx,
-            turn_index=turn_index,
-            user_position=user_position,
-            branch_view=branch_view,
+        """Prepare an edit independently, persist it, then publish and rerun."""
+        return await request_rerun(
+            self,
+            append_user_event_pair,
+            request_id=request_id,
+            edit=EditRequest(
+                message_idx, new_content, turn_index, user_position, branch_view, target
+            ),
         )
-        if resolved_idx is None:
-            logger.warning(
-                "Invalid edit target",
-                index=message_idx,
-                turn_index=turn_index,
-                user_position=user_position,
-            )
-            return False
-        target = msgs[resolved_idx]
-        if target.role != "user":
-            logger.warning("Can only edit user messages", role=target.role)
-            return False
-        # Compute the user-message position so we can map back to a
-        # turn_index in the event log.
-        resolved_user_position = (
-            sum(1 for m in msgs[: resolved_idx + 1] if m.role == "user") - 1
-        )
-        # Drop the old user message + everything after from the
-        # in-memory conversation. Do NOT append the new user message
-        # here — the rerun trigger carries it; the controller appends
-        # it via ``_build_turn_context``.
-        conv.truncate_from(resolved_idx)
-        # Resolve the turn_index of the edited user message and bump
-        # branch_id accordingly. If we cannot resolve it (no store, or
-        # legacy events without turn_index), keep the agent's current
-        # turn/branch state.
-        target_turn_index = turn_index
-        if target_turn_index is None:
-            target_turn_index = self._turn_index_for_user_position(
-                resolved_user_position,
-                branch_view=branch_view,
-            )
-        if target_turn_index is None and user_position is not None:
-            # No session/event metadata (common in narrow tests or
-            # legacy in-memory agents). Position-based targeting still
-            # found the right user message, so preserve old fallback
-            # semantics and open a new branch on the current turn.
-            target_turn_index = self._turn_index if self._turn_index > 0 else None
-        if target_turn_index is not None:
-            self._turn_index = target_turn_index
-        self._branch_id = (
-            self._max_branch_id_for_turn(self._turn_index) + 1
-            if target_turn_index is not None and self.session_store is not None
-            else max(self._branch_id, 1) + 1
-        )
-        logger.info(
-            "Edited and re-running",
-            index=resolved_idx,
-            turn_index=self._turn_index,
-            branch_id=self._branch_id,
-        )
-        # Emit user_input + user_message events for the new branch
-        # carrying the edited content. ``_process_event`` in
-        # ``agent_handlers`` skips its own append for rerun-flagged
-        # triggers, so this is the authoritative writer for the new
-        # branch's user-side events (we have the correct branch_id +
-        # parent_branch_path computed already, which the handler
-        # cannot replicate without re-reading the event log).
-        # Edit+rerun on an EARLIER turn drops every later-turn entry
-        # from the parent path — those follow-ups belong to a previous
-        # subtree and the new edit forks from this point.
-        cur_path = list(getattr(self, "_parent_branch_path", []))
-        cur_path = [(t, b) for (t, b) in cur_path if t < self._turn_index]
-        self._parent_branch_path = cur_path
-        if self.session_store is not None:
-            ppath = [tuple(p) for p in cur_path]
-            await self.session_store.run(
-                append_user_event_pair,
-                self.session_store,
-                self.config.name,
-                {"content": new_content},
-                self._turn_index,
-                self._branch_id,
-                ppath,
-            )
-        self._branch_request_id = request_id
-        try:
-            await self._rerun_from_last(new_user_content=new_content)
-        finally:
-            self._branch_request_id = None
-        return True
 
     async def rewind_to(self, message_idx: int) -> None:
         """Drop messages from ``message_idx`` onward without re-running."""
-        async with self._get_message_mutation_lock():
-            await self._wait_for_history_finalization()
-            self._ensure_history_mutation_idle()
-            conv = self.controller.conversation
-            removed = conv.truncate_from(message_idx)
-            logger.info("Rewound", index=message_idx, dropped=len(removed))
-            if self.session_store:
-                try:
-                    self.session_store.save_conversation(
-                        self.config.name, conv.snapshot_messages()
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Failed to save conversation after rewind",
-                        error=str(e),
-                        exc_info=True,
-                    )
+        await rewind(self, message_idx)
 
     def _get_message_mutation_lock(self) -> asyncio.Lock:
         """Return the per-agent lock guarding destructive history mutations."""
@@ -344,6 +134,7 @@ class AgentMessagesMixin:
 
     def _ensure_history_mutation_idle(self) -> None:
         """Reject destructive history changes while another turn can observe it."""
+        require_model_mutation_available(self)
         processing_lock = getattr(self, "_processing_lock", None)
         inbox = getattr(self, "_event_inbox", None)
         turn_active = processing_lock is not None and processing_lock.locked()
