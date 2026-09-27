@@ -201,6 +201,19 @@ async def test_select_sibling_while_background_result_is_pending(
                     branch_selection, "_persist_on_worker", held_persist
                 )
                 terminal_submitted = asyncio.Event()
+                child_save_submitted = asyncio.Event()
+                store_submit = agent.session_store.submit
+
+                def observe_child_save(fn, *args, **kwargs):
+                    receipt = store_submit(fn, *args, **kwargs)
+                    if getattr(fn, "__name__", "") == "save_subagent":
+                        child_save_submitted.set()
+                    return receipt
+
+                if child:
+                    monkeypatch.setattr(
+                        agent.session_store, "submit", observe_child_save
+                    )
                 submit = agent._session_output._submit_store_write
 
                 def observe_submit(fn, *args, **kwargs):
@@ -216,7 +229,12 @@ async def test_select_sibling_while_background_result_is_pending(
                 await asyncio.wait_for(persist_entered.wait(), 3)
                 release.set()
                 if selected == 1:
-                    await asyncio.wait_for(terminal_submitted.wait(), 3)
+                    await asyncio.wait_for(
+                        (child_save_submitted if child else terminal_submitted).wait(),
+                        3,
+                    )
+                    if child:
+                        assert not terminal_submitted.is_set()
                     assert not enqueued.is_set()
                 persist_release.set()
                 await selection_task

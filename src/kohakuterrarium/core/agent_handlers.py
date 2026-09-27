@@ -293,7 +293,10 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
         native_tool_call_ids: dict[str, str] = {}
 
         async for parse_event in controller.run_once():
-            if self._interrupt_requested:
+            stop_lock = getattr(self, "_stop_lock", None)
+            if self._interrupt_requested or (
+                stop_lock is not None and stop_lock.locked()
+            ):
                 break
 
             if isinstance(parse_event, ToolCallEvent):
@@ -395,6 +398,9 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
         if tool_call_id:
             native_tool_call_ids[job_id] = tool_call_id
 
+        self._notify_tool_start(
+            parse_event, job_id, is_direct, tool_call_id=tool_call_id
+        )
         if handle.promoted:
             # A deliverable background tool defers this turn's output wire
             # until it reports back. STATEFUL (persistent, multi-turn) tools
@@ -406,11 +412,11 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                 self._turn_dispatched_bg.add(job_id)
             # Already background — add placeholder
             if tool_call_id:
-                controller.conversation.append(
-                    "tool",
+                await self._append_background_ack(
+                    job_id,
+                    tool_call_id,
+                    parse_event.name,
                     f"[{parse_event.name}] {_BG_PLACEHOLDER}",
-                    tool_call_id=tool_call_id,
-                    name=parse_event.name,
                 )
             else:
                 # Text mode has no role=tool slot — deliver the same
@@ -439,9 +445,6 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             direct=is_direct,
         )
 
-        self._notify_tool_start(
-            parse_event, job_id, is_direct, tool_call_id=tool_call_id
-        )
         await self._flush_output()
 
     async def _dispatch_subagent_event(
@@ -485,6 +488,22 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             else None
         )
 
+        _, label = _make_job_label(job_id)
+        subagent = self.subagent_manager.get_live_subagent(job_id)
+        provider = getattr(subagent, "llm", None)
+        self.output_router.notify_activity(
+            "subagent_start",
+            f"[{label}] {full_task[:60]}",
+            metadata={
+                "job_id": job_id,
+                "task": full_task,
+                "background": is_bg,
+                **tool_completion_context(self, job_id),
+                "subagent": parse_event.name,
+                "llm_name": getattr(provider, "_llm_identifier", "") or "",
+                "model": _provider_model(provider),
+            },
+        )
         if handle and handle.promoted:
             # A deliverable background sub-agent defers this turn's output
             # wire until it reports. INTERACTIVE sub-agents (persistent,
@@ -495,11 +514,11 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             ):
                 self._turn_dispatched_bg.add(job_id)
             if sa_tool_call_id:
-                controller.conversation.append(
-                    "tool",
+                await self._append_background_ack(
+                    job_id,
+                    sa_tool_call_id,
+                    parse_event.name,
                     f"[{parse_event.name}] {_BG_PLACEHOLDER}",
-                    tool_call_id=sa_tool_call_id,
-                    name=parse_event.name,
                 )
             else:
                 self._bg_dispatch_acks.append(
@@ -519,22 +538,6 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             if sa_tool_call_id and native_tool_call_ids is not None:
                 native_tool_call_ids[job_id] = sa_tool_call_id
 
-        _, label = _make_job_label(job_id)
-        subagent = self.subagent_manager.get_live_subagent(job_id)
-        provider = getattr(subagent, "llm", None)
-        self.output_router.notify_activity(
-            "subagent_start",
-            f"[{label}] {full_task[:60]}",
-            metadata={
-                "job_id": job_id,
-                "task": full_task,
-                "background": is_bg,
-                **tool_completion_context(self, job_id),
-                "subagent": parse_event.name,
-                "llm_name": getattr(provider, "_llm_identifier", "") or "",
-                "model": _provider_model(provider),
-            },
-        )
         await self._flush_output()
 
     def _check_termination(self, round_text: list[str]) -> bool:
@@ -628,16 +631,6 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                     text = self._format_text_results(handle_order, results)
                     if text:
                         feedback_parts.append(text)
-
-        # A direct job promoted to background mid-wait also defers this
-        # turn's output wire (deliverable — promoted directs are ordinary
-        # tools/sub-agents that report back). Record it so the guard sees it.
-        if had_promotions:
-            for jid, promoted_handle in handles.items():
-                if getattr(
-                    promoted_handle, "promoted", False
-                ) and self._bg_controller_notify.get(jid, True):
-                    self._turn_dispatched_bg.add(jid)
 
         # If promotions happened, the controller must continue so the model
         # sees the placeholder and can proceed working on other tasks.

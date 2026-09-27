@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import kohakuterrarium.terrarium.autosession as _autosession
 import kohakuterrarium.terrarium.channels as channel_module
 import kohakuterrarium.terrarium.graph_manifest as _manifest
+from kohakuterrarium.core.session_attachment import require_attachment_idle
 from kohakuterrarium.studio._runtime import as_engine
 from kohakuterrarium.studio.sessions import index_hooks as _index_hooks
 from kohakuterrarium.studio.sessions.registry import stores_for
@@ -40,6 +41,7 @@ def attach_session_store_for_creature(
 ) -> None:
     """Attach a session store to ``creature``. Reuses the graph-level
     store when present, else mints ``<cid>.kohakutr``."""
+    require_attachment_idle(creature.agent)
     engine = as_engine(service)
     session_stores = stores_for(service)
     try:

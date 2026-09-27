@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +21,271 @@ from kohakuterrarium.testing.llm import ScriptedLLM
 # ── copy_events_into ──────────────────────────────────────────
 
 
+@pytest.mark.parametrize("operation", ["merge", "split"])
+def test_unpublished_store_handles_close_after_copy_failure(
+    tmp_path, monkeypatch, operation
+):
+    source = SessionStore(tmp_path / "source.kohakutr")
+    created = []
+    copy = sc.copy_events_into
+    calls = []
+
+    def tracked(path):
+        store = SessionStore(path)
+        created.append(store)
+        return store
+
+    def fail_second(src, dst):
+        calls.append(True)
+        if len(calls) == 2:
+            raise OSError("copy interrupted")
+        return copy(src, dst)
+
+    monkeypatch.setattr(sc, "SessionStore", tracked)
+    monkeypatch.setattr(sc, "copy_events_into", fail_second)
+    try:
+        source.submit(
+            source.append_event, "alice", "message", {"content": "kept"}
+        ).result()
+        with pytest.raises(OSError, match="copy interrupted"):
+            if operation == "merge":
+                sc.merge_session_stores([source, source], tmp_path / "merged.kohakutr")
+            else:
+                sc.split_session_store(
+                    source, [tmp_path / "one.kohakutr", tmp_path / "two.kohakutr"]
+                )
+        assert created and all(store._closed for store in created)
+        assert all(Path(store.path).exists() for store in created)
+        assert not source._closed
+    finally:
+        for store in created:
+            store.close(update_status=False)
+        source.close(update_status=False)
+
+
 class TestCopyEventsInto:
+    @pytest.mark.parametrize("failure", ["repeat", "before_append", "after_append"])
+    def test_retry_copy_keeps_one_row_per_source_identity(
+        self, tmp_path, monkeypatch, failure
+    ):
+        src = SessionStore(tmp_path / "source.kohakutr")
+        dst = SessionStore(tmp_path / "destination.kohakutr")
+        try:
+            for text in ("first", "second"):
+                src.submit(
+                    src.append_event, "alice", "message", {"content": text}
+                ).result()
+            if failure == "repeat":
+                sc.copy_events_into(src, dst)
+            else:
+                append, calls = dst.append_event, []
+
+                def fail_once(*args, **kwargs):
+                    calls.append(True)
+                    if len(calls) == 2 and failure == "before_append":
+                        raise OSError("injected copy failure")
+                    result = append(*args, **kwargs)
+                    if len(calls) == 2:
+                        raise OSError("injected copy failure")
+                    return result
+
+                with monkeypatch.context() as patch:
+                    patch.setattr(dst, "append_event", fail_once)
+                    with pytest.raises(OSError, match="injected copy failure"):
+                        sc.copy_events_into(src, dst)
+            sc.copy_events_into(src, dst)
+            rows = dst.submit(dst.get_events, "alice").result()
+            assert [row["content"] for row in rows] == ["first", "second"]
+            before = rows
+            dst.close()
+            dst = SessionStore(tmp_path / "destination.kohakutr")
+            sc.copy_events_into(src, dst)
+            assert dst.submit(dst.get_events, "alice").result() == before
+        finally:
+            src.close()
+            dst.close()
+
+    def test_equal_content_independent_stores_remain_distinct(self, tmp_path):
+        stores = [
+            SessionStore(tmp_path / name / "same.kohakutr")
+            for name in ("a", "b", "dst")
+        ]
+        a, b, dst = stores
+        try:
+            for source in (a, b):
+                source.submit(
+                    source.append_event,
+                    "alice",
+                    "message",
+                    {"content": "same", "ts": 100},
+                ).result()
+                sc.copy_events_into(source, dst)
+            rows = dst.submit(dst.get_events, "alice").result()
+            assert len(rows) == 2
+            assert [row["content"] for row in rows] == ["same", "same"]
+            assert rows[0]["event_id"] != rows[1]["event_id"]
+        finally:
+            for store in stores:
+                store.close()
+
+    @pytest.mark.parametrize("alias", [False, True])
+    def test_copy_rejects_same_store_before_appending(self, tmp_path, alias):
+        src = SessionStore(tmp_path / "source.kohakutr")
+        try:
+            src.submit(
+                src.append_event, "alice", "message", {"content": "once"}
+            ).result()
+            destination = (
+                SimpleNamespace(
+                    path=Path(src.path).parent / "." / Path(src.path).name,
+                    submit=src.submit,
+                    append_event=src.append_event,
+                )
+                if alias
+                else src
+            )
+            before = src.submit(src.get_events, "alice").result()
+            with pytest.raises(ValueError, match="distinct stores"):
+                sc.copy_events_into(src, destination)
+            assert src.submit(src.get_events, "alice").result() == before
+        finally:
+            src.close()
+
+    @pytest.mark.parametrize("side", ["source", "destination"])
+    def test_copy_uses_each_stores_own_worker(self, tmp_path, monkeypatch, side):
+        src = SessionStore(tmp_path / "source.kohakutr")
+        dst = SessionStore(tmp_path / "destination.kohakutr")
+        try:
+            src.submit(
+                src.append_event, "alice", "user_input", {"content": "accepted"}
+            ).result()
+            src_worker = src.submit(threading.get_ident).result()
+            dst_worker = dst.submit(threading.get_ident).result()
+            seen = []
+            if side == "source":
+                original = type(src.events).__getitem__
+
+                def observed(table, key):
+                    if table is src.events:
+                        seen.append(threading.get_ident())
+                        assert seen[-1] == src_worker
+                    return original(table, key)
+
+                monkeypatch.setattr(type(src.events), "__getitem__", observed)
+            else:
+                original = dst.append_event
+
+                def observed(*args, **kwargs):
+                    seen.append(threading.get_ident())
+                    assert seen[-1] == dst_worker
+                    return original(*args, **kwargs)
+
+                monkeypatch.setattr(dst, "append_event", observed)
+            assert sc.copy_events_into(src, dst) == 1
+            assert seen
+            assert (
+                dst.submit(dst.get_events, "alice").result()[0]["content"] == "accepted"
+            )
+        finally:
+            src.close()
+            dst.close()
+
+    @pytest.mark.parametrize("side", ["source", "destination"])
+    def test_copy_rejects_store_worker_coordinator(self, tmp_path, side):
+        src = SessionStore(tmp_path / "source.kohakutr")
+        dst = SessionStore(tmp_path / "destination.kohakutr")
+        try:
+            coordinator = src if side == "source" else dst
+            with pytest.raises(RuntimeError, match="cannot run on a store worker"):
+                coordinator.submit(sc.copy_events_into, src, dst).result(timeout=3)
+        finally:
+            src.close()
+            dst.close()
+
+    @pytest.mark.parametrize("stage", ["flush", "read", "append"])
+    def test_copy_propagates_worker_error(self, tmp_path, monkeypatch, stage):
+        src = SessionStore(tmp_path / "source.kohakutr")
+        dst = SessionStore(tmp_path / "destination.kohakutr")
+        try:
+            src.submit(
+                src.append_event, "alice", "message", {"content": "original"}
+            ).result()
+
+            def fail(*args, **kwargs):
+                raise OSError(f"{stage} failed")
+
+            with monkeypatch.context() as patch:
+                if stage == "flush":
+                    method = type(src.events).flush_cache
+
+                    def fail_source(table, *args, **kwargs):
+                        if table is src.events:
+                            fail()
+                        return method(table, *args, **kwargs)
+
+                    patch.setattr(type(src.events), "flush_cache", fail_source)
+                elif stage == "read":
+                    get = type(src.events).__getitem__
+
+                    def fail_read(table, key):
+                        if table is src.events:
+                            fail()
+                        return get(table, key)
+
+                    patch.setattr(type(src.events), "__getitem__", fail_read)
+                else:
+                    patch.setattr(dst, "append_event", fail)
+                with pytest.raises(OSError, match=f"{stage} failed"):
+                    sc.copy_events_into(src, dst)
+            assert dst.submit(dst.get_events, "alice").result() == []
+            assert (
+                src.submit(src.get_events, "alice").result()[0]["content"] == "original"
+            )
+        finally:
+            src.close()
+            dst.close()
+
+    def test_copy_detaches_nested_payload_before_destination_work(
+        self, tmp_path, monkeypatch
+    ):
+        src = SessionStore(tmp_path / "source.kohakutr")
+        dst = SessionStore(tmp_path / "destination.kohakutr")
+        raw = {
+            "event_id": 4,
+            "type": "custom",
+            "payload": {"parts": ["source"]},
+            "turn_index": 2,
+            "branch_id": 1,
+            "parent_branch_path": [[1, 1]],
+        }
+        try:
+            src.submit(src.append_event, "alice", "custom", {}).result()
+            get = type(src.events).__getitem__
+            monkeypatch.setattr(
+                type(src.events),
+                "__getitem__",
+                lambda table, key: raw if table is src.events else get(table, key),
+            )
+            append = dst.append_event
+
+            def change_copy(name, event_type, data, **kwargs):
+                data["payload"]["parts"].append("destination")
+                return append(name, event_type, data, **kwargs)
+
+            monkeypatch.setattr(dst, "append_event", change_copy)
+            assert sc.copy_events_into(src, dst) == 1
+            assert raw["payload"]["parts"] == ["source"]
+            row = dst.submit(dst.get_events, "alice").result()[0]
+            assert row["payload"]["parts"] == ["source", "destination"]
+            assert (row["turn_index"], row["branch_id"], row["parent_branch_path"]) == (
+                2,
+                1,
+                [[1, 1]],
+            )
+        finally:
+            src.close()
+            dst.close()
+
     def test_basic_copy(self, tmp_path):
         src = SessionStore(str(tmp_path / "src.kohakutr"))
         dst = SessionStore(str(tmp_path / "dst.kohakutr"))

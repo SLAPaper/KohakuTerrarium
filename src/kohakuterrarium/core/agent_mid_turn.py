@@ -8,12 +8,16 @@ session records, while background completions share a delivery banner.
 """
 
 import asyncio
+from copy import deepcopy
 from typing import Any
 
+from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.background_admission import admit_background_run
+from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
 from kohakuterrarium.core.controller import Controller
 from kohakuterrarium.core.controller_context import format_events_for_context
 from kohakuterrarium.core.events import TriggerEvent
+from kohakuterrarium.core.event_inbox import TurnOutcome
 from kohakuterrarium.core.pending_input import pending_id_of
 from kohakuterrarium.llm.message import content_parts_to_dicts
 from kohakuterrarium.utils.logging import get_logger
@@ -112,7 +116,32 @@ class AgentMidTurnMixin:
         claimed = await admit_background_run(self, self._event_inbox.drain_all())
         if not claimed:
             return 0
+        events = deepcopy([envelope.event for envelope in claimed])
+        task = asyncio.create_task(
+            self._fold_mid_turn_inputs(controller, claimed, events)
+        )
+        cancelled = False
+        while True:
+            try:
+                count = await asyncio.shield(task)
+                break
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                cancelled = True
+            except Exception:
+                for envelope in claimed:
+                    if envelope.future is not None and not envelope.future.done():
+                        envelope.future.set_result(
+                            TurnOutcome(status="error", was_primary=False)
+                        )
+                raise
+        if cancelled:
+            raise asyncio.CancelledError
+        return count
 
+    async def _fold_mid_turn_inputs(self, controller, claimed, drained):
+        """Finish an admitted fold before releasing its processing lock."""
         active_run = getattr(self, "_active_event_run", None)
         if active_run is not None:
             active_run.extend(claimed)
@@ -125,8 +154,6 @@ class AgentMidTurnMixin:
                 active_captures.append(capture)
                 self.output_router.add_secondary(capture)
 
-        drained: list[TriggerEvent] = [env.event for env in claimed]
-
         pairs = [(evt, self._resolve_injected_content(evt)) for evt in drained]
         # Empty events cannot form a meaningful user message.
         pairs = [(evt, c) for evt, c in pairs if c is not None and c != ""]
@@ -134,13 +161,16 @@ class AgentMidTurnMixin:
         # this re-claim, plus release each one's output-wire defer: it
         # folded into THIS turn, so no follow-up turn re-emits for it and
         # the membership guard must not strand the wire.
-        self._emit_batch_background_banner(drained)
-        owed = getattr(self, "_turn_dispatched_bg", None)
-        if owed is not None:
-            for evt in drained:
-                if evt.type in ("tool_complete", "subagent_output"):
-                    owed.discard(getattr(evt, "job_id", "") or "")
+        deliveries = [
+            getattr(evt, "job_id", "") or ""
+            for evt in drained
+            if evt.type in ("tool_complete", "subagent_output")
+        ]
         if not pairs:
+            await submit_internal_session_state(
+                self, lambda: self._release_folded_background(deliveries)
+            )
+            self._emit_batch_background_banner(drained)
             return 0
 
         combined = _coalesce_user_contents([c for _, c in pairs])
@@ -154,13 +184,45 @@ class AgentMidTurnMixin:
                     combined = f"{combined}\n\n{hint}"
                 elif isinstance(combined, list):
                     combined.append({"type": "text", "text": f"\n\n{hint}"})
+        combined = deepcopy(combined)
+        pairs = deepcopy(pairs)
+        feedback_only = all(
+            evt.type in ("tool_complete", "subagent_output") for evt, _ in pairs
+        )
+        conversation = controller.conversation
+
+        def commit():
+            if controller.conversation is not conversation:
+                raise RuntimeError("Conversation replaced during mid-turn capture")
+            original = conversation._messages
+            snapshot = list(original)
+            original_metadata = deepcopy(conversation._metadata)
+            try:
+                conversation.append(
+                    "user",
+                    combined,
+                    metadata={"kind": TOOL_FEEDBACK_KIND} if feedback_only else {},
+                )
+            except BaseException:
+                original[:] = snapshot
+                conversation._messages = original
+                conversation._metadata = original_metadata
+                raise
+            self._release_folded_background(deliveries)
+            return (
+                self._turn_index,
+                self._branch_id,
+                deepcopy(getattr(self, "_parent_branch_path", [])),
+            )
+
         try:
-            controller.conversation.append("user", combined)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
+            coordinates = await submit_internal_session_state(self, commit)
+        except Exception as exc:
+            logger.error(
                 "Mid-turn input injection failed", error=str(exc), exc_info=True
             )
-            return 0
+            raise
+        self._emit_batch_background_banner(drained)
 
         # One session record + one WS frame PER user-facing drained event
         # so the FE can pop the corresponding queued banner and history
@@ -185,12 +247,12 @@ class AgentMidTurnMixin:
             serializable_content = _to_serializable_content(content)
             pending_id = pending_id_of(evt)
             await self._record_injected_input_event(
-                serializable_content, pending_id=pending_id
+                serializable_content, pending_id=pending_id, coordinates=coordinates
             )
             metadata = {
                 "content": serializable_content,
-                "turn_index": self._turn_index,
-                "branch_id": self._branch_id,
+                "turn_index": coordinates[0],
+                "branch_id": coordinates[1],
             }
             if pending_id:
                 metadata["pending_id"] = pending_id
@@ -206,6 +268,12 @@ class AgentMidTurnMixin:
             turn_index=self._turn_index,
         )
         return len(drained)
+
+    def _release_folded_background(self, deliveries):
+        owed = getattr(self, "_turn_dispatched_bg", None)
+        if owed is not None:
+            for job_id in deliveries:
+                owed.discard(job_id)
 
     def _resolve_injected_content(self, evt: TriggerEvent) -> Any:
         """Extract the injectable content string / parts list from a
@@ -270,7 +338,7 @@ class AgentMidTurnMixin:
         )
 
     async def _record_injected_input_event(
-        self, content: Any, *, pending_id: str | None = None
+        self, content: Any, *, pending_id: str | None = None, coordinates=None
     ) -> None:
         """Append a ``user_input_injected`` event at the current
         ``(turn_index, branch_id)``. Distinct from ``user_input`` so
@@ -281,7 +349,13 @@ class AgentMidTurnMixin:
         if store is None:
             return
         try:
-            payload = {"content": content}
+            payload = {"content": deepcopy(content)}
+            if coordinates is None:
+                coordinates = (
+                    self._turn_index,
+                    self._branch_id,
+                    deepcopy(getattr(self, "_parent_branch_path", [])),
+                )
             if pending_id:
                 payload["pending_id"] = pending_id
             await store.run(
@@ -289,11 +363,9 @@ class AgentMidTurnMixin:
                 self.config.name,
                 "user_input_injected",
                 payload,
-                turn_index=self._turn_index,
-                branch_id=self._branch_id,
-                parent_branch_path=[
-                    tuple(p) for p in getattr(self, "_parent_branch_path", [])
-                ],
+                turn_index=coordinates[0],
+                branch_id=coordinates[1],
+                parent_branch_path=[tuple(p) for p in coordinates[2]],
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(

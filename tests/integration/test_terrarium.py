@@ -78,6 +78,9 @@ from kohakuterrarium.terrarium.tools_group_send import (
 )
 from kohakuterrarium.terrarium.tools_group_status import GroupStatusTool
 from kohakuterrarium.terrarium.tools_group_wire import GroupWireTool
+from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.terrarium import session_attach
+from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 pytestmark = pytest.mark.timeout(30)
@@ -1048,7 +1051,9 @@ class TestTerrariumIntegration:
         await service.shutdown()
 
     @pytest.mark.timeout(120)
-    async def test_hotplug_into_running_session_then_stop(self, make_service, tmp_path):
+    async def test_hotplug_into_running_session_then_stop(
+        self, make_service, tmp_path, monkeypatch
+    ):
         """Hot-plug workflow: a session is already running with one
         creature; a second is added into the SAME graph at runtime
         (``add_creature(graph_id=...)``), wired in, used, then the
@@ -1064,6 +1069,87 @@ class TestTerrariumIntegration:
         )
         gid = host.graph_id
         assert engine.get_creature("host").is_running is True
+        await engine.attach_session(gid, tmp_path / "initial.kohakutr")
+        live_host = engine.get_creature("host")
+        original = live_host.agent.session_store
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class HeldAttachmentLLM(ScriptedLLM):
+            async def chat(self, messages, **kwargs):
+                entered.set()
+                await release.wait()
+                async for chunk in super().chat(messages, **kwargs):
+                    yield chunk
+
+        provider = HeldAttachmentLLM(["before replacement", "after replacement"])
+        live_host.agent.llm = live_host.agent.controller.llm = provider
+        running = asyncio.create_task(live_host.run("held input"))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            with pytest.raises(ConflictError):
+                await engine.attach_session(gid, tmp_path / "replacement.kohakutr")
+            assert not original._closed
+            assert not (tmp_path / "replacement.kohakutr").exists()
+        finally:
+            release.set()
+            assert (await running).text == "before replacement"
+        failed_targets = []
+        original_sink = live_host.agent._session_output
+        original_compact_count = live_host.agent.compact_manager._compact_count
+        mint = session_attach.autosession.mint_store
+
+        def failing_close_target(*args, **kwargs):
+            target = mint(*args, **kwargs)
+            target.submit(
+                lambda: target.state.__setitem__("host:compact_count", 9)
+            ).result()
+            close = target.close
+            closed_once = []
+
+            def close_once(**options):
+                if not closed_once:
+                    closed_once.append(True)
+                    raise OSError("first cleanup attempt failed")
+                return close(**options)
+
+            monkeypatch.setattr(target, "close", close_once)
+            failed_targets.append(target)
+            return target
+
+        async def fail_checkpoint(*args):
+            assert live_host.agent.compact_manager._compact_count == 9
+            raise RuntimeError("checkpoint rejected replacement")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                session_attach.autosession, "mint_store", failing_close_target
+            )
+            patch.setattr(session_attach.checkpoint, "checkpoint", fail_checkpoint)
+            with pytest.raises(RuntimeError, match="checkpoint rejected replacement"):
+                await engine.attach_session(
+                    gid, tmp_path / "failed-replacement.kohakutr"
+                )
+        assert live_host.agent.session_store is original and not original._closed
+        assert failed_targets[0] in engine._retained_session_stores
+        assert live_host.agent._session_output is original_sink
+        assert live_host.agent.compact_manager._compact_count == original_compact_count
+        await live_host.agent._submit_session_state(
+            lambda: setattr(live_host.agent.compact_manager, "_compact_count", 8)
+        )
+        await engine.attach_session(gid, tmp_path / "replacement.kohakutr")
+        assert live_host.agent.compact_manager._compact_count == 0
+        assert original._closed
+        assert (await live_host.run("new session input")).text == "after replacement"
+        current = live_host.agent.session_store
+        records = await current.run(current.get_events, "host")
+        assert (
+            sum(
+                e.get("type") == "user_message"
+                and e.get("content") == "new session input"
+                for e in records
+            )
+            == 1
+        )
 
         # Hot-plug a second creature into the live graph — it joins the
         # existing graph rather than minting a new one.
@@ -1133,6 +1219,75 @@ class TestTerrariumIntegration:
         assert "io" in sess_policies
         assert "observer" in sess_policies
 
+        anchor = await engine.add_creature(
+            _agent_config("anchor", tmp_path),
+            graph=gid,
+            llm=ScriptedLLM(["anchor"]),
+            io="headless",
+            start=True,
+        )
+        await engine.connect("host", anchor, channel="stay")
+        child_entered, child_release = asyncio.Event(), asyncio.Event()
+
+        class HandoffChild(ScriptedLLM):
+            async def chat(self, messages, **kwargs):
+                child_entered.set()
+                await child_release.wait()
+                async for chunk in super().chat(messages, **kwargs):
+                    yield chunk
+
+        child_manager = engine.get_creature("helper").agent.subagent_manager
+        child_manager.register(SubAgentConfig(name="handoff_child", max_turns=1))
+        child_manager.llm = HandoffChild(["child history survives"])
+        child_job = await child_manager.spawn(
+            "handoff_child", "preserve this task", background=True
+        )
+        try:
+            await asyncio.wait_for(child_entered.wait(), 5)
+            child_source = engine.get_creature("helper").agent.session_store
+            copied_payload = {
+                "parts": [{"text": "worker-captured history"}],
+                "source": "helper",
+            }
+            await child_source.run(
+                child_source.append_event,
+                "helper",
+                "handoff_probe",
+                {"payload": copied_payload},
+            )
+            await engine.disconnect("host", "helper", channel="relay")
+            moved_store = engine.get_creature("helper").agent.session_store
+            assert moved_store is not child_source
+            moved_events = await moved_store.run(moved_store.get_events, "helper")
+            assert (
+                next(
+                    event["payload"]
+                    for event in moved_events
+                    if event["type"] == "handoff_probe"
+                )
+                == copied_payload
+            )
+            child_release.set()
+            assert (
+                await child_manager.wait_for(child_job, timeout=5)
+            ).output == "child history survives"
+            await engine.connect("host", "helper", channel="rejoin")
+            child_store = engine.get_creature("helper").agent.session_store
+            row = await child_store.run(
+                child_store.find_subagent_run, child_job, parent="helper"
+            )
+            assert "preserve this task" in await child_store.run(
+                child_store.load_subagent_conversation,
+                "helper",
+                "handoff_child",
+                row["run"],
+            )
+            child_path, child_run = child_store.path, row["run"]
+        finally:
+            child_release.set()
+            await child_manager.wait_all(timeout=5)
+        await engine.remove_creature(anchor)
+
         # stop_graph stops every creature in the graph in one call
         # (without removing them) — they remain graph members.
         await engine.stop_graph(gid)
@@ -1143,12 +1298,84 @@ class TestTerrariumIntegration:
         # Stop the whole session: remove every creature in the graph
         # (what lifecycle.stop_session does); the engine drops the
         # graph once its last creature leaves.
-        for cid in list(graphs[0].creature_ids):
+        for cid in list(engine.get_graph(gid).creature_ids):
             await service.remove_creature(cid)
         assert await service.list_creatures() == ()
         assert await service.list_graphs() == ()
 
+        rollback_host = await engine.add_creature(
+            _agent_config("rollback_host", tmp_path),
+            llm=ScriptedLLM(["must not run"]),
+            io="headless",
+            start=True,
+        )
+        rollback_gid = rollback_host.graph_id
+        runtime = engine._drive_runtime
+        detach = runtime.detach_graph
+        detaches, held_targets = [], []
+
+        async def interrupted_rollback(graph_id):
+            detaches.append(graph_id)
+            if len(detaches) == 2:
+                raise asyncio.CancelledError("rollback detach interrupted")
+            await detach(graph_id)
+
+        async def rejected_checkpoint(*args):
+            held_targets.append(engine._session_stores[rollback_gid])
+            raise RuntimeError("primary checkpoint rejection")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime, "detach_graph", interrupted_rollback)
+            patch.setattr(session_attach.checkpoint, "checkpoint", rejected_checkpoint)
+            with pytest.raises(RuntimeError, match="primary checkpoint rejection"):
+                await engine.attach_session(
+                    rollback_gid, tmp_path / "uncertain-target.kohakutr"
+                )
+        assert runtime._registry._bound_stores[rollback_gid] is held_targets[0]
+        assert not held_targets[0]._closed
+        assert held_targets[0] in engine._retained_session_stores
+        with pytest.raises(ConflictError):
+            rollback_host.agent.attach_session_store(rollback_host.agent.session_store)
+        await engine.stop(rollback_host)
+        await engine.start(rollback_host)
+        pending_reconcile = tuple(runtime._reconcile_tasks.get(rollback_gid, ()))
+        if pending_reconcile:
+            await asyncio.wait_for(asyncio.gather(*pending_reconcile), 5)
+        fenced_turn = await rollback_host.run(
+            "restart must not revive uncertain attachment",
+            timeout=5,
+            raise_on_error=False,
+        )
+        assert fenced_turn.status == "error"
+        assert rollback_host.agent.llm.call_count == 0
+        assert rollback_gid not in runtime._registry._ready_graphs
+
         await service.shutdown()
+        assert failed_targets[0]._closed
+        assert held_targets[0]._closed
+        reopened_child_store = SessionStore(child_path)
+        try:
+            cold_events = await reopened_child_store.run(
+                reopened_child_store.get_events, "helper"
+            )
+            assert [
+                event["payload"]
+                for event in cold_events
+                if event["type"] == "handoff_probe"
+            ] == [copied_payload]
+            assert "child history survives" in await reopened_child_store.run(
+                reopened_child_store.load_subagent_conversation,
+                "helper",
+                "handoff_child",
+                child_run,
+            )
+            assert (
+                await reopened_child_store.run(
+                    reopened_child_store.find_subagent_run, child_job, parent="helper"
+                )
+            )["meta"]["success"] is True
+        finally:
+            await asyncio.to_thread(reopened_child_store.close)
 
     async def test_apply_recipe_promotes_privileged_root(
         self, make_service, tmp_path, patched_llm
@@ -1428,6 +1655,16 @@ class TestTerrariumIntegration:
             root_creature.agent.get_system_prompt().count("## Working with the group")
             == 1
         )
+        await engine.stop(root_creature)
+        await engine.start(root_creature)
+        await engine._runtime_prompt.refresh_creature(root_creature)
+        assert (
+            root_creature.agent.get_system_prompt().count("<!-- runtime-graph -->") == 1
+        )
+        assert "findings" in root_creature.agent.get_system_prompt()
+        assert (
+            await root_creature.run("confirm refreshed group", timeout=5)
+        ).text == "ack"
         # The non-privileged scout's block names its recipe wiring.
         scout_creature = engine.get_creature("scout")
         await engine._runtime_prompt.refresh_creature(scout_creature)

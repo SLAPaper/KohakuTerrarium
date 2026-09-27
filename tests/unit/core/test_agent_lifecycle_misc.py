@@ -326,7 +326,7 @@ class TestCompactOverflowRescue:
             a.compact_manager = types.SimpleNamespace(
                 is_compacting=True,
                 _compact_task=asyncio.current_task(),
-                wait_for_current=None,
+                wait_for_splice=None,
             )
             return await a._compact_overflow_rescue()
 
@@ -341,7 +341,7 @@ class TestCompactOverflowRescue:
 
         spliced = [{"role": "system", "content": "s"}]
         a.compact_manager = types.SimpleNamespace(
-            is_compacting=True, wait_for_current=wait
+            is_compacting=True, wait_for_splice=wait
         )
         a.controller = types.SimpleNamespace(
             conversation=types.SimpleNamespace(to_messages=lambda: spliced)

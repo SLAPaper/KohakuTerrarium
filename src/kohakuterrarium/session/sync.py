@@ -13,6 +13,10 @@ from typing import Any
 
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.protocols import LabNotifier, LabRegistrar
+from kohakuterrarium.session.event_origin import (
+    STORE_UUID,
+    append_mirrored,
+)
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.utils.logging import get_logger
 
@@ -246,6 +250,8 @@ class SessionMirrorWriter:
             return None
         # Isolate key failures so one oversized value cannot block resumable fields.
         for key, value in meta.items():
+            if key == STORE_UUID:
+                continue
             try:
                 store.meta[key] = value
             except Exception:  # pragma: no cover - mirroring must not affect the source
@@ -273,7 +279,7 @@ class SessionMirrorWriter:
             event_type = data.get("type", "")
             # SessionStore re-stamps the event type; preserve all other payload data.
             payload = {k: v for k, v in data.items() if k not in ("type",)}
-            await store.run(store.append_event, agent, event_type, payload)
+            await store.run(append_mirrored, store, agent, event_type, payload)
             # Stamp origin only after persistence. Plain assignment avoids the
             # metadata proxy's byte-coercing ``setdefault`` implementation.
             source_node = getattr(msg, "sender_node", "") or body.get("node_id", "")
@@ -290,7 +296,7 @@ def _agent_from_key(key: str) -> str:
     """Extract the agent namespace from a ``<agent>:e<seq>`` event key."""
     if ":" not in key:
         return "unknown"
-    return key.split(":", 1)[0]
+    return key.rsplit(":e", 1)[0]
 
 
 def _json_safe(value: Any) -> Any:

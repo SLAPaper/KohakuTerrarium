@@ -5,21 +5,23 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from kohakuterrarium.core.agent_state import (
+    submit_internal_session_state,
+    submit_session_state,
+)
 from kohakuterrarium.core.compact_branch import (
     read_agent_events,
     build_compact_metadata,
     persist_compacted_async,
 )
 from kohakuterrarium.core.compact_splice import (
-    is_real_user_message,
-    prefix_fingerprint,
     select_compact_boundary,
     splice_conversation,
 )
+from kohakuterrarium.core.compact_state import apply_compact, capture_compact
 from kohakuterrarium.core.compact_text import (
     COMPACT_PROMPT,
     extract_message_text,
-    format_messages_for_summary,
 )
 from kohakuterrarium.core.conversation_elide import elide_after_compact
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
@@ -65,6 +67,8 @@ class CompactManager:
         self.config = config or CompactConfig()
         self._dispatch = SingleFlightDispatch()
         self._compact_task: asyncio.Task | None = None
+        self._splice_ready = asyncio.Event()
+        self._splice_ready.set()
         self._active_lease: SingleFlightLease | None = None
         self._last_compact_time: float = 0
         self._compact_count: int = 0
@@ -218,6 +222,7 @@ class CompactManager:
             )
 
         self._last_skip_reason = ""
+        self._splice_ready.clear()
         self._compact_task = asyncio.create_task(self._run_compact(lease))
         logger.info(
             "Auto-compact triggered",
@@ -252,16 +257,15 @@ class CompactManager:
                 )
                 return
         self._active_lease = lease
+        self._splice_ready.clear()
         terminal_sent = False
         abort_reason = "aborted"
         try:
-            conversation = self._controller.conversation
-            messages = conversation.get_messages()
-
-            boundary = self._compact_boundary(messages)
-            preferred_boundary = select_compact_boundary(
-                messages, self.config.keep_recent_turns
+            captured = await submit_session_state(
+                self._agent, lambda: capture_compact(self)
             )
+            conversation = captured.conversation
+            boundary = captured.boundary
             if boundary <= 1:
                 logger.debug("Not enough messages to compact")
                 self._emit_compact_skipped(
@@ -271,34 +275,7 @@ class CompactManager:
                 terminal_sent = True
                 return
 
-            # Compact zone: messages[1:boundary] (skip system at index 0)
-            # Live zone: messages[boundary:]
-            compact_messages = messages[1:boundary]
-
-            # The replaced range must reflect the turns this splice actually
-            # kept live (token pressure can move boundary past the window).
-            live_turn_count = self.config.keep_recent_turns
-            if boundary > preferred_boundary:
-                live_turn_count = sum(
-                    1 for m in messages[boundary:] if is_real_user_message(m)
-                )
-                live_turn_count += int(
-                    any(is_real_user_message(m) for m in reversed(messages[1:boundary]))
-                )
-
-            if not compact_messages:
-                self._emit_compact_skipped(
-                    "nothing_to_compact",
-                    "Nothing to compact",
-                )
-                terminal_sent = True
-                return
-
-            # Plugin veto: ``on_compact_start`` is a vetoable callback.
-            # Any plugin returning ``False`` skips this compaction cycle
-            # (e.g. a plugin that just injected critical context).
-            # ``on_compact_end`` will NOT fire in this case.
-            context_length = conversation.get_context_length()
+            context_length = captured.context_length
             if self._plugins is not None:
                 proceed = await self._plugins.should_proceed(
                     "on_compact_start",
@@ -314,20 +291,13 @@ class CompactManager:
                         "Compact vetoed by plugin(s)",
                         agent=self._agent_name,
                     )
-                    # Cooldown applies to vetos too. Without this, the
-                    # next ``should_compact`` call would re-trigger
-                    # immediately on every turn while the conversation
-                    # stays above threshold — wasting LLM/plugin calls
-                    # and emitting a flood of ``compact_skipped`` events.
-                    self._last_compact_time = time.time()
+                    await submit_internal_session_state(
+                        self._agent,
+                        lambda: setattr(self, "_last_compact_time", time.time()),
+                    )
                     return
 
-            # Build the text to summarize
-            summary_input = format_messages_for_summary(compact_messages)
-            expected_fingerprint = prefix_fingerprint(compact_messages)
-
-            # Call LLM to summarize
-            summary = await self._summarize(summary_input)
+            summary = await self._summarize(captured.summary_input)
 
             if not summary:
                 logger.warning(
@@ -350,66 +320,23 @@ class CompactManager:
                 terminal_sent = True
                 return
 
-            # The summarizer ran for a while — /clear, attach, or an
-            # edit flow may have REPLACED the controller's conversation
-            # object. Splicing (and persisting) the captured detached
-            # object would report success without compacting anything.
-            if (
-                self._controller is not None
-                and self._controller.conversation is not conversation
-            ):
-                logger.warning(
-                    "Compact aborted — conversation object replaced "
-                    "while summarizing",
-                    agent=self._agent_name,
-                )
-                self._emit_compact_skipped(
-                    "conversation_replaced",
-                    "Conversation was replaced while summarizing",
-                )
-                terminal_sent = True
-                self._last_compact_time = time.time()
-                return
-
-            # Atomic splice: replace compact zone with summary
-            applied = self._splice_conversation(
-                conversation,
-                boundary,
-                summary,
-                expected_last=compact_messages[-1],
-                expected_fingerprint=expected_fingerprint,
-                retain_latest_user=boundary > preferred_boundary,
+            reason = await submit_internal_session_state(
+                self._agent,
+                lambda: apply_compact(self, captured, summary, elide_after_compact),
             )
-            if not applied:
+            if reason is not None:
                 logger.warning(
-                    "Compact splice aborted — conversation changed shape "
-                    "while summarizing",
+                    "Compact source changed while summarizing",
                     agent=self._agent_name,
+                    reason=reason,
                 )
                 self._emit_compact_skipped(
-                    "conversation_changed",
-                    "Conversation changed while summarizing — will retry later",
+                    reason, "Compact source changed while summarizing"
                 )
                 terminal_sent = True
-                self._last_compact_time = time.time()
                 return
+            self._splice_ready.set()
 
-            self._compact_count += 1
-            self._last_compact_time = time.time()
-            # The next round's usage still measures the pre-splice
-            # prompt — drop it so it can't re-trigger a compact.
-            if self._controller is not None:
-                self._controller._last_usage = {}
-
-            # Compact summarizes the compact zone but leaves the live zone
-            # (recent turns) untouched; elide stale tool results there so
-            # the post-compact prompt actually drops below the threshold.
-            elide_after_compact(self._controller)
-
-            # Notify output for TUI/frontend display. The watermark
-            # persisted below must observe queued turn events and the
-            # compact_complete event queued by the notify, or resume
-            # tail-replays events the compacted snapshot already contains.
             if self._output_router:
                 run = getattr(self._session_store, "run", None)
                 if callable(run):
@@ -420,13 +347,9 @@ class CompactManager:
                 else:
                     events = read_agent_events(self._session_store, self._agent_name)
                 metadata = build_compact_metadata(
-                    self._agent,
+                    captured.branch,
                     events,
-                    # keep_count must be the number of live USER TURNS this
-                    # splice actually retained (under token pressure it is
-                    # smaller than the configured window), so the replaced
-                    # range matches what the summary really covered.
-                    live_turn_count,
+                    captured.live_turn_count,
                     compact_round=self._compact_count,
                     summary=summary,
                     messages_compacted=boundary - 1,
@@ -440,9 +363,6 @@ class CompactManager:
                     await run(lambda: None)
             terminal_sent = True
 
-            # Save conversation snapshot with post-compact version
-            # (The compact_complete event is already recorded by SessionOutput
-            # via notify_activity above — no need to append_event separately.)
             if self._session_store:
                 await persist_compacted_async(
                     self._session_store,
@@ -476,6 +396,7 @@ class CompactManager:
             abort_reason = "error"
             logger.error("Compact failed", agent=self._agent_name, error=str(e))
         finally:
+            self._splice_ready.set()
             if not terminal_sent:
                 try:
                     self._emit_compact_skipped(
@@ -566,8 +487,24 @@ class CompactManager:
             retain_latest_user=retain_latest_user,
         )
 
+    async def wait_for_splice(self) -> None:
+        """Wait until the current summary is applied or skipped, not persisted."""
+        if (
+            self._compact_task is not None
+            and self._compact_task is not asyncio.current_task()
+        ):
+            await self._splice_ready.wait()
+
     async def wait_for_current(self) -> None:
-        """Await the in-flight compact round, if any."""
+        """Join the full round externally; turn-held callers wait for the splice."""
+        current = asyncio.current_task()
+        agent = self._agent
+        if agent is not None and current in (
+            getattr(agent, "_processing_task", None),
+            getattr(agent, "_turn_lock_holder", None),
+        ):
+            await self.wait_for_splice()
+            return
         task = self._compact_task
         if task is not None and not task.done():
             try:
@@ -583,6 +520,7 @@ class CompactManager:
                 await self._compact_task
             except (asyncio.CancelledError, Exception):
                 pass
+        self._splice_ready.set()
         self._dispatch.force_release()
         self._active_lease = None
         self._compact_task = None

@@ -12,7 +12,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import kohakuterrarium.terrarium.drive.runtime as runtime_module
+from kohakuterrarium import Terrarium
+from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.core.turn import TurnResult
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.terrarium.drive.config import (
     DriveRuntimeConfig,
     default_registrations,
@@ -692,6 +696,66 @@ class _BlockingCreature:
 
 
 class TestReconcileDrain:
+    @pytest.mark.parametrize("stage", ["schedule", "restoration", "recovery"])
+    @pytest.mark.parametrize("same_graph", [True, False])
+    async def test_uncertain_peer_does_not_rearm_graph_after_await(
+        self, tmp_path, monkeypatch, stage, same_graph
+    ):
+        async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+            first = await engine.add_creature(
+                AgentConfig(name="first"),
+                llm=ScriptedLLM(["first"]),
+                io="headless",
+                start=True,
+            )
+            peer = await engine.add_creature(
+                AgentConfig(name="peer"),
+                graph=first.graph_id if same_graph else None,
+                llm=ScriptedLLM(["peer"]),
+                io="headless",
+                start=True,
+            )
+            runtime, gid = engine._drive_runtime, first.graph_id
+            await runtime.detach_graph(gid)
+            await runtime.bind_graph_store(gid, first.agent.session_store)
+            entered, release = asyncio.Event(), asyncio.Event()
+            original_wait = first.wait_restoration_ready
+            recover = runtime_module.recover_split_intents
+
+            async def held_restoration():
+                await original_wait()
+                entered.set()
+                await release.wait()
+
+            async def held_recovery(path):
+                entered.set()
+                await release.wait()
+                await recover(path)
+
+            if stage == "schedule":
+                peer.agent._session_attach_uncertain = True
+            elif stage == "restoration":
+                monkeypatch.setattr(first, "wait_restoration_ready", held_restoration)
+            else:
+                monkeypatch.setattr(
+                    runtime_module, "recover_split_intents", held_recovery
+                )
+            try:
+                runtime.schedule_reconcile(first)
+                tasks = tuple(runtime._reconcile_tasks.get(gid, ()))
+                if stage != "schedule":
+                    await asyncio.wait_for(entered.wait(), 5)
+                    peer.agent._session_attach_uncertain = True
+                    release.set()
+                if tasks:
+                    await asyncio.wait_for(asyncio.gather(*tasks), 5)
+                manager = runtime.peek_manager(gid)
+                assert (manager.dispatcher._task is None) == same_graph
+                assert (gid in runtime._registry._ready_graphs) != same_graph
+                assert peer.agent._session_attach_uncertain
+            finally:
+                release.set()
+
     async def test_stop_cancels_and_awaits_reconcile_tasks(self):
         # A reconcile task pending at teardown must be cancelled AND awaited so it
         # never calls a repository whose executor the store close is about to shut.

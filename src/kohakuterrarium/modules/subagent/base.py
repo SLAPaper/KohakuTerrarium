@@ -24,6 +24,7 @@ from kohakuterrarium.modules.plugin.base import (
 )
 from kohakuterrarium.modules.plugin.manager import PluginManager
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
+from kohakuterrarium.modules.subagent.persistence import save_result
 from kohakuterrarium.modules.subagent.result import (  # noqa: F401
     SUBAGENT_FRAMEWORK_HINTS,
     SubAgentJob,
@@ -72,7 +73,9 @@ class SubAgent:
 
         self._session_store: Any = None
         self._parent_name: str = ""
-        self._run_index: int = 0
+        self._run_index: int | None = None
+        self._run_receipt = None
+        self._canonical_saved = False
         self._job_id: str = ""
 
         # A shared budget coordinates parent and child iteration limits when configured.
@@ -204,19 +207,19 @@ class SubAgent:
 
         try:
             if self.config.timeout > 0:
-                return await asyncio.wait_for(
+                result = await asyncio.wait_for(
                     self._run_internal(task),
                     timeout=self.config.timeout,
                 )
             else:
-                return await self._run_internal(task)
+                result = await self._run_internal(task)
         except asyncio.TimeoutError:
             logger.warning(
                 "Sub-agent timed out",
                 subagent_name=self.config.name,
                 timeout=self.config.timeout,
             )
-            return SubAgentResult(
+            result = SubAgentResult(
                 success=False,
                 error=f"Timed out after {self.config.timeout}s",
                 turns=self._turns,
@@ -232,7 +235,7 @@ class SubAgent:
                 subagent_name=self.config.name,
                 error=str(e),
             )
-            return SubAgentResult(
+            result = SubAgentResult(
                 success=False,
                 error=str(e),
                 turns=self._turns,
@@ -244,6 +247,8 @@ class SubAgent:
             )
         finally:
             self._running = False
+        await save_result(self, result)
+        return result
 
     async def _run_internal(self, task: str) -> SubAgentResult:
         """Internal run logic. Runs conversation loop with tool execution."""
@@ -575,37 +580,8 @@ class SubAgent:
     def _build_result(
         self, output_parts: list[str], tools_used: list[str]
     ) -> SubAgentResult:
-        """Build the final SubAgentResult, saving conversation if possible."""
+        """Build the final SubAgentResult from collected output and usage."""
         final_output = "".join(output_parts).strip()
-
-        if self._session_store:
-            try:
-                self._session_store.save_subagent(
-                    parent=self._parent_name,
-                    name=self.config.name,
-                    run=self._run_index,
-                    meta={
-                        "job_id": self._job_id,
-                        "task": (
-                            self.conversation.to_messages()[1].get("content", "")
-                            if len(self.conversation.to_messages()) > 1
-                            else ""
-                        ),
-                        "turns": self._turns,
-                        "tools_used": tools_used,
-                        "success": True,
-                        "duration": self._calculate_duration(),
-                        "output_preview": final_output[:500],
-                    },
-                    conv_json=self.conversation.to_json(),
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to save sub-agent conversation",
-                    subagent=self.config.name,
-                    error=str(e),
-                    exc_info=True,
-                )
 
         return SubAgentResult(
             output=final_output,

@@ -4,6 +4,7 @@ import shutil
 import sqlite3
 import uuid
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,16 @@ from kohakuvault import KVault
 
 from kohakuterrarium.session.artifacts import artifacts_dir_for
 from kohakuterrarium.session.errors import ForkNotStableError
+from kohakuterrarium.session.event_origin import (
+    STORE_UUID,
+    EVENT_ORIGIN,
+    capture_events,
+    row_origin,
+    store_uuid,
+)
 from kohakuterrarium.session.store_protocol import SessionStoreLike
 from kohakuterrarium.session.identity import new_conversation_id
+from kohakuterrarium.session.subagent_lineage import PREFIX as CHILD_LINEAGE_PREFIX
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -292,6 +301,7 @@ def perform_fork(
     if target.exists():
         raise FileExistsError(target)
 
+    source_uuid, _ = capture_events(source)
     created_at = datetime.now(timezone.utc).isoformat()
     parent_meta: dict[str, Any] = {}
     for key_bytes in source.meta.keys(limit=2**31 - 1):
@@ -313,7 +323,7 @@ def perform_fork(
     try:
         # Child identity and lineage replace parent-local metadata after copying.
         for key, value in parent_meta.items():
-            if key in ("forked_children",):
+            if key in ("forked_children", STORE_UUID):
                 # Child discovery records belong only to the parent.
                 continue
             try:
@@ -326,6 +336,7 @@ def perform_fork(
                     exc_info=True,
                 )
 
+        child_uuid = store_uuid(dest)
         dest.meta["session_id"] = child_session_id
         dest.meta["conversation_id"] = new_conversation_id()
         dest.meta["created_at"] = created_at
@@ -347,7 +358,7 @@ def perform_fork(
         mutated_fork_event: dict[str, Any] | None = None
         if mutate is not None and fork_point_event is not None:
             try:
-                result = mutate(dict(fork_point_event))
+                result = mutate(deepcopy(fork_point_event))
             except Exception as exc:
                 raise RuntimeError(f"Fork mutate callable raised: {exc}") from exc
             if result is None:
@@ -360,36 +371,31 @@ def perform_fork(
                     f"got {type(result).__name__}"
                 )
 
-        event_keys = [key for key, _ in in_range]
-        fork_point_key: str | None = None
-        if fork_point_event is not None:
-            for key, evt in in_range:
-                if evt.get("event_id") == at_event_id:
-                    fork_point_key = key
-                    break
-
-        if mutate is None or fork_point_event is None:
-            _copy_table(source.events, dest.events, keys=event_keys)
-        else:
-            # Reinsert the fork point only when the mutator returns an event.
-            for key in event_keys:
-                if key == fork_point_key:
+        for key, original in in_range:
+            payload = deepcopy(original)
+            changed = mutate is not None and original.get("event_id") == at_event_id
+            if changed:
+                if mutated_fork_event is None:
                     continue
-                try:
-                    dest.events[key] = source.events[key]
-                except Exception as e:
-                    logger.warning(
-                        "Fork failed to copy non-fork event",
-                        key=key,
-                        error=str(e),
-                        exc_info=True,
-                    )
-            if mutated_fork_event is not None and fork_point_key is not None:
-                # Preserve replay-critical identity when the mutator omits it.
-                payload = dict(mutated_fork_event)
+                payload = deepcopy(mutated_fork_event)
                 payload.setdefault("event_id", at_event_id)
-                payload.setdefault("type", fork_point_event.get("type", "user_message"))
-                dest.events[fork_point_key] = payload
+                payload.setdefault("type", original.get("type", "user_message"))
+                if (
+                    payload["event_id"] != at_event_id
+                    or type(payload["event_id"]) is not int
+                ):
+                    raise ValueError("Fork mutation cannot change the event ID")
+                changed = {k: v for k, v in payload.items() if k != EVENT_ORIGIN} != {
+                    k: v for k, v in original.items() if k != EVENT_ORIGIN
+                }
+            namespace = _decode_key(key).rsplit(":e", 1)[0]
+            origin = (
+                (child_uuid, namespace, at_event_id)
+                if changed
+                else row_origin(source_uuid, namespace, original)
+            )
+            payload[EVENT_ORIGIN] = list(origin)
+            dest.events[key] = payload
 
         # Snapshot markers and conversation caches may include post-fork events,
         # so the child must rebuild conversation state from its truncated log.
@@ -397,6 +403,7 @@ def perform_fork(
             k
             for k in _iter_keys(source.state)
             if not k.endswith((":snapshot_event_id", ":snapshot_branch"))
+            and not k.startswith(CHILD_LINEAGE_PREFIX)
         ]
         _copy_table(source.state, dest.state, keys=state_keys)
         _copy_table(source.channels, dest.channels)

@@ -7,6 +7,9 @@ defensive exception arms and the rarely-hit field-preservation branches
 
 from types import SimpleNamespace
 
+import pytest
+
+from kohakuterrarium.session.event_origin import STORE_UUID
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium import session_coord as sc
 from kohakuterrarium.terrarium.topology import TopologyDelta
@@ -17,9 +20,8 @@ from kohakuterrarium.terrarium.topology import TopologyDelta
 
 
 class TestCopyEventsIntoBranches:
-    def test_flush_cache_failure_is_tolerated(self, tmp_path):
-        """A source store whose ``flush_cache`` raises is still copied —
-        the flush failure is swallowed by ``copy_events_into``."""
+    def test_flush_cache_failure_prevents_origin_capture(self, tmp_path):
+        """A failed source flush prevents partial origin activation and import."""
         src = SessionStore(str(tmp_path / "src.kohakutr"))
         dst = SessionStore(str(tmp_path / "dst.kohakutr"))
         try:
@@ -39,21 +41,24 @@ class TestCopyEventsIntoBranches:
                 def __getattr__(self, name):
                     return getattr(self._real, name)
 
+                def __getitem__(self, key):
+                    return self._real[key]
+
                 def flush_cache(self):
                     if not self._failed:
                         self._failed = True
                         raise RuntimeError("cache wedged")
                     return self._real.flush_cache()
 
-            # The source's first flush_cache raises; copy_events_into
-            # must swallow it rather than propagating — the copy still
-            # completes (the data was already flushed at line 15).
             object.__setattr__(src, "events", _FlushFailEvents(src.events))
+            with pytest.raises(RuntimeError, match="cache wedged"):
+                sc.copy_events_into(src, dst)
+            assert dst.submit(dst.get_events, "alice").result() == []
             n = sc.copy_events_into(src, dst)
-            # No crash; the swallowed-flush path returns a real count.
-            assert isinstance(n, int)
-            assert n >= 0
+            assert n == 1
+            assert dst.submit(dst.get_events, "alice").result()[0]["content"] == "hi"
         finally:
+            src.close()
             dst.close()
 
     def test_parent_branch_path_tuples_preserved(self, tmp_path):
@@ -102,9 +107,20 @@ class _MetaFailStore:
 
     @property
     def meta(self):
+        real = self._real.meta
+
         class _FailingMeta:
+            def flush_cache(self):
+                return real.flush_cache()
+
+            def get(self, key):
+                return real.get(key)
+
             def __setitem__(self, k, v):
-                raise RuntimeError("meta unwritable")
+                if k == STORE_UUID:
+                    real[k] = v
+                else:
+                    raise RuntimeError("meta unwritable")
 
         return _FailingMeta()
 

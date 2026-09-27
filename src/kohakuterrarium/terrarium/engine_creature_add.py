@@ -13,6 +13,7 @@ import kohakuterrarium.terrarium.graph_identity_engine as _identity
 import kohakuterrarium.terrarium.topology as _topo
 import kohakuterrarium.terrarium.wiring as _wiring
 from kohakuterrarium.core.environment import Environment
+from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.creature_host import (
     Creature,
@@ -78,6 +79,7 @@ async def add_creature(
     try:
         _identity.guard_add_name(engine, creature, graph_id)
         if graph_id is not None:
+            _guard_member_bindings(engine, graph_id)
             await _checkpoint.preflight_add(
                 engine,
                 graph_id,
@@ -85,6 +87,8 @@ async def add_creature(
                 will_persist=session is not False
                 and (session is not None or engine._session_dir is not None),
             )
+        if graph_id is not None:
+            _guard_member_bindings(engine, graph_id)
         gid = _topo.add_creature(
             engine._topology, creature.creature_id, graph_id=graph_id
         )
@@ -147,6 +151,13 @@ async def add_creature(
             await cleanup
             raise
         raise
+
+
+def _guard_member_bindings(engine, graph_id):
+    """Reject insertion while graph members reserve their session or model binding."""
+    for creature in engine._creatures.values():
+        if creature.graph_id == graph_id:
+            require_model_mutation_available(creature.agent)
 
 
 def _prepare_creature(

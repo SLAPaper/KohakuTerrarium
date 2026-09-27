@@ -369,13 +369,8 @@ class TestForkDriveTablePurge:
         finally:
             s.close()
 
-    def test_fork_skips_malformed_events_in_scan(self, tmp_path):
-        """Contract: the fork range-scan tolerates a corrupt events
-        table — an event value that isn't a dict, and a dict event with
-        a non-int ``event_id``, are both skipped, while the well-formed
-        events still fork. Drives the malformed-event guard branches in
-        ``_collect_copy_range`` (a corrupt ``.kohakutr`` must not crash
-        a fork)."""
+    def test_fork_rejects_unprovable_event_origins(self, tmp_path):
+        """Corrupt rows prevent provenance activation rather than silently vanishing."""
         s = _store(tmp_path)
         try:
             s.append_event("alice", "user_message", {"content": "good"})
@@ -386,14 +381,11 @@ class TestForkDriveTablePurge:
             s.events["alice:no-event-id"] = {"type": "x", "event_id": "oops"}
             s.events.flush_cache()
 
-            child = perform_fork(s, str(tmp_path / "child.kohakutr"), at_event_id=1)
-            try:
-                evts = child.get_events("alice")
-                # Only the one well-formed event survived the fork.
-                assert len(evts) == 1
-                assert evts[0]["content"] == "good"
-            finally:
-                child.close(update_status=False)
+            target = tmp_path / "child.kohakutr"
+            with pytest.raises(ValueError, match="Invalid event"):
+                perform_fork(s, str(target), at_event_id=1)
+            assert not target.exists()
+            assert s.get_events("alice")[0]["content"] == "good"
         finally:
             s.close()
 

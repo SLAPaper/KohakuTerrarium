@@ -8,6 +8,7 @@ from typing import Any, AsyncIterator, Callable, Protocol, runtime_checkable
 
 from kohakuterrarium.llm.message import Message
 from kohakuterrarium.llm.recovery import RetryPolicy, drop_last_tool_round
+from kohakuterrarium.llm.recovery_scope import active_recovery
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -146,6 +147,7 @@ class BaseLLMProvider:
 
     # An empty name deliberately prevents provider-native tool compatibility.
     provider_name: str = ""
+    supports_scoped_recovery: bool = True
 
     # Supported native tools auto-register unless the creature explicitly disables them.
     provider_native_tools: frozenset[str] = frozenset()
@@ -163,6 +165,12 @@ class BaseLLMProvider:
         self, current: list[dict[str, Any]] | None = None
     ) -> list[dict[str, Any]] | None:
         """Request compacted context, rejecting rescues that do not shrink it."""
+        scope = active_recovery(self, current)
+        if scope is not None:
+            rescued = await scope.rescue(current)
+            if rescued is not None:
+                scope.messages = rescued
+            return rescued
         rescue = getattr(self, "_overflow_rescue", None)
         if rescue is None:
             return None
@@ -198,6 +206,10 @@ class BaseLLMProvider:
             state.drop_attempted = True
             dropped, recovered = drop_last_tool_round(current)
             if dropped:
+                scope = active_recovery(self, current)
+                if scope is not None:
+                    await scope.commit(current, recovered)
+                    scope.messages = recovered
                 self._notify_emergency_drop(recovered)
                 logger.warning(
                     "provider_emergency_drop",

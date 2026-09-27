@@ -16,6 +16,8 @@ from kohakuterrarium.core.agent_construct import AgentConstructMixin
 from kohakuterrarium.core.agent_event_loop import AgentEventLoopMixin
 from kohakuterrarium.core.agent_extensions import AgentExtensionsMixin
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
+from kohakuterrarium.core.session_attachment import attach_explicit
+from kohakuterrarium.modules.subagent.persistence import bind_children
 from kohakuterrarium.core.agent_turn import AgentTurnMixin
 from kohakuterrarium.core.agent_handlers import AgentHandlersMixin
 from kohakuterrarium.core.agent_lifecycle import AgentLifecycleMixin
@@ -221,7 +223,9 @@ class Agent(
         # Order matters: output before controller (need known_outputs for parser)
         with package_snapshot():
             self._init_llm()
-            if hasattr(self.llm, "on_emergency_drop"):
+            if hasattr(self.llm, "on_emergency_drop") and not getattr(
+                self.llm, "supports_scoped_recovery", False
+            ):
                 self.llm.on_emergency_drop(self._on_provider_emergency_drop)
             self._init_registry()
             self._init_executor()
@@ -846,12 +850,11 @@ class Agent(
     def attach_session_store(
         self, store: Any, *, capture_activity: bool = True
     ) -> None:
-        """Attach a SessionStore; registers a SessionOutput sink.
+        """Attach a store while idle, rejecting before any binding changes."""
+        attach_explicit(self, store, capture_activity=capture_activity)
 
-        Wires scratchpad + plugin-hook observers so Wave B
-        ``scratchpad_write`` / ``plugin_hook_timing`` events flow.
-        """
-        require_model_mutation_available(self)
+    def _bind_session_store(self, store: Any, *, capture_activity: bool = True) -> None:
+        """Install a store after explicit admission or inside topology handoff."""
         self.session_store = store
         # Controller needs direct access for artifact writes.
         if hasattr(self, "controller") and self.controller is not None:
@@ -869,8 +872,7 @@ class Agent(
         else:
             self._session_output._capture_activity = capture_activity
         if hasattr(self, "subagent_manager"):
-            self.subagent_manager._session_store = store
-            self.subagent_manager._parent_name = self.config.name
+            bind_children(self.subagent_manager, store, self.config.name)
         self.trigger_manager._session_store = store
         self.trigger_manager._agent_name = self.config.name
         # Terrariums attach the store AFTER agent.start() (creatures),

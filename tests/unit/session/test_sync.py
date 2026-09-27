@@ -3,10 +3,12 @@
 import asyncio
 import base64
 import logging
+from uuid import uuid4
 
 import pytest
 
 from kohakuterrarium.laboratory._internal.app import AppMessage
+from kohakuterrarium.session.event_origin import EVENT_ORIGIN, STORE_UUID, store_uuid
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.sync import (
     NAMESPACE,
@@ -269,6 +271,75 @@ class TestSessionMirrorWriter:
             if "append failed" in r.getMessage() and session_id in r.getMessage()
         ]
         assert not mine, mine
+
+    async def test_mirror_keeps_physical_identity_and_attached_event_origin(
+        self, tmp_path
+    ):
+        writer = SessionMirrorWriter(_FakeNode(), tmp_path / "mirror")
+        source_uuid = str(uuid4())
+        namespace = "alice:attached:peer"
+        origin = [source_uuid, namespace, 4]
+        try:
+            store = writer.store_for("origin-session")
+            local_uuid = await store.run(store_uuid, store)
+            writer._apply_meta(
+                {"session_id": "origin-session", "meta": {STORE_UUID: source_uuid}}
+            )
+            await writer._dispatch(
+                AppMessage(
+                    namespace=NAMESPACE,
+                    type="event",
+                    body={
+                        "session_id": "origin-session",
+                        "key": f"{namespace}:e000000",
+                        "data": {
+                            "type": "user_message",
+                            "event_id": 4,
+                            "content": "mirrored",
+                            EVENT_ORIGIN: origin,
+                        },
+                    },
+                    sender_node="worker",
+                    request_id=None,
+                    in_reply_to=None,
+                )
+            )
+            assert store.meta[STORE_UUID] == local_uuid != source_uuid
+            rows = await store.run(store.get_events, namespace)
+            assert len(rows) == 1 and rows[0][EVENT_ORIGIN] == origin
+        finally:
+            writer.close()
+
+    @pytest.mark.parametrize("marked", [False, True])
+    async def test_mirror_redelivery_preserves_unique_preset_ids(
+        self, tmp_path, marked
+    ):
+        writer = SessionMirrorWriter(_FakeNode(), tmp_path / "mirror")
+        try:
+            store = writer.store_for("repeat")
+            await store.run(store_uuid, store)
+            row = {"type": "user_message", "event_id": 3, "content": "once"}
+            if marked:
+                row[EVENT_ORIGIN] = [str(uuid4()), "alice", 10]
+            message = AppMessage(
+                namespace=NAMESPACE,
+                type="event",
+                body={
+                    "session_id": "repeat",
+                    "key": "alice:e000000",
+                    "data": row,
+                },
+                sender_node="worker",
+                request_id=None,
+                in_reply_to=None,
+            )
+            await writer._dispatch(message)
+            await writer._dispatch(message)
+            rows = await store.run(store.get_events, "alice")
+            assert [event["event_id"] for event in rows] == [3]
+            assert rows[0]["content"] == "once"
+        finally:
+            writer.close()
 
     async def test_dispatch_applies_meta(self, tmp_path):
         # A ``meta`` message initialises the mirror store's meta from

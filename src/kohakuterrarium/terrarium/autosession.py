@@ -22,6 +22,10 @@ from typing import TYPE_CHECKING, Any
 from kohakuterrarium.core.config import AgentConfig
 from kohakuterrarium.core.config_serde import pack_agent_config
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.terrarium.session_resources import (
+    close_retained_stores,
+    release_failed_store,
+)
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.fs_path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
@@ -222,8 +226,7 @@ async def attach_for_new_creature(
         agents=[creature.name],
         session_id=creature.creature_id,
     )
-    engine._owned_sessions.add(gid)
-    await engine.attach_session(gid, store)
+    await _attach_minted(engine, gid, store)
     return store
 
 
@@ -273,9 +276,21 @@ async def attach_for_recipe(
         config_path=str(recipe) if isinstance(recipe, (str, Path)) else "",
         agents=names,
     )
-    engine._owned_sessions.add(graph_id)
-    await engine.attach_session(graph_id, store)
+    await _attach_minted(engine, graph_id, store)
     return store
+
+
+async def _attach_minted(engine, graph_id, store):
+    """Retain ownership only after the minted store becomes the graph binding."""
+    try:
+        await engine.attach_session(graph_id, store)
+    except BaseException:
+        if engine._session_stores.get(graph_id) is store:
+            engine._owned_sessions.add(graph_id)
+        else:
+            release_failed_store(engine, store)
+        raise
+    engine._owned_sessions.add(graph_id)
 
 
 def recipe_session_reuses_store(
@@ -315,5 +330,6 @@ def close_owned_stores(engine: "Terrarium") -> None:
                 graph_id=gid,
                 error=str(exc),
             )
+    close_retained_stores(engine)
     engine._owned_sessions.clear()
     engine._session_stores.clear()

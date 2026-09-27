@@ -11,6 +11,7 @@ the two graphs and pairs the caller as the counterparty (caller sends
 when target listens; caller listens when target sends).
 """
 
+from copy import deepcopy
 from typing import Any
 
 import kohakuterrarium.terrarium.channel_lifecycle as _lifecycle
@@ -24,6 +25,7 @@ from kohakuterrarium.modules.tool.base import (
     ToolResult,
 )
 from kohakuterrarium.terrarium.events import EngineEvent, EventKind
+from kohakuterrarium.terrarium.session_subagent_state import preflight_child_split
 from kohakuterrarium.terrarium.group_tool_context import (
     GroupContext,
     cross_cluster_target_error,
@@ -233,10 +235,20 @@ async def _unwire(
             f"available: {sorted(graph.channels)}"
         )
 
+    projected = deepcopy(gctx.engine._topology)
+    projected_graph = projected.graphs[graph.graph_id]
     if direction == "listen":
-        _topo.set_listen(
-            gctx.engine._topology, target.creature_id, channel, listening=False
-        )
+        _topo.set_listen(projected, target.creature_id, channel, listening=False)
+    else:
+        _topo.set_send(projected, target.creature_id, channel, sending=False)
+    delta = _topo._normalize_components(
+        projected,
+        projected_graph,
+        affected={gctx.caller.creature_id, target.creature_id},
+    )
+    preflight_child_split(gctx.engine, projected, delta)
+    gctx.engine._topology = projected
+    if direction == "listen":
         _channels.remove_channel_trigger(
             target.agent,
             subscriber_id=target.name,
@@ -245,20 +257,12 @@ async def _unwire(
         if channel in target.listen_channels:
             target.listen_channels.remove(channel)
     else:
-        _topo.set_send(
-            gctx.engine._topology, target.creature_id, channel, sending=False
-        )
         if channel in target.send_channels:
             target.send_channels.remove(channel)
 
     # Removing one direction may split the graph. Paired-edge disconnect would
     # remove too much, so normalize connectivity after the single-edge change and
     # apply the standard split bookkeeping. Otherwise emit to refresh both prompts.
-    delta = _topo._normalize_components(
-        gctx.engine._topology,
-        graph,
-        affected={gctx.caller.creature_id, target.creature_id},
-    )
     if delta.kind == "split":
         _lifecycle.apply_split_bookkeeping(gctx.engine, delta)
         for graph_id in delta.new_graph_ids:

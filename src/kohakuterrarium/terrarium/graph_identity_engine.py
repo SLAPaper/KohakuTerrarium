@@ -11,6 +11,7 @@ from kohakuterrarium.terrarium.graph_identity import (
     ensure_graph_name_available,
 )
 from kohakuterrarium.terrarium.session_plugin_state import validate_graph_plugin_state
+from kohakuterrarium.terrarium.session_subagent_state import preflight_child_merge
 
 if TYPE_CHECKING:
     from kohakuterrarium.terrarium.creature_host import Creature, CreatureRef
@@ -123,4 +124,5 @@ def resolve_and_guard_connect(
                 name=alias,
                 creature_ids=creature_ids,
             )
+        preflight_child_merge(engine, (sender_graph_id, receiver_graph_id))
     return sender_creature, receiver_creature

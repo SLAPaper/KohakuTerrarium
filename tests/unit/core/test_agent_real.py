@@ -3613,9 +3613,9 @@ class TestDispatchSubAgentEventDirect:
 
         agent = make_agent()
 
-        async def fake_spawn(event):
+        async def fake_spawn(event, *, job_id, completion_context):
             # Return job_id + is_background tuple.
-            jid = "agent_x_42"
+            jid = job_id
             # Inject a real-ish task that's already done.
             done = asyncio.Future()
             done.set_result(None)
@@ -3639,6 +3639,19 @@ class TestDispatchSubAgentEventDirect:
             handles = {}
             order = []
             tcids = {}
+            await agent._submit_session_state(
+                lambda: agent.controller.conversation.append(
+                    "assistant",
+                    "",
+                    tool_calls=[
+                        {
+                            "id": "call_99",
+                            "type": "function",
+                            "function": {"name": "explore", "arguments": "{}"},
+                        }
+                    ],
+                )
+            )
             await agent._dispatch_subagent_event(
                 evt, agent.controller, handles, order, tcids, True
             )
@@ -5127,7 +5140,8 @@ class TestAttachSessionStoreCompactCount:
         # Now start to bring up compact_manager and rewire.
         await agent.start()
         try:
-            # Re-attach to exercise the compact_count restore branch.
+            # Re-attach after the startup publications settle.
+            await agent._session_output.flush()
             agent.attach_session_store(store)
             assert agent.compact_manager._compact_count == 5
         finally:

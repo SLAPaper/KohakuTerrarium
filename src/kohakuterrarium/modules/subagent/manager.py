@@ -13,6 +13,12 @@ from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.llm.base import LLMProvider
 from kohakuterrarium.modules.subagent.base import SubAgent, SubAgentJob, SubAgentResult
 from kohakuterrarium.modules.subagent.config import SubAgentConfig, SubAgentInfo
+from kohakuterrarium.modules.subagent.persistence import (
+    patch_result,
+    result_metadata,
+    save_result,
+    settle,
+)
 from kohakuterrarium.modules.subagent.runtime_builders import (
     build_compact_manager,
     build_plugin_manager,
@@ -220,8 +226,9 @@ class SubAgentManager(InteractiveManagerMixin):
         if self._session_store:
             subagent._session_store = self._session_store
             subagent._parent_name = self._parent_name
-            subagent._run_index = self._session_store.next_subagent_run(
-                self._parent_name, name
+            subagent._run_index = None
+            subagent._run_receipt = self._session_store.submit(
+                self._session_store.next_subagent_run, self._parent_name, name
             )
 
         job = SubAgentJob(subagent, job_id)
@@ -255,15 +262,22 @@ class SubAgentManager(InteractiveManagerMixin):
         return job_id
 
     def _finalize_cancelled_task(self, job_id: str, task: asyncio.Task) -> None:
-        """Record cancellation when the runner never produced a result."""
+        """Settle runner failures that escaped result construction or persistence."""
+        cancelled = task.cancelled()
+        failure = None if cancelled else task.exception()
         status = self.job_store.get_status(job_id)
-        if not task.cancelled() or status is None or status.state != JobState.RUNNING:
+        if status is None or status.state != JobState.RUNNING:
             return
-        error = "Sub-agent was cancelled before execution."
-        self._results[job_id] = SubAgentResult(
-            success=False, error=error, cancelled=True
+        if not cancelled and failure is None:
+            return
+        error = (
+            "Sub-agent was cancelled before execution." if cancelled else str(failure)
         )
-        self.job_store.update_status(job_id, state=JobState.CANCELLED, error=error)
+        self._results[job_id] = SubAgentResult(
+            success=False, error=error, cancelled=cancelled
+        )
+        state = JobState.CANCELLED if cancelled else JobState.ERROR
+        self.job_store.update_status(job_id, state=state, error=error)
 
     def record_rejection(
         self, name: str, job_id: str, error: str, context: dict
@@ -308,38 +322,16 @@ class SubAgentManager(InteractiveManagerMixin):
         )
         return job_id, is_background
 
-    def _update_persisted_result(self, job_id: str, result: SubAgentResult) -> None:
+    async def _update_persisted_result(
+        self, job_id: str, result: SubAgentResult
+    ) -> None:
         """Keep canonical persisted metadata aligned with transformed results."""
         store = self._session_store
-        find_run = (
-            getattr(store, "find_subagent_run", None) if store is not None else None
-        )
-        if not callable(find_run):
-            return
-        row = find_run(job_id, parent=self._parent_name)
-        if row is None:
-            return
-        meta = dict(row.get("meta") or {})
-        meta.update(
-            {
-                "success": result.success,
-                "error": result.error,
-                "interrupted": result.interrupted,
-                "cancelled": result.cancelled,
-                "turns": result.turns,
-                "duration": result.duration,
-                "total_tokens": result.total_tokens,
-                "prompt_tokens": result.prompt_tokens,
-                "completion_tokens": result.completion_tokens,
-                "cached_tokens": result.cached_tokens,
-            }
-        )
-        store.save_subagent(
-            parent=str(row["parent"]),
-            name=str(row["name"]),
-            run=int(row["run"]),
-            meta=meta,
-        )
+        if store is not None:
+            receipt = store.submit(
+                patch_result, store, self._parent_name, job_id, result_metadata(result)
+            )
+            await settle(receipt)
 
     @staticmethod
     def _stamp_model_metadata(result: SubAgentResult, subagent: SubAgent) -> None:
@@ -361,6 +353,11 @@ class SubAgentManager(InteractiveManagerMixin):
     ) -> SubAgentResult:
         """Run sub-agent and update status."""
         try:
+            receipt = getattr(job.subagent, "_run_receipt", None)
+            if receipt is not None:
+                await settle(
+                    receipt, lambda value: setattr(job.subagent, "_run_index", value)
+                )
             await load_and_wrap_plugins(
                 job.subagent.plugins, job.subagent, job.subagent.llm, self.agent_path
             )
@@ -385,7 +382,9 @@ class SubAgentManager(InteractiveManagerMixin):
                         exc_info=True,
                     )
             self._stamp_model_metadata(result, job.subagent)
-            self._update_persisted_result(job_id, result)
+            if not job.subagent._canonical_saved:
+                await save_result(job.subagent, result)
+            await self._update_persisted_result(job_id, result)
             self._results[job_id] = result
 
             if result.interrupted or result.cancelled:
@@ -424,6 +423,7 @@ class SubAgentManager(InteractiveManagerMixin):
             else:
                 result = SubAgentResult(success=False, error=error_msg, cancelled=True)
             self._stamp_model_metadata(result, job.subagent)
+            await save_result(job.subagent, result)
             self._results[job_id] = result
             self.job_store.update_status(
                 job_id,
@@ -440,6 +440,7 @@ class SubAgentManager(InteractiveManagerMixin):
             else:
                 result = SubAgentResult(success=False, error=str(e))
             self._stamp_model_metadata(result, job.subagent)
+            await save_result(job.subagent, result)
             self._results[job_id] = result
             self.job_store.update_status(
                 job_id,

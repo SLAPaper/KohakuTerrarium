@@ -7,6 +7,8 @@ budget, and surfaces failures as a failed SubAgentResult rather than
 raising.
 """
 
+import pytest
+
 from kohakuterrarium.core.budget import IterationBudget
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.modules.plugin.base import BasePlugin, ToolVisibility
@@ -14,6 +16,7 @@ from kohakuterrarium.modules.plugin.manager import PluginManager
 from kohakuterrarium.modules.subagent.base import SubAgent
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.tool.base import BaseTool, ToolConfig, ToolResult
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 
@@ -649,23 +652,27 @@ class TestTokenAccounting:
 
 
 class TestSessionStorePersistence:
-    async def test_conversation_saved_to_session_store_on_success(self):
+    async def test_conversation_saved_to_session_store_on_success(self, tmp_path):
         saved: list[dict] = []
 
-        class _FakeStore:
+        class _FakeStore(SessionStore):
             def save_subagent(self, **kwargs):
                 saved.append(kwargs)
+                super().save_subagent(**kwargs)
 
         sa = SubAgent(
             SubAgentConfig(name="explore", max_turns=1),
             _registry(),
             ScriptedLLM(["found it"]),
         )
-        sa._session_store = _FakeStore()
+        sa._session_store = _FakeStore(tmp_path / "child.kohakutr")
         sa._parent_name = "controller"
         sa._run_index = 2
         sa._job_id = "agent_explore_12345678"
-        result = await sa.run("find the bug")
+        try:
+            result = await sa.run("find the bug")
+        finally:
+            sa._session_store.close()
         assert result.success is True
         # The sub-agent conversation was persisted with the right lineage.
         assert len(saved) == 1
@@ -674,12 +681,13 @@ class TestSessionStorePersistence:
         assert saved[0]["run"] == 2
         assert saved[0]["meta"]["job_id"] == "agent_explore_12345678"
 
-    async def test_conversation_preserves_reasoning_extra_fields(self):
+    async def test_conversation_preserves_reasoning_extra_fields(self, tmp_path):
         saved: list[dict] = []
 
-        class _FakeStore:
+        class _FakeStore(SessionStore):
             def save_subagent(self, **kwargs):
                 saved.append(kwargs)
+                super().save_subagent(**kwargs)
 
         class _ReasoningLLM:
             model = "reasoning"
@@ -705,16 +713,19 @@ class TestSessionStorePersistence:
             _registry(),
             _ReasoningLLM(),
         )
-        sa._session_store = _FakeStore()
+        sa._session_store = _FakeStore(tmp_path / "child.kohakutr")
         sa._parent_name = "controller"
         sa._run_index = 2
-        await sa.run("find the bug")
+        try:
+            await sa.run("find the bug")
+        finally:
+            sa._session_store.close()
         conv_json = saved[0]["conv_json"]
         assert '"reasoning_content"' in conv_json
         assert '"_kt_assistant_segments"' in conv_json
 
-    async def test_session_store_save_failure_does_not_fail_run(self):
-        class _BadStore:
+    async def test_session_store_save_failure_propagates(self, tmp_path):
+        class _BadStore(SessionStore):
             def save_subagent(self, **kwargs):
                 raise RuntimeError("disk full")
 
@@ -723,11 +734,12 @@ class TestSessionStorePersistence:
             _registry(),
             ScriptedLLM(["done anyway"]),
         )
-        sa._session_store = _BadStore()
-        result = await sa.run("task")
-        # A persistence failure is logged but the run still succeeds.
-        assert result.success is True
-        assert result.output == "done anyway"
+        sa._session_store = _BadStore(tmp_path / "failed.kohakutr")
+        try:
+            with pytest.raises(RuntimeError, match="disk full"):
+                await sa.run("task")
+        finally:
+            sa._session_store.close()
 
 
 class TestPluginIntegration:

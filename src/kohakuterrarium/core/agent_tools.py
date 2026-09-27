@@ -147,9 +147,13 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                     result = exc
 
                 if isinstance(result, PromotionResult):
-                    self._handle_promotion(jid, controller, tool_call_ids, native_mode)
-                    self._clear_direct_job_tracking(jid)
-                    had_promotions = True
+                    admitted = await self._handle_promotion(
+                        jid, controller, tool_call_ids, native_mode
+                    )
+                    await submit_internal_session_state(
+                        self, lambda: self._clear_direct_job_tracking(jid)
+                    )
+                    had_promotions = had_promotions or admitted
                 else:
                     captured = deepcopy(result)
 
@@ -207,27 +211,56 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
 
         return results, had_promotions
 
-    def _handle_promotion(
+    async def _append_background_ack(self, job_id, tool_call_id, name, content):
+        """Pair a background acknowledgement on its captured native occurrence."""
+        admitted = await submit_internal_session_state(
+            self,
+            lambda: append_pending_result(
+                self, job_id, {"tool_call_id": tool_call_id, "name": name}, content
+            ),
+        )
+        if not admitted:
+            logger.warning(
+                "Background acknowledgement rejected by current native occurrence",
+                job_id=job_id,
+            )
+        return admitted
+
+    async def _handle_promotion(
         self,
         job_id: str,
         controller: Controller,
         tool_call_ids: dict[str, str],
         native_mode: bool,
-    ) -> None:
-        """Handle a task that was promoted to background mid-wait."""
+    ) -> bool:
+        """Commit promotion state and acknowledgement before external notifications."""
         tool_name, label = _make_job_label(job_id)
         logger.info("Task promoted to background", job_id=job_id)
-        promote_tool_context(self, job_id)
-
-        # Native tool-call protocols require a result even when the real result
-        # will arrive in a later turn.
         tool_call_id = tool_call_ids.get(job_id)
-        if native_mode and tool_call_id:
-            controller.conversation.append(
-                "tool",
-                f"[{tool_name}] Promoted to background. Result arrives in a later turn.",
-                tool_call_id=tool_call_id,
-                name=tool_name,
+
+        def commit():
+            promote_tool_context(self, job_id)
+            admitted = True
+            if native_mode and tool_call_id:
+                admitted = append_pending_result(
+                    self,
+                    job_id,
+                    {"tool_call_id": tool_call_id, "name": tool_name},
+                    f"[{tool_name}] Promoted to background. Result arrives in a later turn.",
+                )
+            meta = self._direct_job_meta.get(job_id)
+            if meta is not None:
+                meta["background"] = True
+                meta["interruptible"] = False
+            if self._bg_controller_notify.get(job_id, True):
+                self._turn_dispatched_bg.add(job_id)
+            return admitted
+
+        admitted = await submit_internal_session_state(self, commit)
+        if not admitted:
+            logger.warning(
+                "Promotion acknowledgement rejected by current native occurrence",
+                job_id=job_id,
             )
 
         if hasattr(self, "plugins") and self.plugins:
@@ -237,16 +270,12 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 )
             )
 
-        meta = self._direct_job_meta.get(job_id)
-        if meta is not None:
-            meta["background"] = True
-            meta["interruptible"] = False
-
         self.output_router.notify_activity(
             "task_promoted",
             f"[{label}] Moved to background",
             metadata={"job_id": job_id},
         )
+        return admitted
 
     def _interrupt_direct_job(self, job_id: str) -> bool:
         """Cancel and finalize a direct job tracked by the current run."""

@@ -56,6 +56,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         *,
         capture_activity: bool = True,
         event_key_prefix: str | None = None,
+        prepared_recovery: tuple | None = None,
     ):
         self._agent_name = agent_name
         self._store = store
@@ -70,6 +71,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         self._open_text = OpenTextSegment(
             store, self._event_key_prefix, submit=self._submit_store_write
         )
+        self._prepared_recovery = prepared_recovery
         self._recovered_open_text: bool = False
         self._chunk_seq: int = 0
         # Retain tasks for child runs that lack SubAgentManager persistence.
@@ -255,10 +257,19 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         if self._recovered_open_text:
             return
         self._recovered_open_text = True
-        recovered = self._open_text.recover()
-        if not recovered:
-            return
-        ti, bi, ppath = last_persisted_turn_branch(self._store, self._event_key_prefix)
+        if self._prepared_recovery is None:
+            recovered = self._open_text.recover()
+            if not recovered:
+                return
+            ti, bi, ppath = last_persisted_turn_branch(
+                self._store, self._event_key_prefix
+            )
+        else:
+            recovered, ti, bi, ppath = self._prepared_recovery
+            self._prepared_recovery = None
+            if not recovered:
+                return
+            self._open_text._slot_active = True
         recorded = self._append_event_at(
             "text_chunk",
             {

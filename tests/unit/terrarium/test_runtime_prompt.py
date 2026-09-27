@@ -4,6 +4,12 @@ import asyncio
 from types import SimpleNamespace
 
 
+import pytest
+
+from kohakuterrarium import Terrarium
+from kohakuterrarium.core.config_types import AgentConfig
+from kohakuterrarium.errors import ConflictError, InvalidRequestError
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.terrarium import runtime_prompt as rp
 from kohakuterrarium.terrarium.events import EngineEvent, EventKind
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
@@ -26,6 +32,166 @@ class _MockConversation:
 class _MockController:
     def __init__(self, content):
         self.conversation = _MockConversation(content)
+
+
+@pytest.mark.parametrize("entry", ["explicit", "debounce"])
+async def test_live_refresh_splices_only_on_owner(tmp_path, monkeypatch, entry):
+    async with Terrarium() as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=ScriptedLLM(["ok"]),
+            io="headless",
+            is_privileged=True,
+            start=True,
+        )
+        prompt = rp.RuntimeGraphPrompt(engine)
+        tasks = []
+        apply = rp.apply_managed_section
+
+        def observed(agent, content):
+            tasks.append(asyncio.current_task())
+            return apply(agent, content)
+
+        monkeypatch.setattr(rp, "apply_managed_section", observed)
+        if entry == "explicit":
+            await prompt.refresh_creature(creature)
+        else:
+            prompt._do_refresh(creature.creature_id)
+            await creature.agent._submit_session_state(lambda: None)
+        assert tasks == [creature.agent._session_state_owner.task]
+        assert rp._BEGIN in creature.agent.get_system_prompt()
+
+
+async def test_off_owner_direct_apply_rejects_live_mutation():
+    async with Terrarium() as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=ScriptedLLM(["ok"]),
+            io="headless",
+            start=True,
+        )
+        before = creature.agent.get_system_prompt()
+        with pytest.raises(ConflictError):
+            rp.apply_managed_section(creature.agent, "not admitted")
+        assert creature.agent.get_system_prompt() == before
+
+
+@pytest.mark.parametrize("action", ["cancel", "close", "rename", "remove"])
+async def test_accepted_refresh_joins_and_uses_current_graph(monkeypatch, action):
+    async with Terrarium() as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=ScriptedLLM(["ok"]),
+            io="headless",
+            is_privileged=True,
+            start=True,
+        )
+        owner = creature.agent._session_state_owner
+        await owner.submit(lambda: None)
+        prompt = rp.RuntimeGraphPrompt(engine)
+        before = creature.agent.get_system_prompt()
+        admitted = asyncio.Event()
+        submit, wake = owner.submit, owner._wake
+        receipts = []
+
+        def record(callback):
+            receipt = submit(callback)
+            receipts.append(receipt)
+            admitted.set()
+            return receipt
+
+        monkeypatch.setattr(owner, "_wake", lambda: None)
+        monkeypatch.setattr(owner, "submit", record)
+        waiting = asyncio.create_task(prompt.refresh_creature(creature))
+        try:
+            await asyncio.wait_for(admitted.wait(), 3)
+            if action == "cancel":
+                waiting.cancel()
+            elif action == "close":
+                owner.close_admission()
+            elif action == "rename":
+                creature.name = "renamed"
+            else:
+                engine._creatures.pop(creature.creature_id)
+            assert creature.agent.get_system_prompt() == before
+            wake()
+            if action == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await waiting
+            else:
+                await waiting
+            assert receipts[0].done() and not receipts[0].cancelled()
+            current = creature.agent.get_system_prompt()
+            if action == "remove":
+                assert current == before
+            else:
+                assert rp._BEGIN in current
+                if action == "rename":
+                    assert "renamed" in current
+        finally:
+            engine._creatures[creature.creature_id] = creature
+            monkeypatch.setattr(owner, "_wake", wake)
+            wake()
+            await asyncio.gather(waiting, return_exceptions=True)
+
+
+async def test_refresh_rejects_closed_owner_then_works_after_restart():
+    async with Terrarium() as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=ScriptedLLM(["ok"]),
+            io="headless",
+            is_privileged=True,
+            start=True,
+        )
+        prompt = rp.RuntimeGraphPrompt(engine)
+        await engine.stop(creature)
+        before = creature.agent.get_system_prompt()
+        with pytest.raises(InvalidRequestError):
+            await prompt.refresh_creature(creature)
+        assert creature.agent.get_system_prompt() == before
+        await engine.start(creature)
+        await prompt.refresh_creature(creature)
+        assert rp._BEGIN in creature.agent.get_system_prompt()
+
+
+@pytest.mark.parametrize("entry", ["explicit", "debounce"])
+async def test_refresh_error_is_observed_without_partial_prompt(
+    monkeypatch, caplog, entry
+):
+    async with Terrarium() as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=ScriptedLLM(["ok"]),
+            io="headless",
+            is_privileged=True,
+            start=True,
+        )
+        prompt = rp.RuntimeGraphPrompt(engine)
+        before = creature.agent.get_system_prompt()
+
+        def broken_builder(*args):
+            raise ValueError("prompt build failed")
+
+        monkeypatch.setattr(rp, "build_runtime_graph_section", broken_builder)
+        if entry == "explicit":
+            with pytest.raises(ValueError, match="prompt build failed"):
+                await prompt.refresh_creature(creature)
+        else:
+            observed = asyncio.Event()
+            observe = prompt._observe_refresh
+
+            def record(receipt):
+                observe(receipt)
+                observed.set()
+
+            monkeypatch.setattr(prompt, "_observe_refresh", record)
+            prompt._do_refresh(creature.creature_id)
+            await asyncio.wait_for(observed.wait(), 3)
+            assert any(
+                r.getMessage() == "runtime-graph refresh failed" for r in caplog.records
+            )
+        assert creature.agent.get_system_prompt() == before
 
 
 class TestStripExistingBlock:

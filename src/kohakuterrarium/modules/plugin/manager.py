@@ -6,6 +6,7 @@ runtime contribution refresh share the same applicability rules.
 
 import functools
 import time
+from copy import deepcopy
 from typing import Any, Callable
 
 from kohakuterrarium.modules.plugin.base import (
@@ -86,6 +87,8 @@ class PluginManager(PluginCommandRefreshMixin, ToolVisibilityCollectorMixin):
         self._require_model_mutation_available()
         if name := getattr(plugin, "name", ""):
             self.unregister(name)
+        if not hasattr(plugin, "_session_option_baseline"):
+            plugin._session_option_baseline = deepcopy(getattr(plugin, "options", {}))
         self._plugins.append(plugin)
         self._plugins.sort(key=lambda p: getattr(p, "priority", 50))
         logger.info(

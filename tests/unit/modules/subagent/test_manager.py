@@ -161,21 +161,23 @@ class TestSpawn:
         # The sub-agent's context builder is the parent's.
         assert job.subagent._build_tool_context() == "parent-context"
 
-    async def test_spawn_wires_session_store_for_persistence(self):
-        # A manager with a session store passes it to spawned sub-agents
-        # along with the parent name and a fresh run index.
-        class _FakeStore:
-            def next_subagent_run(self, parent, name):
-                return 7
-
+    async def test_spawn_wires_session_store_for_persistence(self, tmp_path):
+        store = SessionStore(tmp_path / "runs.kohakutr")
         mgr = _manager(ScriptedLLM(["done"]))
-        mgr._session_store = _FakeStore()
+        mgr._session_store = store
         mgr._parent_name = "controller"
         mgr.register(SubAgentConfig(name="explore", max_turns=1))
-        job_id = await mgr.spawn("explore", "task", background=False)
-        job = mgr._jobs.get(job_id)
-        assert job.subagent._parent_name == "controller"
-        assert job.subagent._run_index == 7
+        try:
+            await store.run(
+                lambda: store._subagent_runs.update({"controller:explore": 7})
+            )
+            job_id = await mgr.spawn("explore", "task", background=False)
+            job = mgr._jobs.get(job_id)
+            assert job.subagent._parent_name == "controller"
+            assert job.subagent._run_index == 7
+            assert await store.run(store.load_subagent_meta, "controller", "explore", 7)
+        finally:
+            store.close()
 
     async def test_spawn_from_event_extracts_task_and_background_flag(self):
         from kohakuterrarium.parsing.events import SubAgentCallEvent

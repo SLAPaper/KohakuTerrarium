@@ -7,8 +7,10 @@ import asyncio
 from typing import Any
 
 from kohakuterrarium.bootstrap.llm import create_llm_from_profile_name
+from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.compact import CompactConfig, CompactManager
 from kohakuterrarium.llm.profiles import profile_to_identifier, resolve_controller_llm
+from kohakuterrarium.llm.recovery_scope import active_recovery
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -40,6 +42,11 @@ class AgentCompactMixin:
     async def _compact_overflow_rescue(self) -> list[dict[str, Any]] | None:
         """Wait out an in-flight compact and retry with the spliced
         conversation instead of dropping tool data."""
+        if (
+            getattr(self, "_session_state_owner", None) is not None
+            and active_recovery(getattr(self, "llm", None)) is None
+        ):
+            return None
         manager = getattr(self, "compact_manager", None)
         if manager is None or not manager.is_compacting:
             return None
@@ -49,11 +56,13 @@ class AgentCompactMixin:
         # our own task. Let the emergency drop handle it instead.
         if getattr(manager, "_compact_task", None) is asyncio.current_task():
             return None
-        await manager.wait_for_current()
+        await manager.wait_for_splice()
         controller = getattr(self, "controller", None)
         if controller is None:
             return None
-        return controller.conversation.to_messages()
+        return await submit_internal_session_state(
+            self, lambda: controller.conversation.to_messages()
+        )
 
     def _build_compact_llm(self, compact_cfg: CompactConfig) -> Any:
         """Build an isolated LLM instance for compaction.

@@ -4,7 +4,9 @@ from contextlib import ExitStack
 from copy import deepcopy
 from functools import wraps
 
+from kohakuterrarium.core.session_attachment import reserve_topology_attachment
 from kohakuterrarium.modules.plugin.state_io import plugin_state_binding
+from kohakuterrarium.terrarium.session_resources import retain_store, transition_stores
 
 from kohakuterrarium.modules.plugin.state_scope import (
     migrate_legacy_state,
@@ -27,6 +29,7 @@ def guarded_plugin_state_handoff(operation):
             if (creature := engine._creatures.get(cid)) is not None
         }
         with ExitStack() as stack:
+            stack.enter_context(reserve_topology_attachment(hosts.values()))
             for _, host in sorted(hosts.items()):
                 stack.enter_context(plugin_state_binding(host))
             stores = {
@@ -38,7 +41,22 @@ def guarded_plugin_state_handoff(operation):
                 store.submit(validate_legacy_state, store).result()
             for store in stores:
                 store.submit(migrate_legacy_state, store).result()
-            return operation(engine, delta)
+            owned_sources = {
+                store
+                for gid in delta.old_graph_ids
+                if gid in getattr(engine, "_owned_sessions", ())
+                and (store := engine._session_stores.get(gid)) is not None
+            }
+            try:
+                with transition_stores(engine):
+                    return operation(engine, delta)
+            except BaseException:
+                for store in owned_sources:
+                    if not getattr(store, "_closed", False):
+                        retain_store(engine, store)
+                for host in hosts.values():
+                    host._session_attach_uncertain = True
+                raise
 
     return guarded
 

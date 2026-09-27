@@ -309,9 +309,20 @@ class DriveRuntime:
         await self._drain_reconcile(graph_id)
         await self._registry.detach_and_stop(graph_id)
 
+    def _session_binding_uncertain(self, creature: Any) -> bool:
+        """Report unresolved attachment on any member sharing the graph store."""
+        return any(
+            getattr(member.agent, "_session_attach_uncertain", False)
+            for member in self._engine._creatures.values()
+            if member is creature
+            or getattr(member, "graph_id", None) == creature.graph_id
+        )
+
     def schedule_reconcile(self, creature: Any) -> None:
         """Schedule one reconciliation after a creature finishes restoration."""
         creature_id = creature.creature_id
+        if self._session_binding_uncertain(creature):
+            return
         if creature_id in self._reconcile_creatures:
             return
         self._reconcile_creatures.add(creature_id)
@@ -350,13 +361,15 @@ class DriveRuntime:
             await creature.wait_restoration_ready()
         except asyncio.CancelledError:
             return
-        if not creature.is_running:
+        if not creature.is_running or self._session_binding_uncertain(creature):
             return
         session_dir = getattr(self._engine, "_session_dir", None)
         if session_dir is not None:
             await recover_split_intents(session_dir)
         # Topology changes can close the repository while this task waits on the
         # barrier, so a raced reconciliation must stop before manager startup.
+        if self._session_binding_uncertain(creature):
+            return
         repo = self._registry.repository_for(creature.graph_id)
         if getattr(repo, "_closed", False):
             return

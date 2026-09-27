@@ -6,7 +6,10 @@ compaction covers, and compute the event-id range from the event log.
 """
 
 import asyncio
+from copy import deepcopy
 from typing import Any
+
+from kohakuterrarium.core.agent_state import submit_internal_session_state
 
 from kohakuterrarium.utils.logging import get_logger
 
@@ -105,33 +108,94 @@ async def persist_compacted_async(
     compact_count: int,
     last_compact_time: float,
 ) -> None:
-    """Off-loop twin of :func:`persist_compacted`.
+    """Capture live snapshot inputs on the owner and persist detached values."""
+    lock = getattr(agent, "_processing_lock", None)
+    holder = getattr(agent, "_turn_lock_holder", None)
+    owns_turn = (
+        holder is asyncio.current_task()
+        or getattr(agent, "_processing_task", None) is asyncio.current_task()
+    )
+    acquired = False
+    try:
+        if lock is not None and not owns_turn:
+            await lock.acquire()
+            acquired = True
+        pending = asyncio.create_task(
+            _capture_and_persist_compacted(
+                store, agent_name, agent, conversation, compact_count, last_compact_time
+            )
+        )
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(pending)
+                break
+            except asyncio.CancelledError:
+                if pending.cancelled():
+                    raise
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+    finally:
+        if acquired:
+            lock.release()
 
-    Runs on the store's affinity thread when it has one (FIFO after any
-    queued writes), else on a plain worker thread; compaction dispatches
-    this only after a drain barrier, so no queued write can interleave.
-    """
+
+async def _capture_and_persist_compacted(
+    store, agent_name, agent, conversation, compact_count, last_compact_time
+):
+    snapshot = await submit_internal_session_state(
+        agent, lambda: _capture_compacted(agent, conversation, store)
+    )
+    args = (store, agent_name, *snapshot, compact_count, last_compact_time)
     run = getattr(store, "run", None)
     if callable(run):
-        await run(
-            persist_compacted,
-            store,
-            agent_name,
-            agent,
-            conversation,
-            compact_count,
-            last_compact_time,
-        )
+        await run(_persist_compacted_snapshot, *args)
     else:
-        await asyncio.to_thread(
-            persist_compacted,
-            store,
-            agent_name,
-            agent,
-            conversation,
-            compact_count,
-            last_compact_time,
+        await asyncio.to_thread(_persist_compacted_snapshot, *args)
+
+
+def _capture_compacted(agent, conversation, store):
+    if getattr(agent, "session_store", store) is not store:
+        raise ValueError("Compact session store was replaced before snapshot capture")
+    controller = getattr(agent, "controller", None)
+    if controller is not None and controller.conversation is not conversation:
+        raise ValueError("Compacted conversation was replaced before snapshot capture")
+    messages = conversation.snapshot_messages(preserve_pending_tail=True)
+    tag = None
+    turn, branch = getattr(agent, "_turn_index", None), getattr(
+        agent, "_branch_id", None
+    )
+    if type(turn) is int and turn > 0 and type(branch) is int and branch > 0:
+        tag = {
+            "turn_index": turn,
+            "branch_id": branch,
+            "parent_branch_path": getattr(agent, "_parent_branch_path", None),
+            "branch_view": snapshot_branch_view(agent),
+        }
+    return deepcopy((messages, tag)), agent is not None
+
+
+def _persist_compacted_snapshot(
+    store, agent_name, snapshot, update_tag, compact_count, last_compact_time
+):
+    """Write a detached compact snapshot and its captured branch selection."""
+    messages, tag = snapshot
+    try:
+        store.save_conversation(agent_name, messages)
+    except Exception as exc:
+        logger.warning(
+            "Failed to save compacted conversation", error=str(exc), exc_info=True
         )
+    if update_tag:
+        try:
+            if tag is None:
+                store.state.pop(f"{agent_name}:snapshot_branch", None)
+            else:
+                store.state[f"{agent_name}:snapshot_branch"] = tag
+        except Exception:
+            logger.warning("Failed to save compact snapshot branch", exc_info=True)
+    persist_compact_state(store, agent_name, compact_count, last_compact_time)
 
 
 def persist_compact_state(

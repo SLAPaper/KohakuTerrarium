@@ -298,7 +298,11 @@ def _bind_callbacks(agent: Any, new_llm: Any) -> None:
     if cache_key and hasattr(new_llm, "prompt_cache_key"):
         new_llm.prompt_cache_key = cache_key
     callback = getattr(agent, "_on_provider_emergency_drop", None)
-    if callback is not None and hasattr(new_llm, "on_emergency_drop"):
+    if (
+        callback is not None
+        and hasattr(new_llm, "on_emergency_drop")
+        and not getattr(new_llm, "supports_scoped_recovery", False)
+    ):
         new_llm.on_emergency_drop(callback)
     commit = getattr(agent, "_commit_provider_emergency_drop", None)
     if commit is not None and hasattr(new_llm, "set_emergency_drop_commit"):

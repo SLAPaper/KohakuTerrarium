@@ -11,6 +11,7 @@ union on graph merge, session-store copy on graph split).
 """
 
 from collections.abc import AsyncIterator, Iterator
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,9 @@ from kohakuterrarium.terrarium.drive.store import (
     DriveRepositoryClosedError,
 )
 from kohakuterrarium.core.environment import Environment
+from kohakuterrarium.core.session_attachment import run_explicit_attachment
+from kohakuterrarium.terrarium.session_attach import attach_reserved
+from kohakuterrarium.terrarium.session_subagent_state import preflight_child_split
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.creature_host import (
     Creature,
@@ -312,6 +316,9 @@ class Terrarium:
     async def _remove_creature_reserved(self, cid: str) -> None:
         c = self._creatures[cid]
         old_gid = c.graph_id
+        projected = deepcopy(self._topology)
+        delta = _topo.remove_creature(projected, cid)
+        preflight_child_split(self, projected, delta)
         if c.is_running:
             await c.stop(requested=False)
         # A creature-scoped Drive orphans-and-blocks on removal,
@@ -340,7 +347,10 @@ class Terrarium:
                     creature_id=cid,
                     error=str(exc),
                 )
-        delta = _topo.remove_creature(self._topology, cid)
+        projected = deepcopy(self._topology)
+        delta = _topo.remove_creature(projected, cid)
+        preflight_child_split(self, projected, delta)
+        self._topology = projected
         self._creatures.pop(cid, None)
         _wiring.install_output_wiring_resolver(self)
         # Drop the environment + the graph's Drive manager if the graph went
@@ -797,51 +807,13 @@ class Terrarium:
         See ``terrarium.session_coord`` for merge/split details.
         """
         gid = self._resolve_graph_id(graph)
-        # Replacing a graph's store: close the previous one first so its
-        # native handles + writer lock are released before the new (or a
-        # freshly-minted) store opens the same file. Detach the graph's Drive
-        # manager first so its dispatcher releases claims against a LIVE
-        # connection, not the companion repo the store close is about to drop.
-        previous = self._session_stores.get(gid)
-        if previous is not None and previous is not store:
-            if self._drive_runtime is not None:
-                await self._drive_runtime.detach_graph(gid)
-            try:
-                previous.close(update_status=False)
-            except Exception:  # pragma: no cover - defensive
-                _logger.warning(
-                    "attach_session: closing replaced store failed", exc_info=True
-                )
-            self._owned_sessions.discard(gid)
-        if isinstance(store, (str, Path)):
-            names = [c.name for c in self._creatures.values() if c.graph_id == gid]
-            store = _autosession.mint_store(self, gid, path=store, agents=names)
-            self._owned_sessions.add(gid)
-        self._session_stores[gid] = store
-        # Bind the graph's session-backed Drive repository before its creatures
-        # reach restoration-ready.
-        if self._drive_runtime is not None:
-            await self._drive_runtime.bind_graph_store(gid, store)
-        g = self._topology.graphs.get(gid)
-        if g is None:
-            return
-        # Retroactively wire channel persistence on every channel that
-        # was registered before the store was attached — without this,
-        # channels created at engine.add_channel time before
-        # attach_session lose every send to the void.
-        env = self._environments.get(gid)
-        if env is not None:
-            for channel in env.shared_channels._channels.values():
-                _channels._ensure_channel_persistence(channel, self, gid)
-        for cid in g.creature_ids:
-            c = self._creatures.get(cid)
-            if c is None:
-                continue
-            if hasattr(c.agent, "attach_session_store"):
-                c.agent.attach_session_store(store)
-            elif hasattr(c.agent, "session_store"):
-                c.agent.session_store = store
-        await _checkpoint.checkpoint(self, gid)
+        agents = [c.agent for c in self._creatures.values() if c.graph_id == gid]
+        await run_explicit_attachment(
+            agents, lambda: self._attach_session_reserved(gid, store)
+        )
+
+    async def _attach_session_reserved(self, gid, store) -> None:
+        await attach_reserved(self, gid, store)
 
     # ------------------------------------------------------------------
     # internal helpers

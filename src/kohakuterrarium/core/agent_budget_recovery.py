@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -15,6 +16,14 @@ def sync_emergency_drop_conversation(
     """Synchronize an agent controller after provider-side emergency drop."""
     if not hasattr(agent, "controller"):
         return
+    if (
+        getattr(agent, "_session_state_owner", None) is not None
+        or getattr(agent, "_running", False)
+        or getattr(agent, "_stopped", False)
+    ):
+        raise ConflictError(
+            "Live emergency recovery requires a request-scoped owner commit"
+        )
     try:
         data = {
             "messages": [_message_to_conversation_json(msg) for msg in messages],

@@ -641,9 +641,8 @@ class TestSessionIntegration:
                 "a second channel broadcast message",
             ]
             assert reopened._next_channel_seq("broadcast") == 2
-            # Two research runs were saved (run 0 via SessionOutput, run 1
-            # explicitly) — the counter restored to the next free index.
-            assert reopened.next_subagent_run("scribe", "research") == 2
+            # Saved runs 0/1 and the unfilled run-2 reservation survive reopen.
+            assert reopened.next_subagent_run("scribe", "research") == 3
             # The trigger deletion converged across processes: a fresh
             # handle sees only the survivor, never the deleted id.
             assert [t["trigger_id"] for t in reopened.load_triggers("scribe")] == [

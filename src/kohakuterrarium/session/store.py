@@ -11,6 +11,7 @@ from typing import Any
 from kohakuvault import KVault, TextVault
 
 from kohakuterrarium.session.artifacts import artifacts_dir_for, write_artifact_bytes
+from kohakuterrarium.session.event_origin import STORE_UUID, validate_append_origin
 from kohakuterrarium.session.history import (
     dedupe_adjacent_duplicate_events,
     normalize_resumable_events,
@@ -22,6 +23,11 @@ from kohakuterrarium.session.rollup import (
     save_turn_rollup,
 )
 from kohakuterrarium.session.store_affinity import StoreAffinityMixin
+from kohakuterrarium.session.subagent_lineage import (
+    admit_saved_run,
+    reserve_run,
+    restore_run_reservations,
+)
 from kohakuterrarium.session.store_counters import (
     persist_event_counter,
     restore_event_counters,
@@ -57,11 +63,7 @@ def iter_kv_keys(
     prefix: Any = None,
     limit: int = _KV_KEYS_LIMIT,
 ) -> Iterable[Any]:
-    """Iterate every key of a KVault table, bypassing its 10k default.
-
-    ``prefix`` filters the result, and an explicit ``limit`` can override the
-    large session-safe default.
-    """
+    """Iterate table keys with an optional prefix and session-safe default limit."""
     if prefix is None:
         return table.keys(limit=limit)
     return table.keys(prefix=prefix, limit=limit)
@@ -187,12 +189,16 @@ class SessionStore(StoreAffinityMixin):
             self._companion_closers.append(closer)
 
     def _restore_counters(self) -> None:
-        """Restore sequence counters; persisted counters skip the value scan."""
+        """Restore counters, verifying row maxima for identity-enabled stores."""
         self._global_event_id = restore_event_counters(
-            self.events, self._event_seq, state=self.state
+            self.events,
+            self._event_seq,
+            state=self.state,
+            verify_rows=bool(self.meta.get(STORE_UUID)),
         )
         restore_suffix_counters(self.channels, ":m", self._channel_seq)
         restore_subagent_counters(self.subagents, self._subagent_runs)
+        restore_run_reservations(self)
 
         if self._event_seq or self._channel_seq:
             logger.debug(
@@ -223,15 +229,8 @@ class SessionStore(StoreAffinityMixin):
         branch_id: int | None = None,
         parent_branch_path: list[tuple[int, int]] | None = None,
     ) -> tuple[str, int]:
-        """Append one event. Returns ``(key, event_id)``.
-
-        Every event carries a per-session monotonic ``event_id`` plus
-        optional ``turn_index`` / ``spawned_in_turn`` / ``branch_id``.
-
-        ``turn_index`` identifies a logical user turn across reruns. Sibling
-        ``branch_id`` values represent alternate responses; replay selects the
-        latest branch unless a caller requests another.
-        """
+        """Append an event with monotonic ID and optional turn/branch lineage."""
+        imported = validate_append_origin(self, agent, data)
         seq = self._next_event_seq(agent)
         key = f"{agent}:e{seq:06d}"
         # Mirrors preserve source event identifiers for consistent cross-node cursors.
@@ -249,14 +248,14 @@ class SessionStore(StoreAffinityMixin):
             data["turn_index"] = turn_index
         if spawned_in_turn is not None:
             data["spawned_in_turn"] = spawned_in_turn
-        elif turn_index is not None and "spawned_in_turn" not in data:
+        elif not imported and turn_index is not None and "spawned_in_turn" not in data:
             data["spawned_in_turn"] = turn_index
         if branch_id is not None:
             data["branch_id"] = branch_id
         # Persist lineage in JSON-safe form to avoid replay-time history scans.
         if parent_branch_path is not None:
             data["parent_branch_path"] = [list(p) for p in parent_branch_path]
-        if "ts" not in data:
+        if not imported and "ts" not in data:
             data["ts"] = time.time()
         self.events[key] = data
 
@@ -577,10 +576,7 @@ class SessionStore(StoreAffinityMixin):
 
     def next_subagent_run(self, parent: str, name: str) -> int:
         """Get the next run index for a sub-agent."""
-        sa_key = f"{parent}:{name}"
-        run = self._subagent_runs.get(sa_key, 0)
-        self._subagent_runs[sa_key] = run + 1
-        return run
+        return reserve_run(self, parent, name)
 
     def save_subagent(
         self,
@@ -591,6 +587,7 @@ class SessionStore(StoreAffinityMixin):
         conv_json: str | None = None,
     ) -> None:
         """Save sub-agent run metadata and optional conversation."""
+        admit_saved_run(self, parent, name, run)
         prefix = f"{parent}:{name}:{run}"
         if "ts" not in meta:
             meta["ts"] = time.time()

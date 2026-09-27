@@ -19,8 +19,8 @@ def claim_job_terminal(agent, job_id):
     return True
 
 
-def append_pending_result(agent, job_id, meta, content):
-    """Append only a missing result in the last pending native call block."""
+def pending_result_slot(agent, job_id, meta):
+    """Locate a missing result in the current native block and captured lineage."""
     conversation = getattr(getattr(agent, "controller", None), "conversation", None)
     if conversation is None:
         return False
@@ -79,6 +79,15 @@ def append_pending_result(agent, job_id, meta, content):
         call for call in messages[index].tool_calls if call.get("id") == provider_id
     )
     name = call.get("function", {}).get("name") or meta.get("name")
+    return conversation, provider_id, name
+
+
+def append_pending_result(agent, job_id, meta, content):
+    """Append only a missing result in the last pending native call block."""
+    slot = pending_result_slot(agent, job_id, meta)
+    if not slot:
+        return False
+    conversation, provider_id, name = slot
     original = conversation._messages
     snapshot = list(original)
     metadata = deepcopy(conversation._metadata)

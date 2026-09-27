@@ -3,6 +3,7 @@
 from copy import deepcopy
 
 from kohakuterrarium.core.agent_state import submit_internal_session_state
+from kohakuterrarium.core.controller_recovery import capture_recovery
 from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
 from kohakuterrarium.core.events import EventType
 
@@ -39,6 +40,7 @@ async def capture_turn_messages(controller, events, content, skip_empty):
                     )
             if feedback:
                 message.metadata["kind"] = TOOL_FEEDBACK_KIND
+        controller._recovery_capture = capture_recovery(controller)
         return deepcopy(controller.conversation.to_messages())
 
     return await commit_controller_state(controller, capture)

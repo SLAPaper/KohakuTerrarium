@@ -71,6 +71,45 @@ def _persist_terminal(store, namespace, event_type, payload, retry):
     return result
 
 
+def _persist_veto(store, namespace, payload, declaration, retry):
+    """Persist the rejected native request before its unexecuted result."""
+    origin = payload["origin"]
+    calls = declaration.get("tool_calls", [])
+    if (
+        len([call for call in calls if call.get("id") == payload.get("tool_call_id")])
+        != 1
+    ):
+        raise ValueError("Native veto requires its original call declaration")
+    declaration = deepcopy(declaration)
+    existing = [
+        event
+        for event in store.get_events(namespace)
+        if event.get("type") == "assistant_tool_calls"
+        and event.get("veto_group_id") == declaration["veto_group_id"]
+    ]
+    if existing:
+        expected = {
+            **declaration,
+            "turn_index": origin["turn_index"],
+            "branch_id": origin["branch_id"],
+            "parent_branch_path": origin["parent_branch_path"],
+        }
+        if len(existing) != 1 or any(
+            existing[0].get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError("Conflicting native veto declaration")
+    else:
+        store.append_event(
+            namespace,
+            "assistant_tool_calls",
+            declaration,
+            turn_index=origin["turn_index"],
+            branch_id=origin["branch_id"],
+            parent_branch_path=origin["parent_branch_path"],
+        )
+    return _persist_terminal(store, namespace, "tool_result", payload, retry)
+
+
 def record_tool_activity(sink, event_type: str, data: dict, metadata: dict):
     """Detach activity provenance and append under its original coordinates."""
     payload = deepcopy(data)
@@ -104,6 +143,15 @@ def record_tool_activity(sink, event_type: str, data: dict, metadata: dict):
     payload["origin"] = origin
     sink._recover_open_text()
     sink._flush_text_segment()
+    if metadata.get("_native_veto_declaration") is not None:
+        return sink._submit_store_write(
+            _persist_veto,
+            sink._store,
+            sink._event_key_prefix,
+            payload,
+            deepcopy(metadata["_native_veto_declaration"]),
+            bool(metadata.get("_native_veto_retry")),
+        )
     if metadata.get("_terminal_publication"):
         return sink._submit_store_write(
             _persist_terminal,

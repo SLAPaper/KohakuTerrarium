@@ -4,6 +4,8 @@ Hooks run linearly by priority; callbacks observe lifecycle events without nesti
 """
 
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -34,6 +36,17 @@ if TYPE_CHECKING:
 
 
 logger = get_logger(__name__)
+_STRICT_OPTION_REFRESH = ContextVar("kt_strict_plugin_options", default=False)
+
+
+@contextmanager
+def strict_option_refresh():
+    """Propagate plugin refresh failures during a reserved state transition."""
+    token = _STRICT_OPTION_REFRESH.set(True)
+    try:
+        yield
+    finally:
+        _STRICT_OPTION_REFRESH.reset(token)
 
 
 class PluginBlockError(Exception):
@@ -278,6 +291,8 @@ class BasePlugin:
         try:
             self.refresh_options()
         except Exception as e:  # pragma: no cover — defensive
+            if _STRICT_OPTION_REFRESH.get():
+                raise
             logger.warning(
                 "Plugin refresh_options raised after set_options",
                 plugin_name=getattr(self, "name", "?"),

@@ -25,11 +25,13 @@ trigger machinery owned by that module. The dependency is one-way
 back), satisfying the dep-graph cycle check.
 """
 
+from copy import deepcopy
 from typing import TYPE_CHECKING
 
 import kohakuterrarium.terrarium.session_coord as _session_coord
 import kohakuterrarium.terrarium.topology as _topo
 from kohakuterrarium.core.environment import Environment
+from kohakuterrarium.terrarium.session_subagent_state import preflight_child_split
 from kohakuterrarium.terrarium.graph_identity_engine import guard_graph_model_bindings
 from kohakuterrarium.terrarium.channels import (
     bind_creature_to_environment,
@@ -79,7 +81,10 @@ async def disconnect_creatures(
         if channel is not None
         else sorted(g.send_edges.get(sid, set()) & g.listen_edges.get(rid, set()))
     )
-    delta = _topo.disconnect(engine._topology, sid, rid, channel=channel)
+    projected = deepcopy(engine._topology)
+    delta = _topo.disconnect(projected, sid, rid, channel=channel)
+    preflight_child_split(engine, projected, delta)
+    engine._topology = projected
     for ch in targets:
         remove_channel_trigger(
             receiver_creature.agent,
@@ -228,6 +233,9 @@ async def remove_channel_from_graph(
         raise KeyError(f"channel {name!r} not in graph {graph_id!r}")
 
     guard_graph_model_bindings(engine, graph_id)
+    projected = deepcopy(engine._topology)
+    delta = _topo.remove_channel(projected, graph_id, name)
+    preflight_child_split(engine, projected, delta)
     # 1. Tear down listen triggers on every listener.
     for cid, listens in list(g.listen_edges.items()):
         if name not in listens:
@@ -256,7 +264,7 @@ async def remove_channel_from_graph(
         env.shared_channels.remove(name)
 
     # 4. Drop from topology (clears edges + propagates split if any).
-    delta = _topo.remove_channel(engine._topology, graph_id, name)
+    engine._topology = projected
 
     # 5. Split bookkeeping shared with disconnect_creatures + the
     # group_channel(action="unwire") tool path. If no split happened,

@@ -22,6 +22,7 @@ Block content per design.md Section 8:
 import asyncio
 from typing import TYPE_CHECKING, Any
 
+from kohakuterrarium.errors import ConflictError, InvalidRequestError
 from kohakuterrarium.prompt.framework_hints import (
     HINT_GROUP_GROWTH,
     HINT_GROUP_MODEL,
@@ -147,8 +148,9 @@ class RuntimeGraphPrompt:
         if creature is None:
             return
         try:
-            section = build_runtime_graph_section(self._engine, creature)
-            apply_managed_section(creature.agent, section)
+            receipt = self._submit_refresh(creature)
+            if receipt is not None:
+                receipt.add_done_callback(self._observe_refresh)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
                 "runtime-graph refresh failed",
@@ -157,15 +159,56 @@ class RuntimeGraphPrompt:
                 exc_info=True,
             )
 
-    async def refresh_creature(self, creature: "Creature") -> None:
-        """Refresh the runtime-graph block for ``creature`` immediately.
+    def _submit_refresh(self, creature):
+        agent = creature.agent
+        owner = getattr(agent, "_session_state_owner", None)
 
-        Bypasses the 100 ms debounce — used by tests and explicit prompt
-        recomputation. ``async`` so callers can ``await`` consistently
-        even though the body is synchronous today.
-        """
-        section = build_runtime_graph_section(self._engine, creature)
-        apply_managed_section(creature.agent, section)
+        def commit():
+            if self._engine._creatures.get(creature.creature_id) is not creature:
+                return
+            if getattr(agent, "_session_state_owner", None) is not owner:
+                raise ConflictError("Runtime prompt owner changed")
+            section = build_runtime_graph_section(self._engine, creature)
+            apply_managed_section(agent, section)
+
+        if owner is None:
+            commit()
+            return None
+        if asyncio.current_task() is owner.task:
+            if not owner.is_running:
+                raise InvalidRequestError("Runtime prompt owner admission is closed")
+            commit()
+            return None
+        return owner.submit(commit)
+
+    @staticmethod
+    def _observe_refresh(receipt):
+        if receipt.cancelled():
+            return
+        error = receipt.exception()
+        if error is not None:
+            logger.warning("runtime-graph refresh failed", error=str(error))
+
+    async def refresh_creature(self, creature: "Creature") -> None:
+        """Join an admitted owner refresh before reporting caller cancellation."""
+        receipt = self._submit_refresh(creature)
+        if receipt is None:
+            return
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(receipt)
+                break
+            except asyncio.CancelledError:
+                if receipt.cancelled():
+                    raise
+                cancelled = True
+            except BaseException as exc:
+                if cancelled:
+                    raise asyncio.CancelledError() from exc
+                raise
+        if cancelled:
+            raise asyncio.CancelledError()
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +343,11 @@ def apply_managed_section(agent: Any, content: str) -> None:
     """Splice ``content`` into the agent's system prompt, replacing any
     prior runtime-graph block. Silently no-ops when the agent's prompt
     surface isn't reachable (test fakes)."""
+    owner = getattr(agent, "_session_state_owner", None)
+    if owner is not None and asyncio.current_task() is not owner.task:
+        if not owner.is_running:
+            raise InvalidRequestError("Runtime prompt owner admission is closed")
+        raise ConflictError("Runtime prompt mutation requires the session-state owner")
     controller = getattr(agent, "controller", None)
     conversation = getattr(controller, "conversation", None) if controller else None
     get_system = (

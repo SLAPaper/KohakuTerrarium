@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from kohakuterrarium import tool
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
@@ -54,7 +55,11 @@ from kohakuterrarium.llm.artifact_resolve import (
     file_reference_path,
     resolve_artifact_url,
 )
-from kohakuterrarium.llm.base import NativeToolCall
+from kohakuterrarium.llm.base import (
+    BaseLLMProvider,
+    NativeToolCall,
+    OverflowRecoveryState,
+)
 from kohakuterrarium.llm.codex_format import to_responses_input
 from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.session.reader import SessionReader
@@ -72,6 +77,7 @@ from kohakuterrarium.modules.trigger.base import BaseTrigger
 from kohakuterrarium.parsing import ToolCallEvent
 from kohakuterrarium.terrarium.creature_host import Creature
 from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.runtime_prompt import apply_managed_section
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 from kohakuterrarium.testing.output import OutputRecorder
 
@@ -1068,7 +1074,9 @@ class TestCoreIntegration:
             assert roles_after_2 == ["system"]
         assert eph_creature.is_running is False
 
-    async def test_subagent_dispatch_and_result_routing(self, make_creature, tmp_path):
+    async def test_subagent_dispatch_and_result_routing(
+        self, make_creature, tmp_path, monkeypatch
+    ):
         """Controller dispatches a registered sub-agent; the sub-agent
         runs its own LLM loop; its result routes back into the parent
         conversation and drives a follow-up turn.
@@ -1257,7 +1265,102 @@ class TestCoreIntegration:
             # Turn 4 round (1) + turn 4b round (1) = 2 more parent calls.
             assert agent.llm.call_count == calls_before_veto + 2
 
-    async def test_compaction_and_termination(self, make_creature):
+            class NativeVetoProvider(ScriptedLLM):
+                def __init__(self, background=False):
+                    super().__init__(["unused", "native veto acknowledged"])
+                    self.last_tool_calls = []
+                    self.background = background
+
+                async def chat(self, messages, **kwargs):
+                    self.last_tool_calls = []
+                    if self.call_count == 0:
+                        self.call_count += 1
+                        self.call_log.append(self._normalize_messages(messages))
+                        self.last_tool_calls = [
+                            NativeToolCall(
+                                "ack-native" if self.background else "veto-native",
+                                "explore" if self.background else "planner",
+                                (
+                                    '{"task":"work", "run_in_background":true}'
+                                    if self.background
+                                    else '{"task":"forbidden"}'
+                                ),
+                            )
+                        ]
+                        yield ""
+                    else:
+                        async for chunk in super().chat(messages, **kwargs):
+                            yield chunk
+
+            native_llm = NativeVetoProvider()
+            agent.controller.config.tool_format = "native"
+            agent.llm = agent.controller.llm = native_llm
+            child_calls = child_llm.call_count
+            assert await _drain_chat(creature, "native forbidden delegate") == ""
+            assert native_llm.call_count == 1
+            assert (
+                await _drain_chat(creature, "acknowledge denied delegate")
+                == "native veto acknowledged"
+            )
+            assert child_llm.call_count == child_calls
+            tool_responses = [
+                m
+                for m in native_llm.call_log[1]
+                if m.get("tool_call_id") == "veto-native"
+            ]
+            assert (
+                len(tool_responses) == 1
+                and "planner is forbidden" in tool_responses[0]["content"]
+            )
+            raw = await agent.session_store.run(
+                agent.session_store.get_events, agent.config.name
+            )
+            denied = [
+                event
+                for event in raw
+                if event["type"] == "tool_result"
+                and event.get("tool_call_id") == "veto-native"
+            ]
+            assert len(denied) == 1 and denied[0]["name"] == "planner"
+            assert "planner is forbidden" in denied[0]["error"]
+
+            class HeldChild(ScriptedLLM):
+                async def chat(self, messages, **kwargs):
+                    await asyncio.Event().wait()
+                    yield "unreachable"
+
+            background_parent = NativeVetoProvider(background=True)
+            agent.llm = agent.controller.llm = background_parent
+            agent.subagent_manager.llm = HeldChild([])
+            append = type(agent.controller.conversation).append
+            ack_writers = []
+
+            def observe_ack(conversation, role, content, **kwargs):
+                if (
+                    conversation is agent.controller.conversation
+                    and role == "tool"
+                    and kwargs.get("tool_call_id") == "ack-native"
+                ):
+                    ack_writers.append(asyncio.current_task())
+                return append(conversation, role, content, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    type(agent.controller.conversation), "append", observe_ack
+                )
+                assert await _drain_chat(creature, "background exploration") == ""
+            assert background_parent.call_count == 1
+            assert ack_writers == [agent._session_state_owner.task]
+            ack = [
+                message
+                for message in agent.controller.conversation.get_messages()
+                if message.tool_call_id == "ack-native"
+            ]
+            assert len(ack) == 1 and "background" in ack[0].content.lower()
+
+    async def test_compaction_and_termination(
+        self, make_creature, tmp_path, monkeypatch
+    ):
         """One workflow exercising context compaction AND a termination
         condition: a turn pushes token usage past the compact threshold,
         the compact manager splices the conversation, and on the next
@@ -1349,6 +1452,213 @@ class TestCoreIntegration:
             assert "ALL DONE" in (agent._termination_checker.reason or "")
             # After termination the engine reports the creature stopped.
             assert creature.is_running is False
+
+        async with Terrarium(session_dir=tmp_path / "compact-sessions") as saved_engine:
+            compacted = await saved_engine.add_creature(
+                AgentConfig(
+                    name="compacted",
+                    compact={
+                        "max_tokens": 100000,
+                        "keep_recent_turns": 1,
+                        "cooldown_seconds": 0,
+                    },
+                ),
+                llm=ScriptedLLM(
+                    ["one", "two", "three", "fourth answer", "late completed"]
+                ),
+                io="headless",
+                start=True,
+            )
+            saved_agent = compacted.agent
+            for question in ("first", "second", "third"):
+                await compacted.run(question)
+            manager = saved_agent.compact_manager
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            class HeldSummary(ScriptedLLM):
+                async def chat(self, messages, **kwargs):
+                    assert (
+                        asyncio.current_task()
+                        is not saved_agent._session_state_owner.task
+                    )
+                    entered.set()
+                    await release.wait()
+                    async for chunk in super().chat(messages, **kwargs):
+                        yield chunk
+
+            manager._llm = HeldSummary(["durable compact summary"])
+            writes = []
+            splice = manager._splice_conversation
+
+            def record_splice(*args, **kwargs):
+                writes.append(asyncio.current_task())
+                return splice(*args, **kwargs)
+
+            monkeypatch.setattr(manager, "_splice_conversation", record_splice)
+            assert manager.trigger_compact()
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                assert (await compacted.run("fourth")).text == "fourth answer"
+            finally:
+                release.set()
+                await asyncio.wait_for(manager.wait_for_current(), 5)
+            assert writes == [saved_agent._session_state_owner.task]
+            store = saved_agent.session_store
+            saved = await store.run(store.load_conversation, "compacted")
+            assert (
+                sum("durable compact summary" in str(m.get("content")) for m in saved)
+                == 1
+            )
+            assert await store.run(lambda: store.state["compacted:compact_count"]) == 1
+            outcome = await saved_agent.run_event(
+                create_tool_complete_event(
+                    job_id="legacy_job", content="late tool result"
+                )
+            )
+            assert outcome.text == "late completed"
+            session_path = store.path
+        continued_llm = ScriptedLLM(["continued after compact"])
+        restored_engine = await Terrarium.resume(str(session_path), llm=continued_llm)
+        async with restored_engine:
+            restored = restored_engine.list_creatures()[0]
+            assert (
+                await restored.run("continue compacted history", timeout=5)
+            ).text == "continued after compact"
+            restored_messages = continued_llm.last_messages
+            assert (
+                sum(
+                    "durable compact summary" in str(m.get("content"))
+                    for m in restored_messages
+                )
+                == 1
+            )
+            assert (
+                sum(m.get("content") == "late completed" for m in restored_messages)
+                == 1
+            )
+            assert (
+                sum(m.get("content") == "fourth answer" for m in restored_messages) == 1
+            )
+            assert not any(m.get("content") == "first" for m in restored_messages)
+
+        class RefreshDuringRequest(BasePlugin):
+            name = "refresh_during_request"
+
+            async def pre_llm_call(self, messages, **kwargs):
+                await refreshed.agent._submit_session_state(
+                    lambda: apply_managed_section(refreshed.agent, "new runtime facts")
+                )
+                return messages
+
+        refresh_llm = ScriptedLLM(["snapshot answer"])
+        async with Terrarium(session_dir=tmp_path / "prompt-refresh") as refresh_engine:
+            refreshed = await refresh_engine.add_creature(
+                AgentConfig(name="refreshed"),
+                llm=refresh_llm,
+                plugins=[RefreshDuringRequest()],
+                io="headless",
+                start=True,
+            )
+            await refreshed.agent._submit_session_state(
+                lambda: apply_managed_section(refreshed.agent, "old runtime facts")
+            )
+            assert (
+                await refreshed.run("dispatch captured input", timeout=5)
+            ).text == "snapshot answer"
+            assert "old runtime facts" in refresh_llm.last_messages[0]["content"]
+            assert "new runtime facts" not in refresh_llm.last_messages[0]["content"]
+            assert "new runtime facts" in refreshed.agent.get_system_prompt()
+            refresh_path = refreshed.agent.session_store.path
+        continuation = ScriptedLLM(["continued snapshot answer"])
+        async with await Terrarium.resume(
+            str(refresh_path), llm=continuation
+        ) as restored_refresh:
+            restored = restored_refresh.list_creatures()[0]
+            assert (
+                await restored.run("continue", timeout=5)
+            ).text == "continued snapshot answer"
+            assert (
+                sum(
+                    m.get("content") == "snapshot answer"
+                    for m in continuation.last_messages
+                )
+                == 1
+            )
+
+        effects = []
+
+        @tool
+        def recoverable_work(value: str) -> str:
+            """Record one completed work item."""
+            effects.append(value)
+            return "large result " * 100
+
+        class OverflowNative(ScriptedLLM, BaseLLMProvider):
+            def __init__(self):
+                BaseLLMProvider.__init__(self)
+                ScriptedLLM.__init__(self, ["unused", "overflow handled"])
+
+            async def chat(self, messages, **kwargs):
+                self._last_tool_calls = []
+                if not self.call_count:
+                    self.call_count += 1
+                    self.call_log.append(deepcopy(messages))
+                    self._last_tool_calls = [
+                        NativeToolCall(
+                            "recover-native", "recoverable_work", '{"value":"once"}'
+                        )
+                    ]
+                    yield ""
+                    return
+                recovered = await self._recover_from_overflow(
+                    messages, OverflowRecoveryState()
+                )
+                assert recovered is not None
+                async for chunk in ScriptedLLM.chat(self, recovered, **kwargs):
+                    yield chunk
+
+        overflow_llm = OverflowNative()
+        async with Terrarium(
+            session_dir=tmp_path / "overflow-sessions"
+        ) as overflow_engine:
+            recovering = await overflow_engine.add_creature(
+                AgentConfig(name="recovering", tool_format="native"),
+                llm=overflow_llm,
+                tools=[recoverable_work],
+                io="headless",
+                start=True,
+            )
+            assert (
+                await recovering.run("perform work", timeout=5)
+            ).text == "overflow handled"
+            assert effects == ["once"]
+            history = recovering.agent.controller.conversation.get_messages()
+            assert not any(m.tool_calls for m in history)
+            placeholders = [
+                m for m in history if m.metadata.get("kind") == "tool_results"
+            ]
+            assert (
+                len(placeholders) == 1 and "recoverable_work" in placeholders[0].content
+            )
+            overflow_path = recovering.agent.session_store.path
+        after_overflow = ScriptedLLM(["continued safely"])
+        recovered_engine = await Terrarium.resume(
+            str(overflow_path), llm=after_overflow
+        )
+        async with recovered_engine:
+            restored = recovered_engine.list_creatures()[0]
+            assert (
+                await restored.run("continue", timeout=5)
+            ).text == "continued safely"
+            assert effects == ["once"]
+            assert not any(m.get("tool_calls") for m in after_overflow.last_messages)
+            assert (
+                sum(
+                    m.get("content") == "overflow handled"
+                    for m in after_overflow.last_messages
+                )
+                == 1
+            )
 
         # --- A second creature: max_turns termination -------------------
         # ``max_turns`` is the simplest termination condition — the
@@ -1892,7 +2202,9 @@ class TestCoreIntegration:
                     (expected_id, "scratchpad")
                 ]
 
-    async def test_inject_event_and_unified_trigger_model(self, make_creature):
+    async def test_inject_event_and_unified_trigger_model(
+        self, make_creature, monkeypatch
+    ):
         """The unified ``TriggerEvent`` model: a non-user-input event
         (a synthetic ``tool_complete``) injected straight into the
         agent drives a full controller turn, exactly like a real
@@ -2193,3 +2505,54 @@ class TestCoreIntegration:
             assert "drive turn settled" in result.text
             assert drive_llm.call_count == 1
             assert agent._turn_index == turn_before
+
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            class FoldProvider(ScriptedLLM):
+                async def chat(self, messages, **kwargs):
+                    if self.call_count == 0:
+                        self.call_count += 1
+                        self.call_log.append(self._normalize_messages(messages))
+                        entered.set()
+                        yield "thinking"
+                        await release.wait()
+                    else:
+                        async for chunk in super().chat(messages, **kwargs):
+                            yield chunk
+
+            folded_llm = FoldProvider(["unused", "fold acknowledged"])
+            agent.llm = agent.controller.llm = folded_llm
+            append = type(agent.controller.conversation).append
+            folded_writers = []
+
+            def observe_fold(conversation, role, content, **kwargs):
+                if (
+                    conversation is agent.controller.conversation
+                    and role == "user"
+                    and content == "midturn user"
+                ):
+                    folded_writers.append(asyncio.current_task())
+                return append(conversation, role, content, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    type(agent.controller.conversation), "append", observe_fold
+                )
+                turn = asyncio.create_task(agent.run("start fold"))
+                try:
+                    await asyncio.wait_for(entered.wait(), 3)
+                    assert await agent.inject_input("midturn user") is False
+                    release.set()
+                    assert "fold acknowledged" in (await turn).text
+                finally:
+                    release.set()
+                    await asyncio.gather(turn, return_exceptions=True)
+            assert folded_llm.call_count == 2
+            assert folded_writers == [agent._session_state_owner.task]
+            assert (
+                sum(
+                    message["content"] == "midturn user"
+                    for message in folded_llm.call_log[1]
+                )
+                == 1
+            )

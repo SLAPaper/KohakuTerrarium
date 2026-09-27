@@ -4,10 +4,19 @@ Plugins can rewrite a ``ToolCallEvent`` between parser emission and
 executor dispatch, or veto the call via ``PluginBlockError``.
 """
 
+import asyncio
+from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from kohakuterrarium.core.events import TriggerEvent, create_tool_complete_event
+from kohakuterrarium.core.controller_history import commit_controller_state
+from kohakuterrarium.core.interrupted_history import (
+    append_pending_result,
+    pending_result_slot,
+)
+from kohakuterrarium.core.tool_origin import capture_tool_context
 from kohakuterrarium.modules.plugin.base import (
     BasePlugin,
     PluginBlockError,
@@ -47,6 +56,8 @@ async def run_pre_tool_dispatch(
     if not hook_plugins:
         return parse_event
 
+    original = deepcopy(parse_event)
+    target = await _capture_native_target(controller, original)
     current = parse_event
     for plugin in hook_plugins:
         plugin_name = getattr(plugin, "name", "?")
@@ -70,8 +81,8 @@ async def run_pre_tool_dispatch(
                 plugin_name=plugin_name,
                 tool_name=current.name,
             )
-            _synthesize_blocked_tool_result(
-                current, controller, str(block), plugin_name
+            await _synthesize_blocked_tool_result(
+                original, controller, str(block), plugin_name, target=target
             )
             return None
         except Exception as e:
@@ -103,11 +114,12 @@ async def run_pre_tool_dispatch(
                 original=parse_event.name,
                 rewritten=current.name,
             )
-            _synthesize_blocked_tool_result(
-                parse_event,
+            await _synthesize_blocked_tool_result(
+                original,
                 controller,
                 f"unknown tool after rewrite: {current.name}",
                 "pre_tool_dispatch",
+                target=target,
             )
             return None
     return current
@@ -121,6 +133,8 @@ async def run_pre_subagent_dispatch(
     if plugins is None or not plugins._plugins:
         return parse_event
 
+    original = deepcopy(parse_event)
+    target = await _capture_native_target(controller, original)
     task = parse_event.args.get("task", parse_event.args.get("content", ""))
     try:
         updated_task = await plugins.run_pre_hooks(
@@ -135,7 +149,9 @@ async def run_pre_subagent_dispatch(
             subagent_name=parse_event.name,
             error=str(block),
         )
-        _synthesize_blocked_subagent_result(parse_event, controller, str(block))
+        await _synthesize_blocked_subagent_result(
+            original, controller, str(block), target=target
+        )
         return None
     if updated_task is not None and updated_task != task:
         args = dict(parse_event.args)
@@ -147,13 +163,191 @@ async def run_pre_subagent_dispatch(
     return parse_event
 
 
-def _synthesize_blocked_subagent_result(
+async def _capture_native_target(controller, event):
+    if (
+        getattr(controller.config, "tool_format", None) != "native"
+        or getattr(controller, "_state_host", None) is None
+    ):
+        return None
+
+    def capture():
+        conversation = controller.conversation
+        job_id = f"blocked_{event.name}_{uuid4().hex}"
+        context = capture_tool_context(
+            controller._state_host, job_id, "direct", event.args.get("_tool_call_id")
+        )
+        announcement = conversation.get_last_assistant_message()
+        calls = announcement.tool_calls or [] if announcement else []
+        declaration = {"content": "", "tool_calls": deepcopy(calls)}
+        if announcement and announcement.metadata.get("generation"):
+            declaration["generation_id"] = announcement.metadata["generation"][
+                "generation_id"
+            ]
+        declaration["veto_group_id"] = (
+            f"{context['origin']['runtime_scope_id']}:{declaration.get('generation_id') or id(announcement)}"
+        )
+        return conversation, announcement, job_id, context, declaration
+
+    pending = asyncio.create_task(commit_controller_state(controller, capture))
+    cancelled = False
+    while True:
+        try:
+            target = await asyncio.shield(pending)
+            break
+        except asyncio.CancelledError:
+            if pending.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return target
+
+
+def _veto_target_current(controller, target):
+    return (
+        controller.conversation is target[0]
+        and target[0].get_last_assistant_message() is target[1]
+    )
+
+
+async def _finish_native_veto(controller, entry):
+    target, metadata = entry["target"], entry["metadata"]
+    host = controller._state_host
+    try:
+        if not entry["confirmed"]:
+            receipt = host.output_router.notify_terminal_activity(
+                "tool_error",
+                f"[{metadata['tool_name']}] {entry['content']}",
+                metadata,
+            )
+            if receipt is not None:
+                future = asyncio.wrap_future(receipt)
+                while True:
+                    try:
+                        await asyncio.shield(future)
+                        break
+                    except asyncio.CancelledError:
+                        if future.cancelled():
+                            raise RuntimeError(
+                                "Native veto persistence receipt cancelled"
+                            ) from None
+            await commit_controller_state(
+                controller, lambda: entry.update(confirmed=True)
+            )
+
+        def publish():
+            if _veto_target_current(controller, target) and append_pending_result(
+                host,
+                target[2],
+                entry["pair"],
+                entry["content"],
+            ):
+                controller.push_event_sync(
+                    TriggerEvent(type="tool_complete", content="")
+                )
+            entry["state"] = "finished"
+
+        await commit_controller_state(controller, publish)
+    except Exception as exc:
+        await commit_controller_state(
+            controller, lambda: entry.update(state="uncertain")
+        )
+        logger.error("Native veto publication failed", job_id=target[2], error=str(exc))
+        return exc
+    return None
+
+
+async def _join_veto_operation(task):
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    if isinstance(result, Exception):
+        raise result
+    return result
+
+
+async def _publish_native_veto(controller, event, content, target):
+    if target is None:
+        controller.conversation.append(
+            "tool", content, tool_call_id=event.args["_tool_call_id"], name=event.name
+        )
+        controller.push_event_sync(TriggerEvent(type="tool_complete", content=""))
+        return
+
+    def reserve():
+        if not _veto_target_current(controller, target):
+            return None
+        ledger = getattr(controller, "_native_veto_publications", None)
+        if ledger is None:
+            ledger = controller._native_veto_publications = {}
+        key = (id(target[0]), id(target[1]), event.args["_tool_call_id"])
+        entry = ledger.get(key)
+        if entry is not None and entry["state"] != "uncertain":
+            return entry
+        if entry is None:
+            pair = {
+                "tool_call_id": event.args["_tool_call_id"],
+                "name": event.name,
+                "completion_context": target[3],
+            }
+            if not pending_result_slot(controller._state_host, target[2], pair):
+                return None
+            entry = {
+                "target": target,
+                "pair": pair,
+                "content": content,
+                "confirmed": False,
+                "metadata": {
+                    **target[3],
+                    "job_id": target[2],
+                    "tool_name": event.name,
+                    "result": content,
+                    "error": content,
+                    "exit_code": 1,
+                    "_native_veto_declaration": target[4],
+                },
+            }
+            ledger[key] = entry
+        else:
+            entry["metadata"]["_native_veto_retry"] = True
+        entry["state"] = "reserved"
+        task = asyncio.create_task(_finish_native_veto(controller, entry))
+        entry["task"] = task
+        pending = controller._state_host.output_router._terminal_publications
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+        return entry
+
+    async def accepted():
+        entry = await commit_controller_state(controller, reserve)
+        if entry is not None:
+            return await asyncio.shield(entry["task"])
+
+    await _join_veto_operation(asyncio.create_task(accepted()))
+
+
+async def _synthesize_blocked_subagent_result(
     original_event: SubAgentCallEvent,
     controller: "Controller",
     message: str,
+    *,
+    target=None,
 ) -> None:
     """Inject synthetic feedback when a sub-agent dispatch is vetoed."""
     error_text = f"[{original_event.name}] {message}"
+    if getattr(
+        controller.config, "tool_format", None
+    ) == "native" and original_event.args.get("_tool_call_id"):
+        await _publish_native_veto(controller, original_event, error_text, target)
+        return
     controller.push_event_sync(
         create_tool_complete_event(
             job_id=f"blocked_agent_{original_event.name}",
@@ -164,24 +358,20 @@ def _synthesize_blocked_subagent_result(
     )
 
 
-def _synthesize_blocked_tool_result(
+async def _synthesize_blocked_tool_result(
     original_event: ToolCallEvent,
     controller: "Controller",
     message: str,
     plugin_name: str,
+    *,
+    target=None,
 ) -> None:
     """Inject a synthetic tool result when pre_tool_dispatch vetoes."""
     tool_call_id = original_event.args.get("_tool_call_id") or ""
     native_mode = getattr(controller.config, "tool_format", None) == "native"
     error_text = f"[{plugin_name}] {message}"
     if native_mode and tool_call_id:
-        controller.conversation.append(
-            "tool",
-            error_text,
-            tool_call_id=tool_call_id,
-            name=original_event.name,
-        )
-        controller.push_event_sync(TriggerEvent(type="tool_complete", content=""))
+        await _publish_native_veto(controller, original_event, error_text, target)
     else:
         controller.push_event_sync(
             create_tool_complete_event(

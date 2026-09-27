@@ -5,18 +5,26 @@ creatures. Unchanged graphs retain their stores. Engine channel operations own
 this coordination; external callers use Terrarium.connect/disconnect.
 """
 
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import kohakuterrarium.terrarium.drive.topology as _drive_topology
 import kohakuterrarium.terrarium.topology_leftovers as _topo_leftovers
+from kohakuterrarium.core.session_attachment import attach_topology_member
 from kohakuterrarium.errors import SessionNotResumableError
+from kohakuterrarium.session.event_origin import capture_events, import_events
 from kohakuterrarium.session.identity import new_conversation_id
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.session_plugin_state import (
     guarded_plugin_state_handoff,
     transfer_graph_plugin_state,
+)
+from kohakuterrarium.terrarium.session_subagent_state import transfer_graph_children
+from kohakuterrarium.terrarium.session_resources import (
+    track_opened_store,
+    unpublished_store_factory,
 )
 from kohakuterrarium.utils.logging import get_logger
 
@@ -28,45 +36,23 @@ logger = get_logger(__name__)
 
 
 def copy_events_into(src: SessionStore, dst: SessionStore) -> int:
-    """Copy every event in ``src`` into ``dst`` preserving agent
-    namespaces.  Returns the number of events copied.
+    """Copy detached events through each store's worker; requires blocking.
 
-    The destination is appended to via the public ``append_event`` API
-    so its monotonic counters stay consistent.  Original ``ts`` and
-    other payload fields are preserved; ``event_id`` is re-stamped by
-    ``dst`` (a re-stamp is fine — order is what callers care about).
+    Preserves namespace order and branch fields. Destination event IDs are
+    allocated by append_event; embedded source references are not remapped here.
     """
-    # This synchronous topology transaction includes all accepted writes.
-    for store in (src, dst):
-        store.submit(lambda: None).result()
-    try:
-        src.events.flush_cache()
-    except Exception:
-        pass
-    n = 0
-    for agent in src.discover_agents_from_events():
-        for raw in src.get_events(agent):
-            data = dict(raw)
-            event_type = data.pop("type", "event")
-            # ``append_event`` sets event_id itself; clear any stale id.
-            data.pop("event_id", None)
-            kwargs = {}
-            for fld in ("turn_index", "spawned_in_turn", "branch_id"):
-                if fld in data:
-                    kwargs[fld] = data.pop(fld)
-            if "parent_branch_path" in data:
-                pbp = data.pop("parent_branch_path")
-                if isinstance(pbp, list):
-                    kwargs["parent_branch_path"] = [tuple(p) for p in pbp]
-            dst.append_event(agent, event_type, data, **kwargs)
-            n += 1
-    return n
+    if any(
+        threading.get_ident() == getattr(store, "_affinity_worker_ident", None)
+        for store in (src, dst)
+    ):
+        raise RuntimeError("Event copy coordinator cannot run on a store worker")
+    if src is dst or Path(src.path).resolve() == Path(dst.path).resolve():
+        raise ValueError("Event copy requires distinct stores")
+    captured = src.submit(capture_events, src).result()
+    return len(dst.submit(import_events, dst, captured).result())
 
 
-# Resumable-config meta keys to inherit on split/merge. Without these
-# (especially ``config_path`` and ``config_snapshot``), the new child
-# stores carry only ``agents`` / ``status`` and a resume request 502s
-# with "Session has no config_path or config_snapshot in metadata".
+# Configuration and environment metadata inherited by split/merge destinations.
 _RESUMABLE_META_KEYS: tuple[str, ...] = (
     "config_type",
     "config_path",
@@ -121,6 +107,7 @@ def _inherit_conversation_lifecycle(
         dst_store.meta["last_active"] = src_meta["last_active"]
 
 
+@unpublished_store_factory
 def merge_session_stores(
     old_stores: list[SessionStore],
     new_path: str | Path,
@@ -131,7 +118,7 @@ def merge_session_stores(
     Meta carries ``parent_session_ids`` so a future viewer can render
     a fork/merge history.
     """
-    new_store = SessionStore(new_path)
+    new_store = track_opened_store(SessionStore(new_path))
     parents: list[str] = []
     inherited_meta: dict = {}
     for old in old_stores:
@@ -167,6 +154,7 @@ def merge_session_stores(
     return new_store
 
 
+@unpublished_store_factory
 def split_session_store(
     old_store: SessionStore,
     new_paths: list[str | Path],
@@ -184,7 +172,7 @@ def split_session_store(
         full_old_meta = {}
         logger.warning("split: load_meta failed for inheritance", exc_info=True)
     for path in new_paths:
-        new_store = SessionStore(path)
+        new_store = track_opened_store(SessionStore(path))
         copy_events_into(old_store, new_store)
         try:
             new_store.meta["session_id"] = new_store.session_id
@@ -370,17 +358,11 @@ def apply_merge(
             # handle, so it is engine-owned regardless of the sources.
             kept = merge_session_stores(old_stores, new_path)
             kept_owned = True
+    transfer_graph_children(engine, [(keep_gid, kept)])
     transfer_graph_plugin_state(engine, keep_gid, kept)
     engine._session_stores[keep_gid] = kept
     for gid in drop_gids:
         engine._session_stores.pop(gid, None)
-    # Close every superseded store the engine owned; the survivor stays
-    # open (it now backs the merged graph).
-    for gid, store in source_stores.items():
-        if store is kept:
-            continue
-        if gid in owned_source_gids:
-            _close_superseded(store)
     if owned is not None:
         for gid in source_gids:
             owned.discard(gid)
@@ -391,6 +373,9 @@ def apply_merge(
     _topo_leftovers.transfer_leftovers(engine, source_gids, keep_gid)
     _refresh_graph_meta(engine, keep_gid, kept)
     _attach_store_to_graph(engine, keep_gid, kept)
+    for gid, store in source_stores.items():
+        if store is not kept and gid in owned_source_gids:
+            _close_superseded(store)
 
 
 @guarded_plugin_state_handoff
@@ -447,6 +432,9 @@ def apply_split(
         (gid, p) for gid, p in zip(delta.new_graph_ids, new_paths) if gid != reuse_gid
     ]
     new_stores = split_session_store(parent, [p for _, p in fresh]) if fresh else []
+    transfer_graph_children(
+        engine, [(gid, store) for (gid, _), store in zip(fresh, new_stores)]
+    )
     for (gid, _), store in zip(fresh, new_stores):
         transfer_graph_plugin_state(engine, gid, store)
         engine._session_stores[gid] = store
@@ -584,6 +572,6 @@ def _attach_store_to_graph(
         if c is None:
             continue
         if hasattr(c.agent, "attach_session_store"):
-            c.agent.attach_session_store(store)
+            attach_topology_member(c.agent, store)
         elif hasattr(c.agent, "session_store"):
             c.agent.session_store = store

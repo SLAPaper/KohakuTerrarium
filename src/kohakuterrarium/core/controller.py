@@ -26,6 +26,7 @@ from kohakuterrarium.core.controller_history import (
     capture_turn_messages,
 )
 from kohakuterrarium.core.controller_generation import start_generation
+from kohakuterrarium.core.controller_recovery import recovery_chat
 from kohakuterrarium.core.controller_plugins import (
     register_controller_command,
     run_post_llm_call_chain,
@@ -418,7 +419,8 @@ class Controller:
 
         await start_generation(self)
         with time_llm_call(self.llm) as _t:
-            async for chunk in self.llm.chat(
+            async for chunk in recovery_chat(
+                self,
                 messages,
                 stream=True,
                 tools=tool_schemas or None,
@@ -560,7 +562,8 @@ class Controller:
 
         await start_generation(self)
         with time_llm_call(self.llm) as _t:
-            async for chunk in self.llm.chat(
+            async for chunk in recovery_chat(
+                self,
                 messages,
                 stream=True,
                 provider_native_tools=provider_native_tools or None,

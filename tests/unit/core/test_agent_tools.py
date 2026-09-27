@@ -64,6 +64,7 @@ class _FakeAgent(AgentToolsMixin):
         self._direct_job_meta = {}
         self._active_handles = {}
         self._bg_controller_notify = {}
+        self._turn_dispatched_bg = set()
         self._termination_checker = None
         self._running = True
         self._processed: list = []
@@ -433,9 +434,20 @@ class TestFormatTextResults:
 
 
 class TestHandlePromotion:
-    def test_native_mode_appends_placeholder(self, agent):
+    async def test_native_mode_appends_placeholder(self, agent):
+        agent.controller.conversation.append(
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{}"},
+                }
+            ],
+        )
         agent._register_direct_job("bash_x", kind="tool", name="bash")
-        agent._handle_promotion(
+        await agent._handle_promotion(
             "bash_x",
             agent.controller,
             tool_call_ids={"bash_x": "call_1"},
@@ -445,9 +457,9 @@ class TestHandlePromotion:
         assert last.role == "tool"
         assert "Promoted to background" in last.content
 
-    def test_non_native_no_append(self, agent):
+    async def test_non_native_no_append(self, agent):
         before = len(agent.controller.conversation.get_messages())
-        agent._handle_promotion(
+        await agent._handle_promotion(
             "bash_x",
             agent.controller,
             tool_call_ids={},
@@ -458,9 +470,9 @@ class TestHandlePromotion:
         # The activity is emitted but no conversation append.
         assert all(m.role != "tool" for m in after_messages[before:])
 
-    def test_meta_marked_background(self, agent):
+    async def test_meta_marked_background(self, agent):
         agent._register_direct_job("bash_x", kind="tool", name="bash")
-        agent._handle_promotion(
+        await agent._handle_promotion(
             "bash_x",
             agent.controller,
             tool_call_ids={},
@@ -502,6 +514,17 @@ class TestWaitHandles:
         handle = BackgroundifyHandle(job_id="x", task=task)
         await asyncio.sleep(0.01)
         agent._register_direct_job("x", kind="tool", name="t")
+        agent.controller.conversation.append(
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "t", "arguments": "{}"},
+                }
+            ],
+        )
         results, promotions = await agent._wait_handles(
             {"x": handle},
             ["x"],
@@ -947,15 +970,15 @@ class TestHandlePromotionPlugins:
         mgr.notify = AsyncMock()
         agent.plugins = mgr
         agent._register_direct_job("bash_x", kind="tool", name="bash")
-        agent._handle_promotion("bash_x", agent.controller, {}, False)
+        await agent._handle_promotion("bash_x", agent.controller, {}, False)
         # asyncio.create_task scheduled the plugin notify; give it a tick.
         await asyncio.sleep(0)
         mgr.notify.assert_called()
 
-    def test_no_plugins_no_op(self, agent):
+    async def test_no_plugins_no_op(self, agent):
         # ``plugins`` attribute missing means the notify branch is skipped.
         agent._register_direct_job("bash_x", kind="tool", name="bash")
-        agent._handle_promotion("bash_x", agent.controller, {}, False)
+        await agent._handle_promotion("bash_x", agent.controller, {}, False)
 
 
 # ── _emit_direct_completion_activity edge cases ──────────────────

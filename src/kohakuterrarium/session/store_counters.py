@@ -21,6 +21,8 @@ def restore_event_counters(
     events: KVault,
     event_seq: dict[str, int],
     state: KVault | None = None,
+    *,
+    verify_rows: bool = False,
 ) -> int:
     """Restore per-agent event sequences and return the largest event ID.
 
@@ -43,10 +45,14 @@ def restore_event_counters(
             persisted = None
         if isinstance(persisted, int):
             _restore_event_seq_from_keys(events, event_seq)
-            return persisted
+            return (
+                max(persisted, _scan_max_event_id(events, strict=True))
+                if verify_rows
+                else persisted
+            )
 
     _restore_event_seq_from_keys(events, event_seq)
-    return _scan_max_event_id(events)
+    return _scan_max_event_id(events, strict=verify_rows)
 
 
 def _restore_event_seq_from_keys(events: KVault, event_seq: dict[str, int]) -> None:
@@ -63,16 +69,26 @@ def _restore_event_seq_from_keys(events: KVault, event_seq: dict[str, int]) -> N
                 pass
 
 
-def _scan_max_event_id(events: KVault) -> int:
+def _scan_max_event_id(events: KVault, *, strict: bool = False) -> int:
     max_event_id = 0
     for key_bytes in events.keys(limit=_KV_KEYS_LIMIT):
         try:
             evt = events[key_bytes]
+            if strict and (
+                not isinstance(evt, dict)
+                or type(evt.get("event_id")) is not int
+                or evt["event_id"] <= 0
+            ):
+                raise ValueError(
+                    "Invalid event ID while restoring identity-enabled counters"
+                )
             if isinstance(evt, dict):
                 eid = evt.get("event_id")
                 if isinstance(eid, int) and eid > max_event_id:
                     max_event_id = eid
         except Exception as e:
+            if strict:
+                raise
             logger.warning(
                 "Failed to read event for id scan",
                 error=str(e),
