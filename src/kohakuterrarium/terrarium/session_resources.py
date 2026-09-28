@@ -3,11 +3,28 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
+from pathlib import Path
+from uuid import uuid4
 
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 _OPENED = ContextVar("kt_transition_stores", default=None)
+
+
+def archive_unpublished_store(store):
+    """Preserve a closed, newly-created failed target and its artifacts off its retry path."""
+    if not store._closed:
+        raise RuntimeError("Cannot archive an open session target")
+    path = Path(store.path)
+    archive = path.parent / ".failed-handoffs" / uuid4().hex
+    archive.mkdir(parents=True, exist_ok=False)
+    artifacts = path.with_name(f"{path.stem}.artifacts")
+    if artifacts.exists():
+        artifacts.rename(archive / artifacts.name)
+    target = path.rename(archive / path.name)
+    logger.warning("Unpublished handoff target archived", path=str(target))
+    return target
 
 
 def track_opened_store(store):

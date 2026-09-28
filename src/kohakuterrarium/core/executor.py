@@ -12,7 +12,7 @@ from kohakuterrarium.core.job import (
     JobStore,
     generate_job_id,
 )
-from kohakuterrarium.core.tool_output import normalize_tool_result
+from kohakuterrarium.core.tool_output_persistence import normalize_completed_tool
 from kohakuterrarium.modules.tool.doc_mode import (
     DEFAULT_DOC_MODE,
     DOC_MODE_BRIEF,
@@ -347,12 +347,12 @@ class Executor:
             else:
                 result = await exec_fn(args, context=context)
             max_output = tool.config.max_output if isinstance(tool, BaseTool) else 0
-            normalized, metadata = normalize_tool_result(
+            normalized, metadata = await normalize_completed_tool(
+                self._agent,
                 tool,
                 result,
                 max_output=max_output,
                 job_id=job_id,
-                artifact_store=getattr(self._agent, "session_store", None),
             )
             job_result = JobResult(
                 job_id=job_id,

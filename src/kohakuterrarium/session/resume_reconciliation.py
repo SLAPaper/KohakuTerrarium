@@ -194,9 +194,10 @@ def _collect_evidence(events, announcements):
             and _job_key(event) in relevant_jobs
         ):
             _bind(jobs, _provider(event), _job_key(event))
-    for event in events:
+    for position, event in enumerate(events):
         if not isinstance(event, dict):
             raise HistoryCompatibilityError("Invalid selected resume event")
+        event = {**event, "_resume_position": position}
         if _kind(event) is None:
             continue
         provider = _provider(event)
@@ -317,7 +318,7 @@ def _validate_origin(event):
 
 
 def _check_pair(dispatch, terminal):
-    if dispatch["event_id"] >= terminal["event_id"]:
+    if dispatch["_resume_position"] >= terminal["_resume_position"]:
         raise HistoryCompatibilityError("Resume terminal precedes dispatch")
     if _kind(dispatch) != _kind(terminal):
         raise HistoryCompatibilityError("Resume call kind disagrees")

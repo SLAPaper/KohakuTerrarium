@@ -31,6 +31,7 @@ from kohakuterrarium.terrarium.drive.config import (
     default_registrations,
     validate_runtime_selection,
 )
+from kohakuterrarium.terrarium.drive.errors import DriveHandoffError
 from kohakuterrarium.terrarium.drive.requests import DriveQuery
 from kohakuterrarium.terrarium.drive.injection import (
     install_drive_runtime,
@@ -321,6 +322,9 @@ class DriveRuntime:
     def schedule_reconcile(self, creature: Any) -> None:
         """Schedule one reconciliation after a creature finishes restoration."""
         creature_id = creature.creature_id
+        handoff = self._registry._handoff
+        if handoff is not None and creature.graph_id in handoff.graph_ids:
+            return
         if self._session_binding_uncertain(creature):
             return
         if creature_id in self._reconcile_creatures:
@@ -379,7 +383,7 @@ class DriveRuntime:
             manager = await self._registry.ensure_started(creature.graph_id)
             await self._remap_resumed_assignees(creature.graph_id)
             await manager.reconcile(creature_id=creature.creature_id)
-        except DriveRepositoryClosedError:
+        except (DriveRepositoryClosedError, DriveHandoffError):
             return
 
     async def _remap_resumed_assignees(self, graph_id: str) -> None:

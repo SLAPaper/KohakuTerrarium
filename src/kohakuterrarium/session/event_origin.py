@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 STORE_UUID = "_kt_store_uuid_v1"
 EVENT_ORIGIN = "_kt_event_origin_v1"
+EVENT_COORDINATE = "_kt_event_coordinate_v1"
 _IMPORT = ContextVar("kt_event_origin_import", default=None)
 _LIMIT = 2**31 - 1
 
@@ -28,11 +29,25 @@ def validate_origin(value, namespace):
     return tuple(value)
 
 
+def event_key_order(key):
+    """Order event keys by namespace and numeric physical sequence."""
+    key = key.decode("utf-8") if isinstance(key, bytes) else key
+    parts = key.rsplit(":e", 1)
+    if (
+        len(parts) != 2
+        or not parts[0]
+        or not parts[1].isascii()
+        or not parts[1].isdigit()
+    ):
+        raise ValueError(f"Invalid event key: {key}")
+    return parts[0], int(parts[1])
+
+
 def strict_rows(store):
     """Read every event namespace without skipping unreadable rows."""
     store.events.flush_cache()
     rows = []
-    for raw_key in sorted(store.events.keys(limit=_LIMIT)):
+    for raw_key in sorted(store.events.keys(limit=_LIMIT), key=event_key_order):
         key = raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
         parts = key.rsplit(":e", 1)
         if len(parts) != 2 or not parts[0] or not parts[1].isdigit():
@@ -74,11 +89,23 @@ def row_origin(uid, namespace, row):
     return validate_origin(value, namespace)
 
 
+def annotate_coordinate(store, namespace, row):
+    """Project a canonical read coordinate without changing a persisted native row."""
+    uid = getattr(store, "meta", {}).get(STORE_UUID)
+    if uid is None or not isinstance(row, dict):
+        return row
+    value = deepcopy(row)
+    value[EVENT_COORDINATE] = deepcopy(
+        row.get(EVENT_ORIGIN, [uid, namespace, row.get("event_id")])
+    )
+    return value
+
+
 def _payload(row):
     return {
         key: value
         for key, value in row.items()
-        if key not in ("event_id", EVENT_ORIGIN)
+        if key not in ("event_id", EVENT_ORIGIN, EVENT_COORDINATE)
     }
 
 
@@ -134,6 +161,8 @@ def append_imported(store, namespace, event_type, data):
 
 def append_mirrored(store, namespace, event_type, data):
     """Recognize a repeated mirror ID without creating a conflicting physical row."""
+    data = deepcopy(data)
+    data.pop(EVENT_COORDINATE, None)
     event_id = data.get("event_id")
     if type(event_id) is int and 0 < event_id <= store._global_event_id:
         for name, key, row in strict_rows(store):

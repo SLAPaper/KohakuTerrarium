@@ -6,6 +6,8 @@ from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any
 
+from kohakuterrarium.errors import InvalidRequestError
+from kohakuterrarium.core.model_switch_guard import require_topology_mutation_available
 from kohakuterrarium.modules.plugin.state_scope import (
     context_state_key,
     migrate_legacy_state,
@@ -32,6 +34,7 @@ def plugin_state_binding(host):
     """Serialize external state calls with replacement of their host's store."""
     if host is None:
         return nullcontext()
+    require_topology_mutation_available(host)
     with _binding_creation_lock:
         lock = getattr(host, "_plugin_state_binding_lock", None)
         if lock is None:
@@ -46,11 +49,38 @@ def _run_sync(store, operation, *args):
     return store.submit(operation, store, *args).result()
 
 
+def _external_loop(context):
+    owner = getattr(context.host_agent, "_session_state_owner", None)
+    loop = getattr(owner, "_loop", None)
+    if loop is None:
+        return None
+    try:
+        if asyncio.get_running_loop() is loop:
+            return None
+    except RuntimeError:
+        pass
+    if not loop.is_running() or not owner.is_running:
+        raise InvalidRequestError("Plugin state owner is not running")
+    return loop
+
+
+async def _after_handoff(context, operation, *args):
+    host = context.host_agent
+    while getattr(host, "_topology_handoff_task", None) is not None:
+        await host._topology_handoff_ready.wait()
+    return await operation(context, *args)
+
+
 def get_plugin_state_sync(context, key: str) -> Any:
     """Return a detached state value, blocking the caller until completion."""
     store = context.session_store
     if store is not None and threading.get_ident() == store._affinity_worker_ident:
         return read_plugin_state(store, context_state_key(context, key))
+    loop = _external_loop(context)
+    if loop is not None:
+        return asyncio.run_coroutine_threadsafe(
+            _after_handoff(context, get_plugin_state, key), loop
+        ).result()
     with plugin_state_binding(context.host_agent):
         store = context.session_store
         if store is None:
@@ -63,6 +93,12 @@ def set_plugin_state_sync(context, key: str, value: Any) -> None:
     store = context.session_store
     if store is not None and threading.get_ident() == store._affinity_worker_ident:
         write_plugin_state(store, context_state_key(context, key), deepcopy(value))
+        return
+    loop = _external_loop(context)
+    if loop is not None:
+        asyncio.run_coroutine_threadsafe(
+            _after_handoff(context, set_plugin_state, key, deepcopy(value)), loop
+        ).result()
         return
     with plugin_state_binding(context.host_agent):
         store = context.session_store

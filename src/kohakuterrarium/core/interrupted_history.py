@@ -79,7 +79,7 @@ def pending_result_slot(agent, job_id, meta):
         call for call in messages[index].tool_calls if call.get("id") == provider_id
     )
     name = call.get("function", {}).get("name") or meta.get("name")
-    return conversation, provider_id, name
+    return conversation, provider_id, name, messages[index]
 
 
 def append_pending_result(agent, job_id, meta, content):
@@ -87,12 +87,33 @@ def append_pending_result(agent, job_id, meta, content):
     slot = pending_result_slot(agent, job_id, meta)
     if not slot:
         return False
-    conversation, provider_id, name = slot
+    conversation, provider_id, name, announcement = slot
     original = conversation._messages
     snapshot = list(original)
     metadata = deepcopy(conversation._metadata)
     try:
-        conversation.append("tool", content, tool_call_id=provider_id, name=name)
+        message = conversation.append(
+            "tool", content, tool_call_id=provider_id, name=name
+        )
+        context = tool_completion_context(agent, job_id) or meta.get(
+            "completion_context", {}
+        )
+        if isinstance(context.get("origin"), dict):
+            message.metadata["tool_delivery"] = {
+                "job_id": job_id,
+                "tool_call_id": provider_id,
+                "origin": deepcopy(context["origin"]),
+                "phase": meta.get("history_phase", "terminal"),
+                "declaration_origin": (
+                    deepcopy(announcement.metadata.get("native_declaration_origin"))
+                    if announcement
+                    else None
+                ),
+            }
+            if meta.get("ack_origin") is not None:
+                message.metadata["tool_delivery"]["ack_origin"] = deepcopy(
+                    meta["ack_origin"]
+                )
     except BaseException:
         original[:] = snapshot
         conversation._messages = original

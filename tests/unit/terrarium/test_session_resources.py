@@ -11,7 +11,7 @@ from kohakuterrarium.core.session_attachment_state import AttachmentJournal
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.llm import ScriptedLLM
-from kohakuterrarium.terrarium import autosession, session_attach
+from kohakuterrarium.terrarium import autosession, session_attach, session_merge_async
 from kohakuterrarium.terrarium.autosession import close_owned_stores
 from kohakuterrarium.terrarium.session_resources import (
     track_opened_store,
@@ -42,33 +42,30 @@ async def test_failed_merge_keeps_retirement_responsibility_for_old_source(
             sources = [a.agent.session_store, b.agent.session_store]
             if not owned:
                 engine._owned_sessions.clear()
-            bind = b.agent._bind_session_store
+            original_graphs = a.graph_id, b.graph_id
+            bind = session_merge_async._install_member
 
-            def fail_binding(store, **kwargs):
-                if store is not sources[1]:
+            def fail_binding(agent, *args):
+                if agent is b.agent:
                     if after_bind:
-                        bind(store, **kwargs)
+                        bind(agent, *args)
                     raise RuntimeError("merge member bind failed")
-                return bind(store, **kwargs)
+                return bind(agent, *args)
 
-            monkeypatch.setattr(b.agent, "_bind_session_store", fail_binding)
+            monkeypatch.setattr(session_merge_async, "_install_member", fail_binding)
             with pytest.raises(RuntimeError, match="merge member bind failed"):
                 await engine.connect(a, b, channel="merge")
-            unmapped = [
-                store
-                for store in sources
-                if store not in engine._session_stores.values()
-            ]
-            assert unmapped
-            assert all(not store._closed for store in unmapped)
+            assert (a.graph_id, b.graph_id) == original_graphs
+            assert all(store in engine._session_stores.values() for store in sources)
+            assert all(not store._closed for store in sources)
             assert all(
                 (store in getattr(engine, "_retained_session_stores", ())) == owned
-                for store in unmapped
+                for store in sources
             )
             assert (
                 a.agent._session_attach_uncertain and b.agent._session_attach_uncertain
             )
-        assert all(store._closed == owned for store in unmapped)
+        assert all(store._closed == owned for store in sources)
     finally:
         for store in sources:
             store.close(update_status=False)

@@ -4,6 +4,9 @@ from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, TypeAlias
+from uuid import uuid4
+
+from kohakuterrarium.session.event_origin import store_uuid
 
 BranchView: TypeAlias = Mapping[int | str, int | str]
 
@@ -198,20 +201,36 @@ def append_user_event_pair(
     turn_index: int | None,
     branch_id: int | None,
     parent_branch_path: list[tuple[int, int]] | None,
-) -> int:
+    *,
+    with_receipt: bool = False,
+) -> int | dict:
     """Append the canonical user pair and return the user-message event ID.
 
     Both records run as one affinity-thread unit so a cancelled turn can
     never persist half the pair (the raw-history editor and replay both
     key off the ``user_message`` half).
     """
+    uid = store_uuid(store) if with_receipt else None
+    pair_id = str(uuid4()) if with_receipt else None
+    event_ids = []
     for event_type in ("user_input", "user_message"):
+        row = deepcopy(payload)
+        if pair_id is not None:
+            row["user_pair_id"] = pair_id
         _, event_id = store.append_event(
             agent_name,
             event_type,
-            dict(payload),
+            row,
             turn_index=turn_index,
             branch_id=branch_id,
             parent_branch_path=parent_branch_path,
         )
+        event_ids.append(event_id)
+    if with_receipt:
+        return {
+            "event_id": event_id,
+            "event_origin": [uid, agent_name, event_id],
+            "user_pair_origin": [uid, agent_name, event_ids[0]],
+            "user_pair_id": pair_id,
+        }
     return event_id

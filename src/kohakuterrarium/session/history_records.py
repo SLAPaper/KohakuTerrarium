@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from kohakuterrarium.errors import ConflictError, NotFoundError
+from kohakuterrarium.session.event_origin import annotate_coordinate
 from kohakuterrarium.session.history_paging import (
     HistoryPagingError,
     _history_key,
@@ -130,6 +131,8 @@ def history_detail(
         and _record_fingerprint(record) != cursor.fingerprint
     ):
         raise ConflictError("history record changed; reload history")
+    if stream == "events":
+        record = annotate_coordinate(store, name, record)
     return {
         "record": {**record, "_history_key": _history_key(stream, name, cursor.ref)},
         "history_page": {"version": 1, "stream": stream, "history_id": identity},

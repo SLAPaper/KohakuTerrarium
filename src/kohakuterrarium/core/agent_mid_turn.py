@@ -18,6 +18,15 @@ from kohakuterrarium.core.controller import Controller
 from kohakuterrarium.core.controller_context import format_events_for_context
 from kohakuterrarium.core.events import TriggerEvent
 from kohakuterrarium.core.event_inbox import TurnOutcome
+from kohakuterrarium.core.feedback_admission import (
+    arm_background_feedback,
+    arm_injected_inputs,
+    fence_feedback,
+    prepare_feedback,
+    validate_feedback,
+)
+from kohakuterrarium.core.controller_generation import _canonical_output
+from kohakuterrarium.session.output_handoff import output_binding
 from kohakuterrarium.core.pending_input import pending_id_of
 from kohakuterrarium.llm.message import content_parts_to_dicts
 from kohakuterrarium.utils.logging import get_logger
@@ -142,6 +151,10 @@ class AgentMidTurnMixin:
 
     async def _fold_mid_turn_inputs(self, controller, claimed, drained):
         """Finish an admitted fold before releasing its processing lock."""
+        async with output_binding(_canonical_output(controller)):
+            return await self._fold_bound_inputs(controller, claimed, drained)
+
+    async def _fold_bound_inputs(self, controller, claimed, drained):
         active_run = getattr(self, "_active_event_run", None)
         if active_run is not None:
             active_run.extend(claimed)
@@ -189,20 +202,52 @@ class AgentMidTurnMixin:
         feedback_only = all(
             evt.type in ("tool_complete", "subagent_output") for evt, _ in pairs
         )
+        receipt = None
+        if len(pairs) == len(claimed):
+            originals = [envelope.event for envelope in claimed]
+            if any(
+                original.content != captured.content
+                or original.context != captured.context
+                for original, captured in zip(originals, drained)
+            ):
+                raise RuntimeError("Mid-turn feedback changed during capture")
+            payloads = [
+                {
+                    "content": _to_serializable_content(content),
+                    **(
+                        {"pending_id": pending_id_of(evt)} if pending_id_of(evt) else {}
+                    ),
+                }
+                for evt, content in pairs
+            ]
+            await submit_internal_session_state(
+                self,
+                lambda: (
+                    arm_background_feedback(self, originals),
+                    arm_injected_inputs(self, originals, payloads),
+                ),
+            )
+            receipt = await prepare_feedback(controller, originals, combined, False)
         conversation = controller.conversation
 
         def commit():
+            if receipt is not None:
+                validate_feedback(receipt)
             if controller.conversation is not conversation:
                 raise RuntimeError("Conversation replaced during mid-turn capture")
             original = conversation._messages
             snapshot = list(original)
             original_metadata = deepcopy(conversation._metadata)
             try:
-                conversation.append(
-                    "user",
-                    combined,
-                    metadata={"kind": TOOL_FEEDBACK_KIND} if feedback_only else {},
-                )
+                metadata = {"kind": TOOL_FEEDBACK_KIND} if feedback_only else {}
+                if receipt is not None:
+                    metadata.update(
+                        kind=receipt.kind,
+                        feedback_admission_origin=deepcopy(receipt.origin),
+                        turn_index=receipt.coordinates[0],
+                        branch_id=receipt.coordinates[1],
+                    )
+                conversation.append("user", combined, metadata=metadata)
             except BaseException:
                 original[:] = snapshot
                 conversation._messages = original
@@ -217,7 +262,9 @@ class AgentMidTurnMixin:
 
         try:
             coordinates = await submit_internal_session_state(self, commit)
-        except Exception as exc:
+        except BaseException as exc:
+            if receipt is not None:
+                await fence_feedback(controller)
             logger.error(
                 "Mid-turn input injection failed", error=str(exc), exc_info=True
             )
@@ -246,9 +293,10 @@ class AgentMidTurnMixin:
             # ``content_parts_to_dicts`` so both sinks get a safe payload.
             serializable_content = _to_serializable_content(content)
             pending_id = pending_id_of(evt)
-            await self._record_injected_input_event(
-                serializable_content, pending_id=pending_id, coordinates=coordinates
-            )
+            if receipt is None:
+                await self._record_injected_input_event(
+                    serializable_content, pending_id=pending_id, coordinates=coordinates
+                )
             metadata = {
                 "content": serializable_content,
                 "turn_index": coordinates[0],

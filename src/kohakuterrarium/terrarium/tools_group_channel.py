@@ -26,6 +26,11 @@ from kohakuterrarium.modules.tool.base import (
 )
 from kohakuterrarium.terrarium.events import EngineEvent, EventKind
 from kohakuterrarium.terrarium.session_subagent_state import preflight_child_split
+from kohakuterrarium.terrarium.session_split_async import prepare_split
+from kohakuterrarium.terrarium.topology_admission import (
+    require_topology_available,
+    run_topology_operation,
+)
 from kohakuterrarium.terrarium.group_tool_context import (
     GroupContext,
     cross_cluster_target_error,
@@ -156,6 +161,7 @@ async def _wire(
     channel: str,
     direction: str,
 ) -> ToolResult:
+    require_topology_available(gctx.engine)
     # Cross-graph wiring merges the graphs; the caller takes the role opposite
     # the requested target direction.
     if target.graph_id != gctx.graph.graph_id:
@@ -226,6 +232,15 @@ async def _unwire(
     channel: str,
     direction: str,
 ) -> ToolResult:
+    async def operation():
+        return await _unwire_reserved(gctx, target, channel, direction)
+
+    if target.graph_id != gctx.graph.graph_id or channel not in gctx.graph.channels:
+        return await operation()
+    return await run_topology_operation(gctx.engine, {gctx.caller.graph_id}, operation)
+
+
+async def _unwire_reserved(gctx, target, channel, direction):
     if target.graph_id != gctx.graph.graph_id:
         return err(f"target {target.name!r} is not in your graph; nothing to unwire")
     graph = gctx.graph
@@ -246,7 +261,11 @@ async def _unwire(
         projected_graph,
         affected={gctx.caller.creature_id, target.creature_id},
     )
-    preflight_child_split(gctx.engine, projected, delta)
+    prepared = await prepare_split(gctx.engine, projected, delta)
+    if prepared is None:
+        preflight_child_split(gctx.engine, projected, delta)
+    else:
+        await prepared.install()
     gctx.engine._topology = projected
     if direction == "listen":
         _channels.remove_channel_trigger(
@@ -264,12 +283,15 @@ async def _unwire(
     # remove too much, so normalize connectivity after the single-edge change and
     # apply the standard split bookkeeping. Otherwise emit to refresh both prompts.
     if delta.kind == "split":
-        _lifecycle.apply_split_bookkeeping(gctx.engine, delta)
+        _lifecycle.apply_split_bookkeeping(gctx.engine, delta, prepared=prepared)
+        if prepared is not None:
+            await prepared.retire()
         for graph_id in delta.new_graph_ids:
             await gctx.engine.checkpoint_graph(graph_id)
     else:
         _emit_intra_graph_wire_event(gctx, target.creature_id)
         await gctx.engine.checkpoint_graph(graph.graph_id)
+    await gctx.engine._drain_drive_topology()
 
     return ok(
         {

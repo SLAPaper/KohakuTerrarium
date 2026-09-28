@@ -1,16 +1,22 @@
 """Background dispatch and promotion acknowledgements commit on the state owner."""
 
 import asyncio
+from copy import deepcopy
 
 import pytest
 
 from kohakuterrarium import Terrarium
+from kohakuterrarium.errors import HistoryCompatibilityError
 from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.core import agent_tools
 from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
 from kohakuterrarium.testing.llm import ScriptedLLM
+from kohakuterrarium.session.compact_compile import compile_coverage
+from kohakuterrarium.session.compact_coverage import coordinate
+from kohakuterrarium.session.history_replay import replay_selected_events
+from kohakuterrarium.session.resume_replay import replay_resume_history
 
 
 @pytest.mark.parametrize("child", [False, True])
@@ -163,6 +169,139 @@ async def test_native_background_ack_is_owner_commit(
             assert len(responses) == 1
             if hold_ack != "stop":
                 assert "background" in responses[0].content.lower()
+            if hold_ack is False:
+                store = agent.session_store
+                raw = await store.run(store.get_events, "alice")
+                acknowledgements = [
+                    row for row in raw if row["type"] == "native_tool_ack"
+                ]
+                assert len(acknowledgements) == 1
+                receipt = responses[0].metadata["tool_delivery"]
+                assert receipt["ack_origin"] == list(coordinate(acknowledgements[0]))
+                detached = {**responses[0].to_dict(), "metadata": responses[0].metadata}
+                coverage = await store.run(
+                    compile_coverage, store, "alice", [detached], []
+                )
+                assert coverage["coverage_mode"] == "exact"
+                assert receipt["ack_origin"] in coverage["replaced_event_origins"]
+                replayed = replay_selected_events(raw, include_metadata=True)
+                restored = [
+                    message
+                    for message in replayed
+                    if message.get("metadata", {}).get("tool_delivery", {}).get("phase")
+                    == "ack"
+                ]
+                assert len(restored) == 1
+                assert restored[0]["content"] == responses[0].content
+                for field, value in (
+                    ("branch_id", 900),
+                    ("origin", "broken"),
+                    ("phase", "terminal"),
+                ):
+                    tampered = deepcopy(raw)
+                    next(row for row in tampered if row["type"] == "native_tool_ack")[
+                        field
+                    ] = value
+                    with pytest.raises(
+                        HistoryCompatibilityError, match="acknowledgement"
+                    ):
+                        replay_selected_events(tampered, include_metadata=True)
+                damaged = deepcopy(raw)
+                bad_ack = next(
+                    row for row in damaged if row["type"] == "native_tool_ack"
+                )
+                bad_ack["origin"]["delivery_id"] = "foreign:delivery"
+                with pytest.raises(HistoryCompatibilityError, match="acknowledgement"):
+                    replay_selected_events(damaged, include_metadata=True)
+                compact_event = {
+                    "event_id": max(row["event_id"] for row in raw) + 1,
+                    "type": "compact_complete",
+                    "summary": "ACK compact summary",
+                    **coverage,
+                }
+                with pytest.raises(HistoryCompatibilityError, match="acknowledgement"):
+                    replay_resume_history([*damaged, compact_event])
+                compacted = replay_resume_history([*raw, compact_event])
+                assert (
+                    sum(
+                        "ACK compact summary" in str(message.get("content"))
+                        for message in compacted
+                    )
+                    == 1
+                )
+                assert not any(message.get("role") == "tool" for message in compacted)
+                agent.pause()
+                release.set()
+                if child:
+                    await agent.subagent_manager.wait_all(timeout=3)
+                else:
+                    await agent.executor.wait_all(timeout=3)
+                await agent.output_router.flush()
+                raw = await store.run(store.get_events, "alice")
+                compact_event["event_id"] = max(row["event_id"] for row in raw) + 1
+                compacted = replay_resume_history([*raw, compact_event])
+                assert not any(message.get("role") == "tool" for message in compacted)
+                assert (
+                    sum(
+                        "ACK compact summary" in str(message.get("content"))
+                        for message in compacted
+                    )
+                    == 1
+                )
+                assert (
+                    sum(
+                        message.get("role") == "user"
+                        and "terminal result" in str(message.get("content"))
+                        for message in compacted
+                    )
+                    == 1
+                )
+                cold = replay_resume_history(raw)
+                terminal_messages = [
+                    message
+                    for message in cold
+                    if message.get("role") == "user"
+                    and "terminal result" in str(message.get("content"))
+                ]
+                terminal_coverage = await store.run(
+                    compile_coverage, store, "alice", terminal_messages, []
+                )
+                assert terminal_coverage["coverage_mode"] == "exact"
+                assert (
+                    receipt["ack_origin"]
+                    not in terminal_coverage["replaced_event_origins"]
+                )
+                forged = deepcopy(terminal_messages)
+                forged[0]["content"] = "fabricated completion"
+                with pytest.raises(
+                    HistoryCompatibilityError, match="content conflicts"
+                ):
+                    await store.run(compile_coverage, store, "alice", forged, [])
+                retained_coverage = await store.run(
+                    compile_coverage,
+                    store,
+                    "alice",
+                    [detached, *terminal_messages],
+                    terminal_messages,
+                )
+                assert retained_coverage["coverage_mode"] == "exact"
+                assert (
+                    retained_coverage["replaced_event_origins"]
+                    == coverage["replaced_event_origins"]
+                )
+                assert (
+                    sum(
+                        message.get("role") == "tool"
+                        and message.get("tool_call_id") == "provider"
+                        for message in cold
+                    )
+                    == 1
+                )
+                assert any(
+                    message.get("role") == "user"
+                    and "terminal result" in str(message.get("content"))
+                    for message in cold
+                )
             if hold_ack in ("stop", "interrupt"):
                 assert agent.llm.call_count == 1
             if stopping is not None:

@@ -7,6 +7,9 @@ import json
 import pytest
 
 from kohakuterrarium.session import history_paging as hp
+from kohakuterrarium.session.event_origin import EVENT_COORDINATE, store_uuid
+from kohakuterrarium.session.history_records import history_detail
+from kohakuterrarium.session.history_replay import replay_selected_events
 from kohakuterrarium.session.history_paging import (
     HistoryPagingError,
     decode_cursor,
@@ -51,6 +54,70 @@ def _walk_oldest(store, limit=2):
         before = _cursor(page["history_page"], "before")
         last = page
     return ordered, last
+
+
+def test_exact_compact_page_projects_native_coordinates_without_cursor_drift(store):
+    _events(store, ["covered", "hole"])
+    before = page_events(store, "ag", session_id="g", limit=2)
+    uid = store.submit(store_uuid, store).result()
+    store.append_event(
+        "ag",
+        "compact_complete",
+        {
+            "summary": "summary",
+            "compact_coverage_version": 1,
+            "coverage_mode": "exact",
+            "replaced_event_origins": [[uid, "ag", 1]],
+            "summary_anchor_origin": [uid, "ag", 1],
+        },
+    )
+    page = page_events(store, "ag", session_id="g", limit=10)
+    assert page["items"][0][EVENT_COORDINATE] == [uid, "ag", 1]
+    assert replay_selected_events(page["items"]) == [
+        {"role": "assistant", "content": "summary"},
+        {"role": "assistant", "content": "hole"},
+    ]
+    detail = history_detail(
+        store,
+        "ag",
+        session_id="g",
+        stream="events",
+        ref=before["history_page"]["before"],
+        history_id=before["history_page"]["history_id"],
+    )
+    assert detail["record"][EVENT_COORDINATE] == [uid, "ag", 1]
+    assert not page_events(
+        store, "ag", session_id="g", after=before["history_page"]["after"]
+    )["history_page"]["reset_required"]
+
+
+def test_oversized_compact_preview_preserves_all_coverage_identities(
+    store, monkeypatch
+):
+    monkeypatch.setattr(hp, "MAX_PAGE_BYTES", 16000)
+    uid = store.submit(store_uuid, store).result()
+    origins = [[uid, "ag", i] for i in range(1, 101)]
+    store.append_event(
+        "ag",
+        "compact_complete",
+        {
+            "summary": "summary " * 10000,
+            "compact_coverage_version": 1,
+            "coverage_mode": "exact",
+            "replaced_event_origins": origins,
+            "summary_anchor_origin": origins[0],
+            "compact_path": [[i, 1] for i in range(1, 51)],
+        },
+    )
+    page = page_events(store, "ag", session_id="g", limit=10)
+    item = page["items"][0]
+    assert item["_history_truncated"]
+    assert item["replaced_event_origins"] == origins
+    assert item["summary_anchor_origin"] == origins[0]
+    assert item["compact_path"] == [[i, 1] for i in range(1, 51)]
+    assert len(hp._canonical_json(page)) <= hp.MAX_PAGE_BYTES
+    assert item["coverage_mode"] == "exact"
+    assert item["type"] == "compact_complete"
 
 
 def test_tail_page_returns_newest_bounded_slice(store):

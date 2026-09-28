@@ -54,10 +54,12 @@ def _build_bare_repo(tmp_path: Path) -> tuple[str, dict[str, str]]:
     from dulwich.repo import Repo
 
     bare = tmp_path / "origin.git"
-    porcelain.init(str(bare), bare=True)
+    with porcelain.init(str(bare), bare=True) as bare_repo:
+        bare_repo.refs.set_symbolic_ref(b"HEAD", b"refs/heads/master")
 
     work = tmp_path / "work"
-    porcelain.clone(str(bare), str(work))
+    with porcelain.clone(str(bare), str(work)) as work_repo:
+        work_repo.refs.set_symbolic_ref(b"HEAD", b"refs/heads/master")
 
     author = b"Test <test@example.com>"
 
@@ -92,7 +94,8 @@ def _build_bare_repo(tmp_path: Path) -> tuple[str, dict[str, str]]:
     # Feature branch off v1 with its own commit, then push.
     porcelain.branch_create(str(work), "feature", objectish=sha_v1)
     porcelain.update_head(str(work), "feature")
-    porcelain.reset(Repo(str(work)), "hard", sha_v1.encode())
+    with Repo(str(work)) as repo:
+        porcelain.reset(repo, "hard", sha_v1.encode())
     (work / "feature.txt").write_text("on a feature branch")
     porcelain.add(str(work), [str(work / "feature.txt")])
     porcelain.commit(str(work), message=b"feature", author=author, committer=author)

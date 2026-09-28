@@ -22,6 +22,8 @@ from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
 from kohakuterrarium.terrarium.drive.delivery_failure import (
     DeliveryFailureMixin,
 )
+from kohakuterrarium.terrarium.drive.delivery_handoff import DeliveryHandoffBook
+from kohakuterrarium.terrarium.drive.errors import DriveHandoffError
 from kohakuterrarium.terrarium.drive.models import (
     DriveAssignment,
     DriveDelivery,
@@ -112,6 +114,8 @@ class DriveDispatcher(DeliveryFailureMixin):
         self._inflight: dict[str, str] = {}
         self._consecutive: dict[str, int] = {}
         self._settle_tasks: set[asyncio.Task] = set()
+        self._receipts = DeliveryHandoffBook()
+        self._handoff_paused = False
 
     def notify(self) -> None:
         """Wake the claim loop after new or changed delivery work."""
@@ -119,10 +123,24 @@ class DriveDispatcher(DeliveryFailureMixin):
 
     async def start(self) -> None:
         """Start the dispatcher unless it is already running."""
-        if self._task is not None:
+        if self._handoff_paused:
+            return
+        if self._task is not None and not self._task.done():
             return
         self._stopping = False
         self._task = asyncio.create_task(self._run())
+
+    def pause_handoff(self):
+        """Stop new scans without joining external admission or turn completion."""
+        self._handoff_paused = True
+        self._stopping = True
+        self._wake.set()
+
+    def resume_handoff(self):
+        """Re-enable scans on a confirmed or restored repository binding."""
+        self._handoff_paused = False
+        self._stopping = False
+        self._wake.set()
 
     async def stop(self) -> None:
         """Stop the loop, drain settlements, and release outstanding claims.
@@ -142,7 +160,7 @@ class DriveDispatcher(DeliveryFailureMixin):
         await self._drain_settlements()
         try:
             await self._release_claims()
-        except DriveRepositoryClosedError:
+        except (DriveRepositoryClosedError, DriveHandoffError):
             pass
 
     async def drain(self) -> None:
@@ -151,11 +169,14 @@ class DriveDispatcher(DeliveryFailureMixin):
 
     async def _run(self) -> None:
         while not self._stopping:
+            if self._repo in self._receipts._paused:
+                self._stopping = True
+                break
             try:
                 if self._scan_callback is not None:
                     await self._scan_callback()
                 await self.dispatch_once()
-            except DriveRepositoryClosedError:
+            except (DriveRepositoryClosedError, DriveHandoffError):
                 # Repository closure is a quiescence signal, not a failed round;
                 # continuing would only spin on an unavailable executor.
                 self._stopping = True
@@ -168,10 +189,13 @@ class DriveDispatcher(DeliveryFailureMixin):
             except asyncio.TimeoutError:
                 pass
             self._wake.clear()
-        await self._drain_settlements()
+        if not self._handoff_paused:
+            await self._drain_settlements()
 
     async def dispatch_once(self) -> None:
         """Claim due deliveries and dispatch them in deterministic order."""
+        if self._handoff_paused or self._repo in self._receipts._paused:
+            return
         now = self._clock()
         limit = max(1, self._config.dispatcher_concurrency) * 4
         claimed = await self._repo.claim_deliveries(
@@ -199,6 +223,8 @@ class DriveDispatcher(DeliveryFailureMixin):
         now: datetime,
         dispatched_assignees: set[str],
     ) -> None:
+        if self._handoff_paused:
+            return
         gen = self._readiness_gen(delivery.drive_id)
         if is_delivery_stale(
             delivery, record, assignment, current_readiness_generation=gen
@@ -215,7 +241,11 @@ class DriveDispatcher(DeliveryFailureMixin):
             return
         assignee = delivery.assignee_creature_id
         # One assignee cannot receive overlapping drive admissions.
-        if assignee in dispatched_assignees or assignee in self._inflight:
+        if (
+            assignee in dispatched_assignees
+            or assignee in self._inflight
+            or self._receipts.reserved(self._repo, assignee=assignee)
+        ):
             return
         if len(self._inflight) >= self._config.dispatcher_concurrency:
             emit_observation(
@@ -275,55 +305,90 @@ class DriveDispatcher(DeliveryFailureMixin):
     async def _dispatch(
         self, delivery: DriveDelivery, assignee: str, event: TriggerEvent, now: datetime
     ) -> None:
+        receipt = self._receipts.register(self, delivery)
         self._inflight[assignee] = delivery.delivery_id
+        try:
+            await self._dispatch_receipt(delivery, assignee, event, now, receipt)
+        except BaseException as exc:
+            self._receipts.fail(receipt, exc)
+            self._inflight.pop(assignee, None)
+            raise
+
+    async def _dispatch_receipt(self, delivery, assignee, event, now, receipt):
         try:
             outcome = await self._sink.deliver(
                 assignee, event, delivery_id=delivery.delivery_id
             )
         except Exception as exc:
+            async with self._receipts.phase(receipt) as target:
+                await target._on_failure(
+                    delivery, DeliveryFailureKind.TRANSIENT, f"sink_error: {exc}", now
+                )
+            self._receipts.complete(receipt)
             self._inflight.pop(assignee, None)
-            await self._on_failure(
-                delivery, DeliveryFailureKind.TRANSIENT, f"sink_error: {exc}", now
-            )
             return
-        if not outcome.admitted:
-            # A stopped assignee is temporary unavailability, not a failed attempt;
-            # return the row to pending for restoration-time redelivery.
-            self._inflight.pop(assignee, None)
-            self._consecutive[assignee] = 0
-            await self._repo.mark_delivery(delivery.delivery_id, "pending", now=now)
+        receipt.admission = outcome
+        async with self._receipts.phase(receipt) as target:
+            await target._repo.mark_delivery(
+                delivery.delivery_id,
+                "admitted" if outcome.admitted else "pending",
+                now=now,
+            )
+            target._consecutive[assignee] = (
+                target._consecutive.get(assignee, 0) + 1 if outcome.admitted else 0
+            )
             emit_observation(
-                self._observer,
-                "drive_delivery_deferred",
+                target._observer,
+                (
+                    "drive_delivery_admitted"
+                    if outcome.admitted
+                    else "drive_delivery_deferred"
+                ),
                 delivery.drive_id,
-                {"reason": "assignee_stopped", "delivery_id": delivery.delivery_id},
+                {
+                    "delivery_id": delivery.delivery_id,
+                    **({} if outcome.admitted else {"reason": "assignee_stopped"}),
+                },
             )
-            return
-        await self._repo.mark_delivery(delivery.delivery_id, "admitted", now=now)
-        self._consecutive[assignee] = self._consecutive.get(assignee, 0) + 1
-        emit_observation(
-            self._observer,
-            "drive_delivery_admitted",
-            delivery.drive_id,
-            {"delivery_id": delivery.delivery_id},
-        )
-        if outcome.settlement is None:
-            # Without settlement evidence the admitted row remains uncertain and
-            # reconciliation must assume side effects may have occurred.
+        if not outcome.admitted or outcome.settlement is None:
+            self._receipts.complete(receipt)
             self._inflight.pop(assignee, None)
             return
-        task = asyncio.create_task(self._settle(delivery, assignee, outcome.settlement))
+        task = asyncio.create_task(
+            self._settle(delivery, assignee, outcome.settlement, receipt)
+        )
         self._settle_tasks.add(task)
-        task.add_done_callback(self._settle_tasks.discard)
+        task.add_done_callback(self._settlement_done)
+
+    def _settlement_done(self, task):
+        self._settle_tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Drive delivery settlement failed", error=str(error))
 
     async def _settle(
-        self, delivery: DriveDelivery, assignee: str, source: SettlementSource
+        self, delivery: DriveDelivery, assignee: str, source: SettlementSource, receipt
     ) -> None:
         try:
-            settlement = await _resolve_settlement(source)
-        except Exception as exc:
-            # Settlement-source failures are retryable turn errors.
-            settlement = Settlement(SettlementStatus.ERROR, {"error": str(exc)})
+            try:
+                settlement = await _resolve_settlement(source)
+            except Exception as exc:
+                settlement = Settlement(SettlementStatus.ERROR, {"error": str(exc)})
+            receipt.settlement = settlement
+            async with self._receipts.phase(receipt) as target:
+                callback = await target._apply_settlement(
+                    delivery, assignee, settlement
+                )
+            self._receipts.complete(receipt)
+            if callback is not None:
+                await callback(delivery.drive_id)
+        except BaseException as exc:
+            self._receipts.fail(receipt, exc)
+            raise
+        finally:
+            self._inflight.pop(assignee, None)
+            self._wake.set()
+
+    async def _apply_settlement(self, delivery, assignee, settlement):
         now = self._clock()
         try:
             match settlement.status:
@@ -340,7 +405,7 @@ class DriveDispatcher(DeliveryFailureMixin):
                             "outcome": settlement.detail,
                         },
                     )
-                    await self._notify_acknowledged(delivery.drive_id)
+                    return self._notify_acknowledged
                 case SettlementStatus.ERROR:
                     await self._on_failure(
                         delivery,
@@ -367,7 +432,7 @@ class DriveDispatcher(DeliveryFailureMixin):
                                 "ack_reason": USER_INTERRUPTED_REASON,
                             },
                         )
-                        await self._notify_user_interrupted(delivery.drive_id)
+                        return self._notify_user_interrupted
                     else:
                         await self._on_failure(
                             delivery, DeliveryFailureKind.TRANSIENT, "interrupted", now

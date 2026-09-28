@@ -27,10 +27,12 @@ into the destination graph(s).
   cloning is unsupported in v1.
 """
 
+import asyncio
 from dataclasses import dataclass, replace
 from typing import Any
 
 from kohakuterrarium.terrarium.drive.errors import DriveError, DriveValidationError
+from kohakuterrarium.terrarium.drive.handoff import drive_handoff
 from kohakuterrarium.terrarium.drive.models import DriveStatus
 from kohakuterrarium.terrarium.drive.policy import (
     GraphComponent,
@@ -78,17 +80,17 @@ class _DriveSource:
     """Retain access to a graph's Drive rows across repository shutdown."""
 
     gid: str
-    memory_repo: Any = None
+    repository: Any = None
     store_path: str | None = None
 
     async def export(self) -> dict[str, Any]:
-        if self.memory_repo is not None:
-            return await self.memory_repo.export_rows()
-        repo = SqliteDriveRepository(self.store_path)
+        if self.repository is not None:
+            return await self.repository.export_rows()
+        repo = await asyncio.to_thread(SqliteDriveRepository, self.store_path)
         try:
             return await repo.export_rows()
         finally:
-            repo.close_blocking()
+            await _close_if_persistent(repo)
 
 
 def _capture(runtime: Any, gid: str) -> _DriveSource | None:
@@ -96,12 +98,11 @@ def _capture(runtime: Any, gid: str) -> _DriveSource | None:
     if manager is None:
         return None
     repo = manager.repository
-    if getattr(repo, "durability", "ephemeral") == "ephemeral":
-        return _DriveSource(gid=gid, memory_repo=repo)
-    path = getattr(repo, "_path", None)
-    if not path:
-        return None
-    return _DriveSource(gid=gid, store_path=str(path))
+    if runtime.registry._bound_stores.get(gid) is not None and isinstance(
+        repo, SqliteDriveRepository
+    ):
+        return _DriveSource(gid=gid, store_path=str(repo._path))
+    return _DriveSource(gid=gid, repository=repo)
 
 
 def _enqueue(engine: Any, entry: tuple) -> None:
@@ -140,21 +141,50 @@ def stash_split(engine: Any, parent_gid: str, child_gids: list[str]) -> None:
 
 async def drain(runtime: Any) -> None:
     """Apply pending topology changes after quiescing affected reconciliations."""
+    lock = getattr(runtime, "_topology_drain_lock", None)
+    if lock is None:
+        lock = runtime._topology_drain_lock = asyncio.Lock()
+    async with lock:
+        await _drain_pending(runtime)
+
+
+async def _drain_pending(runtime):
     engine = runtime._engine
     pending = getattr(engine, "_pending_drive_topology", None)
     if not pending:
         return
     engine._pending_drive_topology = None
-    for entry in pending:
-        if entry[0] == "merge":
-            keep_gid, sources = entry[1], entry[2]
-            await runtime._drain_reconcile(keep_gid)
-            for gid in sources:
-                await runtime._drain_reconcile(gid)
-            await _apply_merge(runtime, keep_gid, sources)
-        elif entry[0] == "split":
-            await runtime._drain_reconcile(entry[1])
-            await _apply_split(runtime, entry[1], entry[2], entry[3])
+    for index, entry in enumerate(pending):
+        handoff = None
+        try:
+            if entry[0] == "merge":
+                keep_gid, sources = entry[1], entry[2]
+                await runtime._drain_reconcile(keep_gid)
+                for gid in sources:
+                    await runtime._drain_reconcile(gid)
+                async with drive_handoff(engine, set(sources) | {keep_gid}) as handoff:
+                    await _apply_merge(runtime, keep_gid, sources)
+            elif entry[0] == "split":
+                await runtime._drain_reconcile(entry[1])
+                async with drive_handoff(engine, {entry[1], *entry[2]}) as handoff:
+                    await _apply_split(runtime, entry[1], entry[2], entry[3])
+        except BaseException as exc:
+            recovery = getattr(exc, "recovery_required", False) or (
+                handoff is not None
+                and (handoff.written or engine._topology != handoff.topology)
+            )
+            if recovery:
+                failures = getattr(engine, "_failed_drive_topology", None)
+                if failures is None:
+                    failures = engine._failed_drive_topology = []
+                failures.append((entry, type(exc).__name__, str(exc)))
+                logger.error(
+                    "Drive topology entry requires cold recovery", error=str(exc)
+                )
+            engine._pending_drive_topology = pending[index + int(recovery) :] + (
+                getattr(engine, "_pending_drive_topology", None) or []
+            )
+            raise
 
 
 async def _apply_merge(
@@ -164,39 +194,38 @@ async def _apply_merge(
     engine = runtime._engine
     payloads = [await src.export() for src in sources.values()]
     merged = _combine(payloads)
-    if not merged["drives"]:
-        # Dispatchers must release against live repositories before superseded
-        # graph stores are collapsed.
-        for gid in sources:
-            if gid != keep_gid:
-                await registry.detach_and_stop(gid)
-        return
-    # Leases cannot survive repository movement because the surviving dispatcher
-    # must establish ownership against its own graph.
     _rehome_payload(merged, keep_gid)
-    # A provider repository takes precedence over session storage; resolving to
-    # the existing repository permits an in-place import without rebinding.
-    new_repo, survivor_store = registry.resolve_destination_repo(keep_gid)
+    new_repo, survivor_store = await registry.resolve_destination_repo_async(keep_gid)
     old_repo = registry.repository_for(keep_gid)
     same_repo = new_repo is old_repo
-    # Import before rebinding so a failed movement leaves the survivor's live
-    # repository intact. Import deduplication preserves append-only history.
+    backup = await new_repo.export_rows()
+    previously_written = registry._handoff.written
     try:
+        registry._handoff.written = True
         await new_repo.import_rows(merged)
-    except Exception:
+    except (Exception, asyncio.CancelledError):
+        try:
+            await new_repo.replace_rows(backup)
+            registry._handoff.written = previously_written
+        except (Exception, asyncio.CancelledError):
+            logger.error("Drive merge rollback was not confirmed", exc_info=True)
         if not same_repo:
-            _close_if_persistent(new_repo)
+            try:
+                await _close_if_persistent(new_repo, registry)
+            except (Exception, asyncio.CancelledError):
+                logger.error(
+                    "Unpublished Drive repository could not close", exc_info=True
+                )
         raise
     if not same_repo:
-        # The survivor keeps its session store while only its Drive repository is
-        # replaced, avoiding competing ownership of the store lifecycle.
-        _close_if_persistent(old_repo)
+        await _close_if_persistent(old_repo, registry)
         registry.rebind_repository(keep_gid, new_repo, survivor_store)
     await registry.ensure_started(keep_gid)
     # Each non-survivor dispatcher must stop before its graph store is closed.
     for gid in sources:
         if gid != keep_gid:
             await registry.detach_and_stop(gid)
+    registry._handoff.stage({keep_gid: merged})
     await _reconcile_graph(engine, registry, keep_gid)
 
 
@@ -232,21 +261,34 @@ async def _apply_split(
         for gid in live_children
         if gid in stores and getattr(stores[gid], "path", None)
     }
+    destinations = await _prepare_children(registry, live_children)
     repo_paths = {
-        gid: str(getattr(registry.resolve_destination_repo(gid)[0], "_path", ""))
-        for gid in live_children
+        gid: str(getattr(repo, "_path", "")) for gid, repo, _, _, _ in destinations
     }
-    if (
-        source.store_path is not None
-        and len(child_sessions) == len(live_children)
-        and all(repo_paths.values())
-    ):
-        intent = write_split_intent(
-            source.store_path, repo_paths, child_sessions, per_child
-        )
-    await _install_children_atomic(engine, registry, live_children, per_child)
+    try:
+        if (
+            source.store_path is not None
+            and len(child_sessions) == len(live_children)
+            and all(repo_paths.values())
+        ):
+            intent = await asyncio.to_thread(
+                write_split_intent,
+                source.store_path,
+                repo_paths,
+                child_sessions,
+                per_child,
+            )
+    except BaseException:
+        for _, repo, _, old_repo, _ in destinations:
+            if repo is not old_repo:
+                await _close_if_persistent(repo, registry)
+        raise
+    await _install_children_atomic(
+        engine, registry, live_children, per_child, destinations=destinations
+    )
+    registry._handoff.stage(per_child)
     if intent is not None:
-        complete_split_intent(intent)
+        await asyncio.to_thread(complete_split_intent, intent)
     for gid in live_children:
         await _reconcile_graph(engine, registry, gid)
 
@@ -439,10 +481,35 @@ def _rehome_payload(payload: dict[str, Any], target_gid: str) -> None:
     ]
 
 
-def _close_if_persistent(repo: Any) -> None:
+async def _close_if_persistent(repo: Any, registry=None) -> None:
+    if registry is not None and any(
+        repo is value for value in registry._provider_repos.values()
+    ):
+        return
     close = getattr(repo, "close_blocking", None)
     if callable(close):
-        close()
+        await asyncio.to_thread(close)
+
+
+async def _prepare_children(registry, gids):
+    destinations = []
+    try:
+        for gid in gids:
+            repo, store = await registry.resolve_destination_repo_async(gid)
+            old_repo = registry.repository_for(gid)
+            try:
+                backup = await repo.export_rows()
+            except BaseException:
+                if repo is not old_repo:
+                    await _close_if_persistent(repo, registry)
+                raise
+            destinations.append((gid, repo, store, old_repo, backup))
+    except BaseException:
+        for _, repo, _, old_repo, _ in destinations:
+            if repo is not old_repo:
+                await _close_if_persistent(repo, registry)
+        raise
+    return destinations
 
 
 async def _install_children_atomic(
@@ -450,19 +517,19 @@ async def _install_children_atomic(
     registry: Any,
     gids: list[str],
     payloads: dict[str, dict[str, Any]],
+    *,
+    destinations=None,
 ) -> None:
     """Stage all child rows before publishing any repository binding."""
-    destinations: list[tuple[str, Any, Any, Any, dict[str, Any]]] = []
-    for gid in gids:
-        repo, store = registry.resolve_destination_repo(gid)
-        old_repo = registry.repository_for(gid)
-        backup = await repo.export_rows()
-        destinations.append((gid, repo, store, old_repo, backup))
+    if destinations is None:
+        destinations = await _prepare_children(registry, gids)
     touched: list[tuple[str, Any, Any, Any, dict[str, Any]]] = []
     try:
         for item in destinations:
             gid, repo, _, _, _ = item
             touched.append(item)
+            if registry._handoff is not None:
+                registry._handoff.written = True
             await repo.replace_rows(payloads[gid])
     except Exception as install_error:
         rollback_errors: list[Exception] = []
@@ -473,7 +540,7 @@ async def _install_children_atomic(
                 rollback_errors.append(rollback_error)
         for _, repo, _, old_repo, _ in destinations:
             if repo is not old_repo:
-                _close_if_persistent(repo)
+                await _close_if_persistent(repo, registry)
         if rollback_errors:
             raise RuntimeError(
                 "Drive split failed and one or more destinations could not be restored"
@@ -481,7 +548,7 @@ async def _install_children_atomic(
         raise
     for gid, repo, store, old_repo, _ in destinations:
         if repo is not old_repo:
-            _close_if_persistent(old_repo)
+            await _close_if_persistent(old_repo, registry)
             registry.rebind_repository(gid, repo, store)
         await registry.ensure_started(gid)
 

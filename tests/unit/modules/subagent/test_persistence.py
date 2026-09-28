@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+from concurrent.futures import Future
 
 import pytest
 
@@ -9,8 +10,31 @@ from kohakuterrarium.core.job import JobState
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.subagent.manager import SubAgentManager
+from kohakuterrarium.modules.subagent.persistence import settle
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.llm import ScriptedLLM
+
+
+async def test_cancelled_receipt_preserves_accept_failure_as_cause():
+    receipt = Future()
+    started = asyncio.Event()
+
+    def reject(_):
+        raise ValueError("accept rejected")
+
+    async def waiter():
+        started.set()
+        await settle(receipt, reject)
+
+    pending = asyncio.create_task(waiter())
+    await started.wait()
+    pending.cancel()
+    await asyncio.sleep(0)
+    receipt.set_result(1)
+    with pytest.raises(asyncio.CancelledError) as exc:
+        await pending
+    assert isinstance(exc.value.__cause__, ValueError)
+    assert str(exc.value.__cause__) == "accept rejected"
 
 
 async def test_child_io_uses_store_worker_and_detached_conversation(

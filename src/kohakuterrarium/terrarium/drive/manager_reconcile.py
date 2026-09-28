@@ -166,6 +166,10 @@ class DriveManagerReconcileMixin:
         return ()
 
     async def _reconcile_drive(self, record: DriveRecord) -> None:
+        if self._dispatcher._receipts.requires_recovery(
+            self._repo
+        ) or self._dispatcher._receipts.reserved(self._repo, drive_id=record.drive_id):
+            return
         assignment = await self._repo.get_assignment(record.drive_id)
         # Persisted assignments may outlive their runtime topology. Invalid or
         # cross-graph targets are orphaned and blocked rather than redelivered.

@@ -22,6 +22,9 @@ def capture_tool_context(agent, job_id, execution_class, tool_call_id=None):
         "delivery_id": f"{scope}:{job_id}",
         "execution_class": execution_class,
     }
+    generation = getattr(getattr(agent, "controller", None), "_active_generation", None)
+    if isinstance(generation, dict) and generation.get("generation_id"):
+        origin["generation_id"] = generation["generation_id"]
     context = {"origin": origin, "execution_class": execution_class}
     if tool_call_id:
         context["tool_call_id"] = tool_call_id

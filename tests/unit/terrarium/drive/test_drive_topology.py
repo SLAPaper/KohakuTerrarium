@@ -8,6 +8,7 @@ these tests pin ROW MOVEMENT + placement + integrity, not delivery (that lives
 in the integration tier). One persistent merge exercises the sqlite path.
 """
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -23,6 +24,7 @@ from kohakuterrarium.terrarium.drive.errors import (
     DriveIdempotencyConflictError,
     DriveProposalConflictError,
 )
+from kohakuterrarium.terrarium.drive.memory import MemoryDriveRepository
 from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
 from kohakuterrarium.terrarium.drive.repository import Mutation
 from kohakuterrarium.terrarium.drive.requests import (
@@ -211,20 +213,27 @@ class TestMerge:
             store_a.close()
             store_b.close()
 
-    async def test_merge_movement_failure_leaves_survivor_consistent(self, monkeypatch):
+    @pytest.mark.parametrize("after_write", [False, True])
+    @pytest.mark.parametrize("cancel", [False, True])
+    async def test_merge_movement_failure_leaves_survivor_consistent(
+        self, monkeypatch, after_write, cancel
+    ):
         engine, rt = _make()
         rec_a = await _mk_graph(rt.manager_for("gA"), "gA", assignee="wa")
         await _mk_graph(rt.manager_for("gB"), "gB", assignee="wb")
         # Force the destination import to fail mid-merge.
-        from kohakuterrarium.terrarium.drive.memory import MemoryDriveRepository
+        original = MemoryDriveRepository.import_rows
+        error = asyncio.CancelledError if cancel else RuntimeError
 
         async def _boom(self, payload):
-            raise RuntimeError("disk full")
+            if after_write:
+                await original(self, payload)
+            raise error("disk full")
 
         monkeypatch.setattr(MemoryDriveRepository, "import_rows", _boom)
         try:
             drive_topology.stash_merge(engine, "gA", ["gA", "gB"])
-            with pytest.raises(RuntimeError, match="disk full"):
+            with pytest.raises(error, match="disk full"):
                 await _drain(engine, rt)
             # The survivor's original repo/manager is untouched — its Drive is
             # still readable (rollback / no visible mutation, §6.6).

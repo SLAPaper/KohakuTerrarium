@@ -12,14 +12,18 @@ from kohakuterrarium.terrarium.graph_identity import (
 )
 from kohakuterrarium.terrarium.session_plugin_state import validate_graph_plugin_state
 from kohakuterrarium.terrarium.session_subagent_state import preflight_child_merge
+from kohakuterrarium.terrarium.topology_admission import require_topology_available
 
 if TYPE_CHECKING:
     from kohakuterrarium.terrarium.creature_host import Creature, CreatureRef
     from kohakuterrarium.terrarium.engine import Terrarium
 
 
-def guard_graph_model_bindings(engine: "Terrarium", *graph_ids: str) -> None:
+def guard_graph_model_bindings(
+    engine: "Terrarium", *graph_ids: str, store_preflight=True
+) -> None:
     """Reject graph changes that would disturb a pending model publication."""
+    require_topology_available(engine)
     for graph_id in set(graph_ids):
         graph = engine._topology.graphs.get(graph_id)
         if graph is not None:
@@ -27,13 +31,16 @@ def guard_graph_model_bindings(engine: "Terrarium", *graph_ids: str) -> None:
                 creature = engine._creatures.get(cid)
                 if creature is not None:
                     require_model_mutation_available(creature.agent)
-    validate_graph_plugin_state(engine, graph_ids)
+    if store_preflight:
+        validate_graph_plugin_state(engine, graph_ids)
 
 
 @contextmanager
-def reserve_graph_model_bindings(engine: "Terrarium", graph_id: str):
+def reserve_graph_model_bindings(
+    engine: "Terrarium", graph_id: str, *, store_preflight=True
+):
     """Keep model replacement out of an asynchronous graph-removal window."""
-    guard_graph_model_bindings(engine, graph_id)
+    guard_graph_model_bindings(engine, graph_id, store_preflight=store_preflight)
     graph = engine._topology.graphs.get(graph_id)
     agents = (
         [
@@ -66,6 +73,7 @@ def guard_add_name(
     engine: "Terrarium", creature: "Creature", graph_id: str | None
 ) -> None:
     """Reject a duplicate role name when adding into an existing graph."""
+    require_topology_available(engine)
     if graph_id is None:
         return
     for name in sorted(creature_name_aliases(creature)):
@@ -95,6 +103,8 @@ def resolve_and_guard_connect(
     engine: "Terrarium",
     sender: "CreatureRef",
     receiver: "CreatureRef",
+    *,
+    store_preflight=True,
 ) -> tuple[Any, Any]:
     """Resolve endpoints and reject merges that create duplicate names."""
     sender_creature = engine.get_creature(engine._resolve_creature_id(sender))
@@ -105,7 +115,9 @@ def resolve_and_guard_connect(
     receiver_graph_id = engine._topology.creature_to_graph.get(
         receiver_creature.creature_id
     )
-    guard_graph_model_bindings(engine, sender_graph_id, receiver_graph_id)
+    guard_graph_model_bindings(
+        engine, sender_graph_id, receiver_graph_id, store_preflight=store_preflight
+    )
     if (
         sender_graph_id != receiver_graph_id
         and sender_graph_id is not None
@@ -124,5 +136,6 @@ def resolve_and_guard_connect(
                 name=alias,
                 creature_ids=creature_ids,
             )
-        preflight_child_merge(engine, (sender_graph_id, receiver_graph_id))
+        if store_preflight:
+            preflight_child_merge(engine, (sender_graph_id, receiver_graph_id))
     return sender_creature, receiver_creature

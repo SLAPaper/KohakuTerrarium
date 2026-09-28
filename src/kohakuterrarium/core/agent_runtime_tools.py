@@ -153,6 +153,7 @@ class AgentRuntimeToolsMixin:
         )
         job_id = generate_job_id(f"agent_{event.name}")
         context = capture_tool_context(self, job_id, "direct", tool_call_id)
+        context["subagent"] = event.name
         if tool_call_id:
             context["tool_call_arguments"] = event.raw
         is_background = False
@@ -254,7 +255,7 @@ class AgentRuntimeToolsMixin:
                 metadata={
                     "job_id": job_id,
                     **origin_metadata,
-                    "subagent": sa_meta.get("subagent", ""),
+                    "subagent": context.get("subagent") or sa_meta.get("subagent", ""),
                     "llm_name": sa_meta.get("llm_name", ""),
                     "model": sa_meta.get("model", ""),
                     "error": error,
@@ -280,7 +281,7 @@ class AgentRuntimeToolsMixin:
                 metadata={
                     "job_id": job_id,
                     **origin_metadata,
-                    "subagent": sa_meta.get("subagent", ""),
+                    "subagent": context.get("subagent") or sa_meta.get("subagent", ""),
                     "llm_name": sa_meta.get("llm_name", ""),
                     "model": sa_meta.get("model", ""),
                     "tools_used": tools_used,

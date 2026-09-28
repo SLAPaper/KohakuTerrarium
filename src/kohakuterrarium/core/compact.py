@@ -18,7 +18,9 @@ from kohakuterrarium.core.compact_splice import (
     select_compact_boundary,
     splice_conversation,
 )
-from kohakuterrarium.core.compact_state import apply_compact, capture_compact
+from kohakuterrarium.core.branch_selection import _join_accepted
+from kohakuterrarium.core.compact_commit import CompactCommitError, commit_summary
+from kohakuterrarium.core.compact_state import capture_compact
 from kohakuterrarium.core.compact_text import (
     COMPACT_PROMPT,
     extract_message_text,
@@ -26,6 +28,7 @@ from kohakuterrarium.core.compact_text import (
 from kohakuterrarium.core.conversation_elide import elide_after_compact
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.core.single_flight import SingleFlightDispatch, SingleFlightLease
+from kohakuterrarium.session.compact_compile import compile_coverage
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -68,6 +71,7 @@ class CompactManager:
         self._dispatch = SingleFlightDispatch()
         self._compact_task: asyncio.Task | None = None
         self._splice_ready = asyncio.Event()
+        self._splice_failure: CompactCommitError | None = None
         self._splice_ready.set()
         self._active_lease: SingleFlightLease | None = None
         self._last_compact_time: float = 0
@@ -101,6 +105,11 @@ class CompactManager:
         Uses prompt_tokens from the last LLM call. Token-based only,
         no character estimation fallback.
         """
+        if (
+            self._splice_failure is not None
+            or getattr(self._agent, "_compact_commit_pending", None) is not None
+        ):
+            return False
         if not self.config.enabled or self.is_compacting:
             return False
         if self._last_compact_time:
@@ -139,6 +148,8 @@ class CompactManager:
         ``compact_complete`` or ``compact_skipped``.
         """
         require_model_mutation_available(self._agent)
+        if self._splice_failure is not None:
+            raise self._splice_failure
         if not self._controller:
             self._last_skip_reason = "no_controller"
             return False
@@ -259,6 +270,7 @@ class CompactManager:
         self._active_lease = lease
         self._splice_ready.clear()
         terminal_sent = False
+        commit_task = None
         abort_reason = "aborted"
         try:
             captured = await submit_session_state(
@@ -297,6 +309,37 @@ class CompactManager:
                     )
                     return
 
+            run = getattr(captured.store, "run", None)
+            if captured.sink is not None:
+                await captured.sink.flush()
+            if callable(run):
+                events = await run(read_agent_events, captured.store, self._agent_name)
+            else:
+                events = read_agent_events(captured.store, self._agent_name)
+            frozen_metadata = build_compact_metadata(
+                captured.branch,
+                events,
+                captured.live_turn_count,
+                compact_round=self._compact_count + 1,
+                summary="",
+                messages_compacted=boundary - 1,
+            )
+            coverage = {
+                "compact_coverage_version": 1,
+                "coverage_mode": "legacy_fallback",
+                "coverage_reason": "unavailable_canonical_store",
+            }
+            if callable(run) and captured.sink is not None:
+                coverage = await run(
+                    compile_coverage,
+                    captured.store,
+                    self._agent_name,
+                    captured.prefix_messages,
+                    captured.retained_messages,
+                )
+            if coverage["coverage_mode"] == "exact":
+                frozen_metadata.pop("replaced_from_event_id", None)
+                frozen_metadata.pop("replaced_to_event_id", None)
             summary = await self._summarize(captured.summary_input)
 
             if not summary:
@@ -320,10 +363,17 @@ class CompactManager:
                 terminal_sent = True
                 return
 
-            reason = await submit_internal_session_state(
-                self._agent,
-                lambda: apply_compact(self, captured, summary, elide_after_compact),
+            commit_task = asyncio.create_task(
+                commit_summary(
+                    self,
+                    captured,
+                    summary,
+                    frozen_metadata,
+                    coverage,
+                    elide_after_compact,
+                )
             )
+            reason = await _join_accepted(commit_task)
             if reason is not None:
                 logger.warning(
                     "Compact source changed while summarizing",
@@ -335,32 +385,6 @@ class CompactManager:
                 )
                 terminal_sent = True
                 return
-            self._splice_ready.set()
-
-            if self._output_router:
-                run = getattr(self._session_store, "run", None)
-                if callable(run):
-                    # Scan on the affinity thread, ordered after queued writes.
-                    events = await run(
-                        read_agent_events, self._session_store, self._agent_name
-                    )
-                else:
-                    events = read_agent_events(self._session_store, self._agent_name)
-                metadata = build_compact_metadata(
-                    captured.branch,
-                    events,
-                    captured.live_turn_count,
-                    compact_round=self._compact_count,
-                    summary=summary,
-                    messages_compacted=boundary - 1,
-                )
-                self._output_router.notify_activity(
-                    "compact_complete",
-                    f"Context auto-compact done (round {self._compact_count})",
-                    metadata=metadata,
-                )
-                if callable(run):
-                    await run(lambda: None)
             terminal_sent = True
 
             if self._session_store:
@@ -390,8 +414,22 @@ class CompactManager:
                 )
 
         except asyncio.CancelledError:
+            if (
+                commit_task is not None
+                and commit_task.done()
+                and not commit_task.cancelled()
+            ):
+                error = commit_task.exception()
+                if isinstance(error, CompactCommitError):
+                    terminal_sent = True
+                    self._notify_commit_failure(error)
+                else:
+                    terminal_sent = error is None and commit_task.result() is None
             abort_reason = "cancelled"
             logger.info("Compact cancelled", agent=self._agent_name)
+        except CompactCommitError as exc:
+            terminal_sent = True
+            self._notify_commit_failure(exc)
         except Exception as e:
             abort_reason = "error"
             logger.error("Compact failed", agent=self._agent_name, error=str(e))
@@ -409,6 +447,18 @@ class CompactManager:
             if self._active_lease is lease:
                 self._active_lease = None
             self._compact_task = None
+
+    def _notify_commit_failure(self, error):
+        self._splice_failure = error
+        logger.error(
+            "Compact persistence unconfirmed", agent=self._agent_name, error=str(error)
+        )
+        if self._output_router:
+            self._output_router.notify_activity(
+                "processing_error",
+                str(error),
+                metadata={"error_type": "CompactCommitError", "error": str(error)},
+            )
 
     def _compact_boundary(self, messages: list) -> int:
         usage = getattr(self._controller, "_last_usage", {}) or {}
@@ -488,12 +538,16 @@ class CompactManager:
         )
 
     async def wait_for_splice(self) -> None:
-        """Wait until the current summary is applied or skipped, not persisted."""
+        """Wait for confirmed summary application or skip, excluding snapshot capture."""
         if (
             self._compact_task is not None
             and self._compact_task is not asyncio.current_task()
         ):
             await self._splice_ready.wait()
+        if self._agent is not None:
+            require_model_mutation_available(self._agent)
+        if self._splice_failure is not None:
+            raise self._splice_failure
 
     async def wait_for_current(self) -> None:
         """Join the full round externally; turn-held callers wait for the splice."""

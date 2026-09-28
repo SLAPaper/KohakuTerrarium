@@ -3,9 +3,11 @@
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.session.event_origin import validate_origin
 
 _TOPOLOGY_BINDINGS = ContextVar("kt_topology_attachment", default=None)
 
@@ -16,12 +18,76 @@ def reserve_topology_attachment(agents):
     bindings = {}
     for agent in agents:
         require_model_mutation_available(agent)
-        bindings[id(agent)] = (agent, getattr(agent, "session_store", None))
+        bindings[id(agent)] = (
+            agent,
+            getattr(agent, "session_store", None),
+            agent.config.name,
+        )
     token = _TOPOLOGY_BINDINGS.set(bindings)
     try:
         yield
     finally:
         _TOPOLOGY_BINDINGS.reset(token)
+
+
+def topology_source_names(store):
+    """Return namespaces owned by a source store in the current synchronous handoff."""
+    bindings = _TOPOLOGY_BINDINGS.get()
+    if bindings is None:
+        return None
+    return {name for _, source, name in bindings.values() if source is store}
+
+
+def relocate_topology_selectors(
+    agent, destination, coordinator, source_uid, canonical, local, source_output=None
+):
+    """Commit receipt-proven local selector changes on the creature's owner."""
+    if (
+        agent.session_store is not destination
+        or getattr(agent, "_topology_handoff_task", None) is not coordinator
+    ):
+        raise ConflictError("Live selector handoff binding changed")
+    messages = list(agent.controller.conversation.get_messages())
+    for field in ("_runtime_context_bundle", "_installed_runtime_context_bundle"):
+        bundle = getattr(agent, field, None)
+        messages.extend(getattr(bundle, "provider_conversation", ()))
+    seen, updates = set(), []
+    for message in messages:
+        if id(message) in seen:
+            continue
+        seen.add(id(message))
+        metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict) or not (
+            "event_id" in metadata or "event_origin" in metadata
+        ):
+            continue
+        if "event_origin" in metadata:
+            try:
+                origin = validate_origin(metadata["event_origin"], agent.config.name)
+            except (TypeError, ValueError) as exc:
+                raise ConflictError(
+                    "Invalid live selector origin during handoff"
+                ) from exc
+            event_id = canonical.get(origin)
+            if event_id is None and origin[0] == source_uid:
+                raise ConflictError("Live selector missing from confirmed transfer")
+        else:
+            event_id = local.get((agent.config.name, metadata["event_id"]))
+            if event_id is None:
+                raise ConflictError("Unproven local selector during handoff")
+        updates.append((metadata, event_id))
+    target_output = getattr(agent, "_session_output", None)
+    if source_output is not None and target_output is not source_output:
+        if target_output is None or target_output._store is not destination:
+            raise ConflictError("Output binding changed before generation handoff")
+        for name in ("_generation_id", "_generation_coordinates", "_chunk_seq"):
+            setattr(target_output, name, deepcopy(getattr(source_output, name)))
+        source_output._handoff_successor = target_output
+    for metadata, event_id in updates:
+        if event_id is None:
+            metadata.pop("event_id", None)
+        else:
+            metadata["event_id"] = event_id
 
 
 def require_attachment_idle(agent):

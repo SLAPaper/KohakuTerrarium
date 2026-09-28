@@ -14,6 +14,62 @@ from kohakuterrarium.core.tool_origin import capture_tool_context
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 
+@pytest.mark.parametrize("uncertain", [False, True])
+async def test_deferred_terminal_rechecks_successor_handoff_and_uncertain_binding(
+    tmp_path, monkeypatch, uncertain
+):
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=ScriptedLLM(["first"]),
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        await creature.run("question")
+        agent.pause()
+        observed = []
+
+        class Successor:
+            async def wait(self):
+                agent._topology_handoff_task = None
+                agent._session_attach_uncertain = uncertain
+
+        class First:
+            async def wait(self):
+                agent._topology_handoff_ready = Successor()
+
+        agent._topology_handoff_task = asyncio.current_task()
+        agent._topology_handoff_ready = First()
+        publish = agent._publish_bg_complete
+
+        def recording(*args, **kwargs):
+            observed.append(agent._topology_handoff_task)
+            return publish(*args, **kwargs)
+
+        monkeypatch.setattr(agent, "_publish_bg_complete", recording)
+        event = create_tool_complete_event(
+            job_id="read_deferred",
+            content="result",
+            **capture_tool_context(agent, "read_deferred", "background", "provider"),
+        )
+        agent._bg_controller_notify[event.job_id] = False
+        try:
+            await agent._on_bg_complete(event)
+            assert observed == ([] if uncertain else [None])
+            raw = await agent.session_store.run(agent.session_store.get_events, "alice")
+            assert sum(row["type"] == "tool_result" for row in raw) == (
+                0 if uncertain else 1
+            )
+            assert [
+                entry["state"] for entry in agent._background_terminals.values()
+            ] == (["uncertain"] if uncertain else ["published"])
+        finally:
+            agent._topology_handoff_task = None
+            agent._topology_handoff_ready = None
+            agent._session_attach_uncertain = False
+
+
 @pytest.mark.parametrize("child", [False, True])
 @pytest.mark.parametrize("error", [None, "failed", "cancelled"])
 async def test_duplicate_callback_records_one_origin_terminal(tmp_path, child, error):

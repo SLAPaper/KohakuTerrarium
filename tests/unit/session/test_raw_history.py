@@ -11,8 +11,37 @@ from kohakuterrarium.session.raw_history import (
     TargetUserMessageLineageError,
     TargetUserMessageNotFoundError,
     UserMessageSelector,
+    append_user_event_pair,
     select_raw_history_prefix,
 )
+from kohakuterrarium.session.store import SessionStore
+
+
+def test_user_pair_isolates_subscriber_mutation_from_payload_and_canonical_row(
+    tmp_path,
+):
+    store = SessionStore(tmp_path / "pair.kohakutr")
+    payload = {"content": [{"type": "text", "text": "original"}]}
+    before = deepcopy(payload)
+    observed = []
+
+    def subscriber(_key, event):
+        observed.append(event["type"])
+        if event["type"] == "user_input":
+            event["content"][0]["text"] = "changed by subscriber"
+
+    try:
+        store.submit(store.subscribe, subscriber).result()
+        eid = store.submit(
+            append_user_event_pair, store, "alice", payload, 1, 1, []
+        ).result()
+        rows = store.submit(store.get_events, "alice").result()
+        assert observed == ["user_input", "user_message"]
+        assert rows[-1]["event_id"] == eid
+        assert rows[-1]["content"] == before["content"]
+        assert payload == before
+    finally:
+        store.close(update_status=False)
 
 
 def _event(

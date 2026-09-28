@@ -113,8 +113,8 @@ class _MetaFailStore:
             def flush_cache(self):
                 return real.flush_cache()
 
-            def get(self, key):
-                return real.get(key)
+            def get(self, key, default=None):
+                return real.get(key, default)
 
             def __setitem__(self, k, v):
                 if k == STORE_UUID:

@@ -169,11 +169,8 @@ async def test_save_fault_before_write_keeps_memory_and_marks_uncertain(
         original = type(agent.session_store).save_conversation
 
         def fail(self, namespace, payload):
-            if (
-                isinstance(payload, list)
-                and payload
-                and payload[0].get("role") == "system"
-            ):
+            saved = payload.get("messages") if isinstance(payload, dict) else payload
+            if isinstance(saved, list) and saved and saved[0].get("role") == "system":
                 raise OSError("selection save rejected")
             return original(self, namespace, payload)
 

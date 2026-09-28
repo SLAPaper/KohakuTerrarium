@@ -1,8 +1,13 @@
 """Selected-branch conversation replay, including generation grouping."""
 
+from copy import deepcopy
 from typing import Any, Iterable
 
+from kohakuterrarium.session.compact_coverage import coordinate, make_rule
+from kohakuterrarium.session.event_origin import EVENT_ORIGIN
+from kohakuterrarium.session.feedback_admission import project_feedback_events
 from kohakuterrarium.session.history_generation import GenerationReplay
+from kohakuterrarium.session.native_ack import project_ack_results
 from kohakuterrarium.session.history_support import (
     _clean_tool_name as clean_tool_name,
     _covered_by_replace as covered_by_replace,
@@ -32,6 +37,15 @@ def replay_selected_events(
     # Nested branch ancestry determines the live event set and the selected
     # branch projection compaction rules are validated against.
     live_ids = select_live_event_ids(events_list, branch_view=branch_view)
+    events_list = project_feedback_events(
+        [
+            event
+            for event in events_list
+            if not isinstance(event.get("event_id"), int)
+            or event["event_id"] in live_ids
+        ]
+    )
+    events_list = project_ack_results(events_list)
     provider_ids = {
         evt.get("call_id") or evt.get("job_id"): evt["tool_call_id"]
         for evt in events_list
@@ -47,20 +61,15 @@ def replay_selected_events(
     # compact_replace may carry a ``compact_path`` so a replacement recorded
     # on one branch never deletes the sibling branch's events.
     replaced_rules: list[tuple[int, int, set[tuple[int, int]] | None, str]] = []
+    visible_events = [
+        event for event in events_list if event.get("event_id") in live_ids
+    ]
     for evt in events_list:
         if evt.get("type") not in ("compact_replace", "compact_complete"):
             continue
-        frm = evt.get("replaced_from_event_id")
-        to = evt.get("replaced_to_event_id")
-        if isinstance(frm, int) and isinstance(to, int):
-            replaced_rules.append(
-                (
-                    frm,
-                    to,
-                    compact_path_from_event(evt),
-                    evt.get("summary", "") or evt.get("summary_text", ""),
-                )
-            )
+        rule = make_rule(evt, visible_events, compact_path_from_event(evt))
+        if rule is not None:
+            replaced_rules.append(rule)
     # A single replay projects ONE linear branch, so at most one compaction
     # summary is live: the deepest compaction on the lineage matching the
     # selected branch. Same-lineage rounds nest (the deeper one wins); a
@@ -99,9 +108,7 @@ def replay_selected_events(
     text_buf: list[str] = []
     generations = GenerationReplay(events_list, live_ids, include_metadata)
     text_generation = None
-    # A turn/branch owns exactly one user_message. Graph merge and
-    # migration can copy the same event twice; duplicate user messages
-    # would break turn-targeted edit resolution and pollute the view.
+    # Unmarked legacy users retain turn/branch deduplication.
     seen_user_messages: set[tuple[int, int]] = set()
 
     def _flush_text() -> None:
@@ -125,7 +132,22 @@ def replay_selected_events(
         # otherwise that summary is injected late or lost entirely.
         i = 0
         while i < len(pending_rules):
-            frm, to, _path, summary = pending_rules[i]
+            rule = pending_rules[i]
+            frm, to, _path, summary = rule[:4]
+            if rule.members is not None:
+                if eid == rule.anchor:
+                    _flush_text()
+                    if summary:
+                        message = {"role": "assistant", "content": summary}
+                        if include_metadata:
+                            message["metadata"] = {
+                                "compact_coverage": deepcopy(rule.metadata)
+                            }
+                        messages.append(message)
+                    pending_rules.pop(i)
+                    continue
+                i += 1
+                continue
             if frm > eid:
                 break
             # Inject the summary only when the current branch actually has an
@@ -209,10 +231,20 @@ def replay_selected_events(
         # Structural events delimit streamed assistant text.
         _flush_text()
 
-        if etype == "user_message":
+        if etype == "tool_feedback_admitted":
+            message = {"role": "user", "content": deepcopy(evt.get("content", ""))}
+            if include_metadata and coordinate(evt) is not None:
+                message["metadata"] = {
+                    "kind": evt.get("message_kind", "tool_results"),
+                    "feedback_admission_origin": list(coordinate(evt)),
+                    "turn_index": evt.get("turn_index"),
+                    "branch_id": evt.get("branch_id"),
+                }
+            messages.append(message)
+        elif etype == "user_message":
             ti = evt.get("turn_index")
             bi = evt.get("branch_id")
-            if isinstance(ti, int) and isinstance(bi, int):
+            if EVENT_ORIGIN not in evt and isinstance(ti, int) and isinstance(bi, int):
                 if (ti, bi) in seen_user_messages:
                     continue
                 seen_user_messages.add((ti, bi))
@@ -223,6 +255,19 @@ def replay_selected_events(
                     "turn_index": evt.get("turn_index"),
                     "branch_id": evt.get("branch_id"),
                 }
+                if coordinate(evt) is not None and evt.get("user_pair_id"):
+                    twins = [
+                        row
+                        for row in events_list
+                        if row.get("type") == "user_input"
+                        and row.get("user_pair_id") == evt["user_pair_id"]
+                    ]
+                    if len(twins) == 1 and coordinate(twins[0]) is not None:
+                        message["metadata"].update(
+                            event_origin=list(coordinate(evt)),
+                            user_pair_origin=list(coordinate(twins[0])),
+                            user_pair_id=evt["user_pair_id"],
+                        )
             messages.append(message)
         elif etype == "assistant_tool_calls":
             tool_calls = evt.get("tool_calls") or []
@@ -244,6 +289,52 @@ def replay_selected_events(
                         generations.key(evt),
                     )
                 )
+            if include_metadata and coordinate(evt) is not None:
+                messages[-1].setdefault("metadata", {})["native_declaration_origin"] = (
+                    list(coordinate(evt))
+                )
+        elif etype in ("background_ack_result", "background_dispatch_result"):
+            content = evt.get("output") or evt.get("error") or ""
+            message = {"role": "user", "content": content}
+            if include_metadata:
+                message["metadata"] = {"kind": "tool_results"}
+                if not evt.get("_synthetic_resume") and coordinate(evt) is not None:
+                    if etype == "background_dispatch_result":
+                        message["metadata"]["dispatch_result_receipt"] = {
+                            "event_origin": list(coordinate(evt)),
+                            "admission_origin": deepcopy(
+                                evt["dispatch_feedback_origin"]
+                            ),
+                        }
+                    else:
+                        message["metadata"]["background_result_receipt"] = {
+                            "event_origin": list(coordinate(evt)),
+                            "ack_origin": deepcopy(evt["ack_origin"]),
+                        }
+            messages.append(message)
+        elif etype == "native_tool_ack":
+            message = {
+                "role": "tool",
+                "content": evt.get("output", ""),
+                "tool_call_id": evt.get("tool_call_id"),
+                "name": evt.get("name"),
+            }
+            if include_metadata:
+                message["metadata"] = {
+                    "tool_delivery": {
+                        "job_id": evt.get("job_id"),
+                        "tool_call_id": evt.get("tool_call_id"),
+                        "origin": deepcopy(evt.get("origin")),
+                        "phase": "ack",
+                        "declaration_origin": deepcopy(evt.get("declaration_origin")),
+                        "ack_origin": (
+                            list(coordinate(evt))
+                            if coordinate(evt) is not None
+                            else None
+                        ),
+                    }
+                }
+            messages.append(message)
         elif etype == "tool_result":
             job_id = evt.get("call_id", "") or evt.get("job_id", "")
             messages.append(
@@ -255,6 +346,32 @@ def replay_selected_events(
                     "name": clean_tool_name(evt),
                 }
             )
+            if include_metadata and isinstance(evt.get("origin"), dict):
+                announcement = next(
+                    (
+                        item
+                        for item in reversed(messages[:-1])
+                        if item.get("role") == "assistant"
+                        and any(
+                            call.get("id") == messages[-1]["tool_call_id"]
+                            for call in item.get("tool_calls", [])
+                        )
+                    ),
+                    {},
+                )
+                messages[-1]["metadata"] = {
+                    "tool_delivery": {
+                        "job_id": evt.get("job_id") or job_id,
+                        "tool_call_id": messages[-1]["tool_call_id"],
+                        "origin": deepcopy(evt["origin"]),
+                        "phase": "terminal",
+                        "declaration_origin": deepcopy(
+                            announcement.get("metadata", {}).get(
+                                "native_declaration_origin"
+                            )
+                        ),
+                    }
+                }
         elif etype == "system_prompt_set":
             messages.append({"role": "system", "content": evt.get("content", "")})
         elif etype == "assistant_reasoning":

@@ -12,6 +12,7 @@ from kohakuterrarium.core.selected_subagent_history import (
     restore_text_subagent_feedback,
 )
 from kohakuterrarium.llm.message import dicts_to_messages
+from kohakuterrarium.session.compact_coverage import exact_origins, project_exact_prefix
 from kohakuterrarium.session.history import (
     compact_path_from_event,
     normalize_tool_call_events,
@@ -92,6 +93,11 @@ def reload_raw_prefix_for_target(
         for evt in all_events:
             if evt.get("type") not in ("compact_replace", "compact_complete"):
                 continue
+            if exact_origins(evt) is not None:
+                projected = project_exact_prefix(evt, prefix.events)
+                if projected is not None:
+                    covering_compacts.append(projected)
+                continue
             frm = evt.get("replaced_from_event_id")
             to = evt.get("replaced_to_event_id")
             if not isinstance(frm, int) or not isinstance(to, int):
@@ -122,10 +128,7 @@ def reload_raw_prefix_for_target(
     ]
     raw_events.extend(covering_compacts)
     raw_events.append(prefix.target)
-    # A covering compact can carry an event_id larger than the target's;
-    # restore stream order so replay sees a monotonic event stream (its
-    # pending-summary flush/drop logic assumes one).
-    raw_events.sort(key=lambda evt: evt.get("event_id", 0))
+    # Prefix events retain physical stream order across nonmonotonic remappings.
     text_subagents = {}
     if strict_pairs:
         raw_events, text_subagents = project_selected_subagents(raw_events)

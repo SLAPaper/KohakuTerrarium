@@ -25,7 +25,7 @@ logger = get_logger(__name__)
 class OutputRouterParseEventMixin:
     """Parser-event routing for :class:`OutputRouter`."""
 
-    async def route(self, event: ParseEvent) -> None:
+    async def route(self, event: ParseEvent) -> CompletedOutput | None:
         """Route a parse event to the appropriate handler."""
         match event:
             case TextEvent(text=text):
@@ -44,7 +44,7 @@ class OutputRouterParseEventMixin:
                 logger.debug("Command queued", command=event.command)
 
             case OutputCallEvent():
-                await self._handle_output(event)
+                return await self._handle_output(event)
 
             case BlockStartEvent(block_type=block_type):
                 self._handle_block_start(block_type)
@@ -101,7 +101,7 @@ class OutputRouterParseEventMixin:
             case OutputState.OUTPUT_BLOCK:
                 pass
 
-    async def _handle_output(self, event: OutputCallEvent) -> None:
+    async def _handle_output(self, event: OutputCallEvent) -> CompletedOutput:
         """Route a named output block and record its completion status."""
         target = event.target
         content = event.content
@@ -110,17 +110,15 @@ class OutputRouterParseEventMixin:
             output_module = self.named_outputs[target]
             try:
                 await output_module.write(content)
-                self._completed_outputs.append(
-                    CompletedOutput(target=target, content=content, success=True)
+                completion = CompletedOutput(
+                    target=target, content=content, success=True
                 )
                 logger.debug(
                     "Output sent to target", target=target, content_len=len(content)
                 )
             except Exception as e:
-                self._completed_outputs.append(
-                    CompletedOutput(
-                        target=target, content=content, success=False, error=str(e)
-                    )
+                completion = CompletedOutput(
+                    target=target, content=content, success=False, error=str(e)
                 )
                 logger.error("Output failed", target=target, error=str(e))
         else:
@@ -130,11 +128,11 @@ class OutputRouterParseEventMixin:
                 available=list(self.named_outputs.keys()),
             )
             await self.default_output.write(f"[output_{target}] {content}")
-            self._completed_outputs.append(
-                CompletedOutput(
-                    target=f"{target}(default)", content=content, success=True
-                )
+            completion = CompletedOutput(
+                target=f"{target}(default)", content=content, success=True
             )
+        self._completed_outputs.append(completion)
+        return completion
 
     def _handle_block_start(self, block_type: str) -> None:
         """Handle block start event."""

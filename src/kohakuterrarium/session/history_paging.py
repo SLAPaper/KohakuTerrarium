@@ -9,6 +9,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from kohakuterrarium.session.compact_coverage import COVERAGE_FIELDS
+from kohakuterrarium.session.event_origin import (
+    EVENT_COORDINATE,
+    EVENT_ORIGIN,
+    annotate_coordinate,
+)
 from kohakuterrarium.session.store import iter_kv_keys
 
 DEFAULT_LIMIT = 400
@@ -149,10 +155,24 @@ def _bounded_preview(record: dict, detail: str, max_bytes: int) -> dict:
         "_history_detail": detail,
         "_history_truncated": True,
     }
+    protected = (EVENT_COORDINATE, EVENT_ORIGIN)
+    if "compact_coverage_version" in record:
+        protected += (
+            *COVERAGE_FIELDS,
+            "type",
+            "event_id",
+            "compact_path",
+            "turn_index",
+            "branch_id",
+            "parent_branch_path",
+            "round",
+        )
+    markers.update({key: record[key] for key in protected if key in record})
     preview = {**_preview_value(record), **markers}
     if isinstance(preview.get("output"), str):
         preview["output_preview"] = preview["output"][:50]
-    while len(_canonical_json(preview)) > min(4096, max_bytes):
+    target_bytes = min(max_bytes, max(4096, len(_canonical_json(markers)) + 512))
+    while len(_canonical_json(preview)) > target_bytes:
         candidates = [k for k in preview if k not in markers]
         if not candidates:
             break
@@ -186,6 +206,7 @@ def _page(
     live_job_ids: tuple[str, ...] = (),
     envelope: dict | None = None,
     revision: str | None = None,
+    project_record: Callable | None = None,
 ) -> dict:
     limit = _clamp_limit(limit)
     if before is not None and after is not None:
@@ -255,6 +276,8 @@ def _page(
                 _history_key=key, _history_unavailable=True, _history_detail=token
             )
         else:
+            if project_record is not None:
+                record = project_record(record)
             item = {**record, "_history_key": key}
             if len(_canonical_json(item)) > budget:
                 item = _bounded_preview(item, token, budget)
@@ -283,6 +306,7 @@ def page_events(store: Any, agent: str, *, session_id: str, **kwargs) -> dict:
     return _page(
         _ordered_event_refs(store, agent),
         lambda ref: store.events[ref],
+        project_record=lambda row: annotate_coordinate(store, agent, row),
         stream="events",
         target=agent,
         session_id=session_id,

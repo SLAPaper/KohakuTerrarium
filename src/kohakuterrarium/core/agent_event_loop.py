@@ -7,16 +7,30 @@ per run. The processing lock allows shutdown to join an in-flight turn.
 """
 
 import asyncio
+from copy import deepcopy
 
 from kohakuterrarium.core.agent_mid_turn import _to_serializable_content
 from kohakuterrarium.core.agent_runtime_tools import _make_job_label
+from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.background_admission import admit_background_run
+from kohakuterrarium.core.branch_selection import _join_accepted
 from kohakuterrarium.core.event_inbox import EventEnvelope, TurnOutcome
+from kohakuterrarium.core.feedback_admission import (
+    arm_background_feedback,
+    arm_persisted_input,
+    record_injected_constituent,
+    clear_feedback,
+)
 from kohakuterrarium.core.metrics_hook import metrics
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.core.pending_input import pending_id_of
+from kohakuterrarium.core.primary_user_identity import (
+    arm_primary_user,
+    capture_primary_user,
+    clear_primary_user,
+    install_primary_user,
+)
 from kohakuterrarium.session.raw_history import append_user_event_pair
-from kohakuterrarium.llm.message import content_parts_to_dicts
 from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.skills.hints import inject_skill_path_hint
 from kohakuterrarium.utils.logging import get_logger
@@ -146,6 +160,9 @@ class AgentEventLoopMixin:
         The turn mutex is held for the whole turn so ``stop()`` can join."""
         handoff = []
         async with self._processing_lock:
+            ready = getattr(self, "_topology_handoff_ready", None)
+            if ready is not None:
+                await ready.wait()
             self._turn_lock_holder = asyncio.current_task()
             try:
                 run = await admit_background_run(self, run)
@@ -179,23 +196,38 @@ class AgentEventLoopMixin:
                 return []
             require_model_mutation_available(self)
             await self._begin_batch(events)
-            await self._process_batch_with_controller(events, self.controller)
+            cancelled = await self._process_batch_with_controller(
+                events, self.controller
+            )
             interrupted = bool(primary.context.get("interrupted_by_user"))
             if interrupted:
                 self._flush_trigger_backlog_stash()
                 handoff = self._event_inbox.drain_all()
         finally:
-            for cap in captures:
-                self.output_router.remove_secondary(cap)
-            self._active_event_run = None
-            self._active_event_captures = None
-            if self._turn_completion is completion:
-                self._turn_completion = None
-            if not completion.done():
-                completion.set_result(None)
+            try:
+                await _join_accepted(
+                    asyncio.create_task(
+                        submit_internal_session_state(
+                            self,
+                            lambda: (
+                                clear_primary_user(self, completion),
+                                clear_feedback(self, completion),
+                            ),
+                        )
+                    )
+                )
+            finally:
+                for cap in captures:
+                    self.output_router.remove_secondary(cap)
+                self._active_event_run = None
+                self._active_event_captures = None
+                if self._turn_completion is completion:
+                    self._turn_completion = None
+                if not completion.done():
+                    completion.set_result(None)
         self._resolve_run(
             run,
-            status="interrupted" if interrupted else "ok",
+            status="interrupted" if interrupted or cancelled else "ok",
             interrupted=interrupted,
         )
         return handoff
@@ -257,6 +289,8 @@ class AgentEventLoopMixin:
             if self.session_store is not None:
                 await self._record_primary_user_input(primary)
 
+        if primary.type == "trigger":
+            await self._record_folded_user_event(primary)
         if (
             primary.type == "user_input"
             and self.output_router is not None
@@ -301,24 +335,44 @@ class AgentEventLoopMixin:
     async def _record_primary_user_input(self, event) -> None:
         """Append the ``user_input`` + ``user_message`` session events for a
         fresh (non-rerun) user turn."""
-        content = (
-            content_parts_to_dicts(event.content)
-            if hasattr(event, "is_multimodal") and event.is_multimodal()
-            else (event.content or "")
+        receipt = await _join_accepted(
+            asyncio.create_task(
+                submit_internal_session_state(
+                    self,
+                    lambda: capture_primary_user(self, event, pending_id_of(event)),
+                )
+            )
         )
-        ppath = [tuple(p) for p in self._parent_branch_path]
-        payload = {"content": content}
-        pending_id = pending_id_of(event)
-        if pending_id:
-            payload["pending_id"] = pending_id
-        await self.session_store.run(
-            append_user_event_pair,
-            self.session_store,
-            self.config.name,
-            dict(payload),
-            self._turn_index,
-            self._branch_id,
-            ppath,
+        event_id = await _join_accepted(
+            asyncio.create_task(
+                receipt.store.run(
+                    append_user_event_pair,
+                    receipt.store,
+                    receipt.namespace,
+                    deepcopy(receipt.payload),
+                    receipt.turn,
+                    receipt.branch,
+                    [tuple(p) for p in receipt.path],
+                    with_receipt=True,
+                )
+            )
+        )
+
+        def install():
+            install_primary_user(self, receipt, event_id)
+            if not receipt.eligible and isinstance(event_id, dict):
+                arm_persisted_input(
+                    self,
+                    event,
+                    {
+                        "mode": "user_pair",
+                        **deepcopy(event_id),
+                        "payload": deepcopy(receipt.payload),
+                    },
+                )
+
+        await _join_accepted(
+            asyncio.create_task(submit_internal_session_state(self, install))
         )
 
     async def _record_folded_user_event(self, evt) -> None:
@@ -326,7 +380,12 @@ class AgentEventLoopMixin:
         pops its queued banner and replay shows it as its own bubble."""
         content = _to_serializable_content(self._resolve_injected_content(evt))
         pending_id = pending_id_of(evt)
-        await self._record_injected_input_event(content, pending_id=pending_id)
+        payload = {
+            "content": content,
+            **({"pending_id": pending_id} if pending_id else {}),
+        }
+        if not await record_injected_constituent(self.controller, evt, payload):
+            await self._record_injected_input_event(content, pending_id=pending_id)
         metadata = {
             "content": content,
             "turn_index": self._turn_index,
@@ -409,12 +468,23 @@ class AgentEventLoopMixin:
             },
         )
 
-    async def _process_batch_with_controller(self, events: list, controller) -> None:
+    async def _process_batch_with_controller(self, events: list, controller) -> bool:
         """Push the whole stackable run to the controller (one combined
         ``role=user`` message) and drive the controller loop. Cancellable
         via ``interrupt()``."""
         primary = events[0]
         self._prepare_processing_cycle(primary, controller)
+        await _join_accepted(
+            asyncio.create_task(
+                submit_internal_session_state(
+                    self,
+                    lambda: (
+                        arm_primary_user(self, controller),
+                        arm_background_feedback(self, events),
+                    ),
+                )
+            )
+        )
         for event in events:
             await controller.push_event(event)
         await self.output_router.emit(
@@ -431,9 +501,11 @@ class AgentEventLoopMixin:
             self._run_controller_loop(controller, all_round_text)
         )
         self._processing_task = loop_task
+        cancelled = False
         try:
             await loop_task
         except asyncio.CancelledError:
+            cancelled = True
             logger.info("Processing cancelled by interrupt")
             self.output_router.notify_activity(
                 "interrupt", "[system] Processing interrupted"
@@ -453,3 +525,4 @@ class AgentEventLoopMixin:
         if self._interrupt_requested:
             primary.context["interrupted_by_user"] = True
         await self._finalize_processing(primary, controller, all_round_text)
+        return cancelled

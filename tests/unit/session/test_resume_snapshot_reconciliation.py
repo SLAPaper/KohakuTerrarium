@@ -144,6 +144,17 @@ def _tool(call_id, name, content="already"):
     }
 
 
+def test_nonmonotonic_ids_do_not_reverse_physical_dispatch_order():
+    base = [_assistant([{"id": "call-1", "name": "bash", "arguments": "{}"}])]
+    dispatch = _dispatch(event_id=90, args={})
+    terminal = _terminal(event_id=7, output="physical tail")
+    result, consumed = reconcile_snapshot(base, [dispatch, terminal], 90)
+    assert result[-1]["content"] == "physical tail"
+    assert consumed == {90, 7}
+    with pytest.raises(HistoryCompatibilityError, match="precedes"):
+        reconcile_snapshot(base, [terminal, dispatch], 90)
+
+
 def test_tool_and_subagent_terminals_before_and_after_watermark():
     base = [
         {"role": "system", "content": "sys"},
@@ -373,7 +384,11 @@ def test_malformed_or_reversed_evidence_rejects(damage):
     else:
         terminal["tool_name"] = "foreign"
     with pytest.raises(HistoryCompatibilityError):
-        reconcile_snapshot(base, [dispatch, terminal], None)
+        reconcile_snapshot(
+            base,
+            [terminal, dispatch] if damage == "early" else [dispatch, terminal],
+            None,
+        )
 
 
 def test_unrelated_scoped_jobs_do_not_conflict_with_accepted_snapshot():

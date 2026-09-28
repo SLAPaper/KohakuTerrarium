@@ -32,6 +32,7 @@ across resume can drop edges (stable-identity mapping is the
 follow-up).
 """
 
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 import kohakuterrarium.terrarium.channels as _channels
@@ -51,23 +52,14 @@ logger = get_logger(__name__)
 META_KEY = "runtime_topology"
 
 
-def snapshot(engine: "Terrarium", graph_id: str) -> None:
-    """Write the graph's current topology snapshot into its store meta.
-
-    No-op when no session store is attached to ``graph_id``. Best-
-    effort: a write failure logs and continues — losing one snapshot
-    just means resume reverts to the most recent successfully-written
-    snapshot, not data corruption.
-    """
+def capture_snapshot(engine: "Terrarium", graph_id: str) -> dict | None:
+    """Detach live topology and unresolved edges without accessing store tables."""
     if graph_id in getattr(engine, "_restoring_topology_graphs", ()):
         # Mid-replay mutations must not persist a half-built graph
         # (channels present, edges still empty) — replay writes ONE
         # authoritative snapshot when the full topology is live.
         # Per-graph: a replay on graph A must not suppress snapshots
         # for concurrent mutations on graph B.
-        return
-    store = engine._session_stores.get(graph_id)
-    if store is None:
         return
     g = engine._topology.graphs.get(graph_id)
     if g is None:
@@ -89,10 +81,30 @@ def snapshot(engine: "Terrarium", graph_id: str) -> None:
     leftovers = getattr(engine, "_topology_replay_leftovers", {}).get(graph_id)
     if leftovers:
         merge_into(payload, leftovers)
+    return deepcopy(payload)
+
+
+def write_snapshot(store, payload):
+    """Write detached topology metadata with the snapshot's best-effort contract."""
     try:
         store.meta[META_KEY] = payload
     except Exception:  # pragma: no cover - defensive
         logger.warning("runtime-topology snapshot write failed", exc_info=True)
+
+
+def snapshot(engine: "Terrarium", graph_id: str) -> None:
+    """Synchronously persist a detached snapshot through its store worker."""
+    store = engine._session_stores.get(graph_id)
+    if store is None:
+        return
+    payload = capture_snapshot(engine, graph_id)
+    if payload is None:
+        return
+    submit = getattr(store, "submit", None)
+    if callable(submit):
+        submit(write_snapshot, store, payload).result()
+    else:
+        write_snapshot(store, payload)
 
 
 def snapshot_all(engine: "Terrarium") -> None:

@@ -18,6 +18,8 @@ from kohakuterrarium.session.history import (
     resolve_branch_view_strict,
     select_live_event_ids,
 )
+from kohakuterrarium.session.history_feedback import ToolIdentityResolver
+from kohakuterrarium.session.history_support import compact_replay_events
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -222,6 +224,13 @@ def reload_conversation_under_branch_view(
         if not isinstance(event.get("event_id"), int)
         or event["event_id"] in live_event_ids
     ]
+    ToolIdentityResolver(replay_events)
+    compacts = [
+        event
+        for event in replay_events
+        if event.get("type") in ("compact_replace", "compact_complete")
+    ]
+    replay_events = compact_replay_events(replay_events, compacts, selected)
     messages = replay(
         normalize_tool_call_events(replay_events),
         branch_view=branch_view,

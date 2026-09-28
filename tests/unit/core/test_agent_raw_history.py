@@ -1,10 +1,13 @@
 """Tests for reseating an agent on uncompacted persisted history."""
 
+from copy import deepcopy
 from types import SimpleNamespace
+from uuid import uuid4
 
 from kohakuterrarium.core.agent_raw_history import reload_raw_prefix_for_target
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
 from kohakuterrarium.core.message_locator import user_message_indices_for_turn
+from kohakuterrarium.session.event_origin import EVENT_ORIGIN
 from kohakuterrarium.session.raw_history import UserMessageSelector
 
 
@@ -44,6 +47,54 @@ def _agent(events, *, conversation_config=None):
         _branch_id=4,
         _parent_branch_path=[(8, 4)],
     )
+
+
+def test_exact_compact_edit_clips_stream_prefix_not_numeric_id():
+    uid = str(uuid4())
+
+    def origin(index):
+        return [uid, "worker", index]
+
+    events = [
+        {
+            **_event(80, "user_message", turn=1, content="summarized"),
+            EVENT_ORIGIN: origin(1),
+        },
+        {
+            **_event(30, "text_chunk", turn=1, content="unsummarized hole"),
+            EVENT_ORIGIN: origin(2),
+        },
+        {
+            **_event(10, "user_message", turn=2, content="target", path=[[1, 1]]),
+            EVENT_ORIGIN: origin(3),
+        },
+        {
+            **_event(5, "text_chunk", turn=2, content="future", path=[[1, 1]]),
+            EVENT_ORIGIN: origin(4),
+        },
+        {
+            **_event(3, "compact_complete", turn=2, path=[[1, 1]]),
+            "summary": "baseline",
+            "compact_coverage_version": 1,
+            "coverage_mode": "exact",
+            "replaced_event_origins": [origin(1), origin(3), origin(4)],
+            "summary_anchor_origin": origin(1),
+            "replaced_from_event_id": 1,
+            "replaced_to_event_id": 80,
+            EVENT_ORIGIN: origin(5),
+        },
+    ]
+    original = deepcopy(events)
+    agent = _agent(events)
+    reload_raw_prefix_for_target(agent, UserMessageSelector(10, 2, 1))
+    messages = agent.controller.conversation.get_messages()
+    assert [(m.role, m.content) for m in messages] == [
+        ("system", "current runtime prompt"),
+        ("assistant", "baseline"),
+        ("assistant", "unsummarized hole"),
+        ("user", "target"),
+    ]
+    assert events == original
 
 
 def test_reload_restores_missing_system_prompt_and_canonical_user_metadata():

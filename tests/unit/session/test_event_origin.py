@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 
 import kohakuterrarium.session.store as store_module
+from kohakuterrarium.errors import HistoryCompatibilityError
 from kohakuterrarium.session.event_origin import (
     EVENT_ORIGIN,
     STORE_UUID,
@@ -14,6 +15,8 @@ from kohakuterrarium.session.event_origin import (
     import_events,
     store_uuid,
 )
+from kohakuterrarium.session.history_replay import replay_selected_events
+from kohakuterrarium.session.history_support import dedupe_adjacent_duplicate_events
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.session_coord import copy_events_into
 
@@ -30,6 +33,155 @@ def append(store, name="alice", text="same"):
     return store.submit(
         store.append_event, name, "user_message", {"content": text}
     ).result()
+
+
+def test_capture_and_replay_keep_numeric_physical_order_past_six_digits(stores):
+    a, b, _ = stores
+    a.submit(lambda: a._event_seq.update(alice=999999)).result()
+    append(a, text="before rollover")
+    append(a, text="after rollover")
+    _, captured = a.submit(capture_events, a).result()
+    assert [row[2]["content"] for row in captured] == [
+        "before rollover",
+        "after rollover",
+    ]
+    assert [row["content"] for row in a.submit(a.get_events, "alice").result()] == [
+        "before rollover",
+        "after rollover",
+    ]
+    copy_events_into(a, b)
+    assert [row["content"] for row in b.submit(b.get_events, "alice").result()] == [
+        "before rollover",
+        "after rollover",
+    ]
+
+
+def test_replay_keeps_independent_origins_with_identical_user_coordinates(stores):
+    a, b, destination = stores
+    for source in (a, b):
+        source.submit(
+            source.append_event,
+            "alice",
+            "user_message",
+            {"content": "same", "turn_index": 1, "branch_id": 1},
+        ).result()
+        copy_events_into(source, destination)
+    rows = destination.submit(destination.get_events, "alice").result()
+    messages = replay_selected_events(rows, include_metadata=True)
+    assert [message["content"] for message in messages] == ["same", "same"]
+    assert [message["metadata"]["event_id"] for message in messages] == [
+        row["event_id"] for row in rows
+    ]
+    destination.close(update_status=False)
+    reopened = SessionStore(destination.path)
+    try:
+        assert (
+            replay_selected_events(
+                reopened.submit(reopened.get_events, "alice").result(),
+                include_metadata=True,
+            )
+            == messages
+        )
+    finally:
+        reopened.close(update_status=False)
+
+
+def test_replay_collapses_nonadjacent_copies_by_origin():
+    origin = [str(uuid4()), "alice", 1]
+    first = {
+        "type": "text_chunk",
+        "event_id": 1,
+        "content": "A",
+        "ts": 10,
+        EVENT_ORIGIN: origin,
+    }
+    middle = {"type": "text_chunk", "event_id": 2, "content": "B"}
+    duplicate = {**first, "event_id": 3}
+    assert dedupe_adjacent_duplicate_events([first, middle, duplicate]) == [
+        first,
+        middle,
+    ]
+    assert replay_selected_events([first, middle, duplicate]) == [
+        {"role": "assistant", "content": "AB"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "field,value", [("content", "different"), ("ts", 11), ("branch_id", 2)]
+)
+def test_replay_rejects_conflicting_payload_for_one_origin(field, value):
+    first = {
+        "type": "user_message",
+        "event_id": 1,
+        "content": "same",
+        "ts": 10,
+        "turn_index": 1,
+        "branch_id": 1,
+        EVENT_ORIGIN: [str(uuid4()), "alice", 1],
+    }
+    second = {**first, "event_id": 2, field: value}
+    with pytest.raises(HistoryCompatibilityError, match="origin"):
+        replay_selected_events([first, second])
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        None,
+        [],
+        ["bad", "alice", 1],
+        [str(uuid4()), "alice", True],
+        [str(uuid4()), "", 1],
+    ],
+)
+def test_replay_rejects_malformed_origin(origin):
+    with pytest.raises(HistoryCompatibilityError, match="origin"):
+        replay_selected_events(
+            [
+                {
+                    "type": "user_message",
+                    "event_id": 1,
+                    "content": "x",
+                    EVENT_ORIGIN: origin,
+                }
+            ]
+        )
+
+
+@pytest.mark.parametrize("marked_first", [False, True])
+def test_replay_does_not_equate_marked_and_legacy_users(marked_first):
+    legacy = {
+        "type": "user_message",
+        "event_id": 1,
+        "turn_index": 1,
+        "branch_id": 1,
+        "content": "same",
+    }
+    marked = {**legacy, "event_id": 2, EVENT_ORIGIN: [str(uuid4()), "alice", 7]}
+    events = [marked, legacy] if marked_first else [legacy, marked]
+    assert [
+        m["metadata"]["event_id"]
+        for m in replay_selected_events(events, include_metadata=True)
+    ] == [e["event_id"] for e in events]
+
+
+def test_origin_dedup_keeps_branch_selection_and_does_not_mutate_inputs():
+    events = [
+        {
+            "type": "user_message",
+            "event_id": i,
+            "turn_index": 1,
+            "branch_id": branch,
+            "content": str(branch),
+            EVENT_ORIGIN: [str(uuid4()), "alice", i],
+        }
+        for i, branch in [(1, 1), (2, 2)]
+    ]
+    original = deepcopy(events)
+    assert replay_selected_events(events, branch_view={1: 1}) == [
+        {"role": "user", "content": "1"}
+    ]
+    assert events == original
 
 
 def test_identity_flush_failure_prevents_export_and_retry_reflushes(

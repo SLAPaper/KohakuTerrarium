@@ -11,7 +11,7 @@ from typing import Any
 from kohakuvault import KVault, TextVault
 
 from kohakuterrarium.session.artifacts import artifacts_dir_for, write_artifact_bytes
-from kohakuterrarium.session.event_origin import STORE_UUID, validate_append_origin
+from kohakuterrarium.session import event_origin
 from kohakuterrarium.session.history import (
     dedupe_adjacent_duplicate_events,
     normalize_resumable_events,
@@ -22,6 +22,7 @@ from kohakuterrarium.session.rollup import (
     list_turn_rollups,
     save_turn_rollup,
 )
+from kohakuterrarium.session.snapshot_coverage import decode_snapshot
 from kohakuterrarium.session.store_affinity import StoreAffinityMixin
 from kohakuterrarium.session.subagent_lineage import (
     admit_saved_run,
@@ -194,7 +195,7 @@ class SessionStore(StoreAffinityMixin):
             self.events,
             self._event_seq,
             state=self.state,
-            verify_rows=bool(self.meta.get(STORE_UUID)),
+            verify_rows=bool(self.meta.get(event_origin.STORE_UUID)),
         )
         restore_suffix_counters(self.channels, ":m", self._channel_seq)
         restore_subagent_counters(self.subagents, self._subagent_runs)
@@ -230,7 +231,8 @@ class SessionStore(StoreAffinityMixin):
         parent_branch_path: list[tuple[int, int]] | None = None,
     ) -> tuple[str, int]:
         """Append an event with monotonic ID and optional turn/branch lineage."""
-        imported = validate_append_origin(self, agent, data)
+        data.pop(event_origin.EVENT_COORDINATE, None)
+        imported = event_origin.validate_append_origin(self, agent, data)
         seq = self._next_event_seq(agent)
         key = f"{agent}:e{seq:06d}"
         # Mirrors preserve source event identifiers for consistent cross-node cursors.
@@ -277,7 +279,7 @@ class SessionStore(StoreAffinityMixin):
         # Subscriber failures cannot invalidate a successfully appended event.
         for cb in tuple(self._event_subscribers):
             try:
-                cb(key, data)
+                cb(key, event_origin.annotate_coordinate(self, agent, data))
             except Exception as e:
                 logger.warning("Event subscriber failed", error=str(e), exc_info=True)
 
@@ -332,16 +334,13 @@ class SessionStore(StoreAffinityMixin):
             pass
 
     def get_events(self, agent: str, since_event_id: int | None = None) -> list[dict]:
-        """Get events for an agent, ordered by sequence.
-
-        Returns list of event dicts with keys sorted chronologically. With
-        ``since_event_id``, only events whose ``event_id`` exceeds it are
-        returned (cursor-style incremental reads).
-        """
+        """Read events in physical sequence, optionally after a global event-ID cursor."""
         self._flush_events_cache()
         prefix = f"{agent}:e"
         result = []
-        for key_bytes in sorted(iter_kv_keys(self.events, prefix=prefix)):
+        for key_bytes in sorted(
+            iter_kv_keys(self.events, prefix=prefix), key=event_origin.event_key_order
+        ):
             try:
                 evt = self.events[key_bytes]
             except Exception as e:
@@ -351,7 +350,7 @@ class SessionStore(StoreAffinityMixin):
                 eid = evt.get("event_id") if isinstance(evt, dict) else None
                 if not isinstance(eid, int) or eid <= since_event_id:
                     continue
-            result.append(evt)
+            result.append(event_origin.annotate_coordinate(self, agent, evt))
         return result
 
     def max_event_id(self, agent: str) -> int:
@@ -381,7 +380,7 @@ class SessionStore(StoreAffinityMixin):
                 logger.warning("Failed to read event", error=str(e), exc_info=True)
                 continue
             if isinstance(evt, dict) and evt.get("event_id") == event_id:
-                return evt
+                return event_origin.annotate_coordinate(self, agent, evt)
         return None
 
     def get_resumable_events(
@@ -429,7 +428,7 @@ class SessionStore(StoreAffinityMixin):
         all_events.sort(key=lambda x: x[1].get("ts", 0))
         return all_events
 
-    def save_conversation(self, agent: str, messages: list[dict] | str) -> None:
+    def save_conversation(self, agent: str, messages: list[dict] | str | dict) -> None:
         """Save a conversation snapshot (overwritten each time).
 
         Accepts either a list of message dicts (preferred, stored via msgpack)
@@ -444,6 +443,8 @@ class SessionStore(StoreAffinityMixin):
         """
         try:
             val = self.conversation[agent]
+            if isinstance(val, dict):
+                return decode_snapshot(val)
             if isinstance(val, list):
                 return val
             # Older sessions may contain JSON rather than auto-packed lists.

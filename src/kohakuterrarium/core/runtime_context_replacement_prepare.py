@@ -17,6 +17,7 @@ from kohakuterrarium.llm.message import Message, dicts_to_messages
 from kohakuterrarium.session.generation_validation import (
     validate_selected_generation_events,
 )
+from kohakuterrarium.session.history_support import compact_replay_events
 from kohakuterrarium.session.history_feedback import (
     ToolIdentityResolver,
     canonicalize_provider_tool_order,
@@ -389,6 +390,17 @@ def prepare_selected_branch_context(
         normalized = canonicalize_provider_tool_order(
             normalize_tool_call_events(projected_events)
         )
+        if require_complete_tool_pairs:
+            _validate_selected_tool_events(normalized)
+        compacts = [
+            event
+            for event in projected_events
+            if event.get("type") in ("compact_replace", "compact_complete")
+        ]
+        visible = compact_replay_events(projected_events, compacts, selected)
+        normalized = canonicalize_provider_tool_order(
+            normalize_tool_call_events(visible)
+        )
         raw_messages = replay_conversation(
             normalized,
             branch_view=selected,
@@ -399,7 +411,6 @@ def prepare_selected_branch_context(
         _restore_replay_metadata(raw_messages, messages)
         messages = _with_baseline(messages, baseline)
         if require_complete_tool_pairs:
-            _validate_selected_tool_events(normalized)
             _validate_complete_tool_pairs(messages)
         if pure_text_only and any(
             message.role != "system"

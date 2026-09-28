@@ -216,19 +216,23 @@ class OutputRouter(OutputRouterParseEventMixin, OutputRouterInteractiveMixin):
 
     def _notify_generation_observers(self, payload: dict) -> None:
         """Notify renderers of an origin already confirmed by the canonical sink."""
+        self.notify_confirmed_activity("assistant_generation_start", "", payload)
+
+    def notify_confirmed_activity(self, activity_type, detail, metadata):
+        """Notify noncanonical observers after a persistence receipt is confirmed."""
         for target in (self.default_output, *self._secondary_outputs):
             if getattr(type(target), "_kt_canonical_session_output", False):
                 continue
             try:
                 if hasattr(target, "on_activity_with_metadata"):
                     target.on_activity_with_metadata(
-                        "assistant_generation_start", "", deepcopy(payload)
+                        activity_type, detail, deepcopy(metadata)
                     )
                 else:
-                    target.on_activity("assistant_generation_start", "")
+                    target.on_activity(activity_type, detail)
             except Exception:
                 logger.warning(
-                    "Generation observer failed",
+                    "Confirmed activity observer failed",
                     output=type(target).__name__,
                     exc_info=True,
                 )

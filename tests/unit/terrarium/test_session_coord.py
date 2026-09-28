@@ -27,7 +27,7 @@ def test_unpublished_store_handles_close_after_copy_failure(
 ):
     source = SessionStore(tmp_path / "source.kohakutr")
     created = []
-    copy = sc.copy_events_into
+    copy = sc._copy_session_into
     calls = []
 
     def tracked(path):
@@ -42,7 +42,7 @@ def test_unpublished_store_handles_close_after_copy_failure(
         return copy(src, dst)
 
     monkeypatch.setattr(sc, "SessionStore", tracked)
-    monkeypatch.setattr(sc, "copy_events_into", fail_second)
+    monkeypatch.setattr(sc, "_copy_session_into", fail_second)
     try:
         source.submit(
             source.append_event, "alice", "message", {"content": "kept"}

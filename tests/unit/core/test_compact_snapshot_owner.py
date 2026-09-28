@@ -79,12 +79,14 @@ async def test_compact_snapshot_is_frozen_before_affinity_queue(tmp_path, monkey
         )
         ancestry = deepcopy(agent._parent_branch_path)
         captured, release = asyncio.Event(), threading.Event()
+        barrier = None
         run = type(store).run
 
         def held():
             assert release.wait(5)
 
         async def intercept(self, fn, *args, **kwargs):
+            nonlocal barrier
             if self is store and getattr(fn, "__name__", "").startswith(
                 "persist_compacted"
             ):
@@ -93,11 +95,11 @@ async def test_compact_snapshot_is_frozen_before_affinity_queue(tmp_path, monkey
                 self is store
                 and getattr(fn, "__name__", "") == "_persist_compacted_snapshot"
             ):
+                barrier = store.submit(held)
                 captured.set()
             return await run(self, fn, *args, **kwargs)
 
         monkeypatch.setattr(type(store), "run", intercept)
-        barrier = store.submit(held)
         saving = asyncio.create_task(
             persist_compacted_async(
                 store, "alice", agent, agent.controller.conversation, 3, 456.0
@@ -120,7 +122,8 @@ async def test_compact_snapshot_is_frozen_before_affinity_queue(tmp_path, monkey
             ]
         finally:
             release.set()
-            await asyncio.wrap_future(barrier)
+            if barrier is not None:
+                await asyncio.wrap_future(barrier)
             await asyncio.gather(saving, return_exceptions=True)
             agent._parent_branch_path[:] = ancestry
 

@@ -12,6 +12,7 @@ from kohakuterrarium.session.history import select_live_event_ids
 from kohakuterrarium.session.resume_admission import validate_resume_snapshot
 from kohakuterrarium.session.resume_reconciliation import reconcile_snapshot
 from kohakuterrarium.session.resume_replay import replay_resume_history
+from kohakuterrarium.session.snapshot_coverage import partition_snapshot
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -304,6 +305,13 @@ def load_conversation_with_replay_fallback(
     snapshot = store.load_conversation(agent_name)
     if events is None:
         events = store.get_events(agent_name)
+    covered = (
+        partition_snapshot(store, agent_name, events)
+        if snapshot is not None and hasattr(store, "conversation")
+        else None
+    )
+    if covered is not None:
+        return _load_covered_snapshot(snapshot, events, covered, branch_view, origins)
     if origins is not None and snapshot is not None:
         return _load_validated_snapshot(
             store, agent_name, snapshot, events, branch_view, origins
@@ -354,6 +362,11 @@ def load_conversation_with_replay_fallback(
                 and (evt.get("turn_index"), evt["branch_id"]) not in pre_pairs
                 for evt in tail
             )
+        if any(
+            event.get("type") in ("compact_complete", "compact_replace")
+            for event in tail
+        ):
+            return replay_resume_history(events, branch_view)
         if not tail_has_forks:
             appended = replay_resume_history(tail, branch_view)
             # A legacy snapshot portion must be backfilled too, otherwise the
@@ -404,6 +417,51 @@ def load_conversation_with_replay_fallback(
     return snapshot
 
 
+def _load_covered_snapshot(snapshot, events, covered, view, origins):
+    selected_ids = select_live_event_ids(events, branch_view=view)
+    prior, tail = (
+        [
+            event
+            for event in group
+            if not isinstance(event.get("event_id"), int)
+            or event["event_id"] in selected_ids
+        ]
+        for group in covered
+    )
+    if view is not None:
+        leaves_view = _selection_leaves_view(snapshot, tail, view)
+    else:
+        pairs = {(event.get("turn_index"), event.get("branch_id")) for event in prior}
+        leaves_view = any(
+            type(event.get("branch_id")) is int
+            and event["branch_id"] > 1
+            and (event.get("turn_index"), event["branch_id"]) not in pairs
+            for event in tail
+        )
+    if leaves_view or any(
+        event.get("type") in ("compact_complete", "compact_replace") for event in tail
+    ):
+        return replay_resume_history(events, view)
+    base, consumed = snapshot, set()
+    if origins is not None:
+        validate_resume_snapshot(snapshot, origins)
+        selected = [
+            event
+            for event in events
+            if not isinstance(event.get("event_id"), int)
+            or event["event_id"] in selected_ids
+        ]
+        base, consumed = reconcile_snapshot(snapshot, selected, None)
+    if not snapshot_has_turn_metadata(base):
+        base = backfill_turn_metadata(base, prior, view)
+    remaining = [event for event in tail if event.get("event_id") not in consumed]
+    if remaining:
+        base = list(base) + replay_resume_history(remaining, view)
+    if origins is not None:
+        validate_resume_snapshot(base, origins)
+    return base
+
+
 def _load_validated_snapshot(store, name, snapshot, events, view, origins):
     watermark = store.state.get(f"{name}:snapshot_event_id")
     selected_ids = select_live_event_ids(events, branch_view=view)
@@ -436,7 +494,9 @@ def _load_validated_snapshot(store, name, snapshot, events, view, origins):
             and (event.get("turn_index"), event["branch_id"]) not in prior
             for event in tail
         )
-    if leaves_view:
+    if leaves_view or any(
+        event.get("type") in ("compact_complete", "compact_replace") for event in tail
+    ):
         return replay_resume_history(events, view)
     validate_resume_snapshot(snapshot, origins)
     base, consumed = reconcile_snapshot(snapshot, selected, watermark)

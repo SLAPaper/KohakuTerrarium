@@ -15,6 +15,8 @@ from kohakuterrarium.modules.subagent.base import SubAgent, SubAgentJob, SubAgen
 from kohakuterrarium.modules.subagent.config import SubAgentConfig, SubAgentInfo
 from kohakuterrarium.modules.subagent.persistence import (
     patch_result,
+    persistence_binding,
+    wait_for_binding,
     result_metadata,
     save_result,
     settle,
@@ -164,6 +166,8 @@ class SubAgentManager(InteractiveManagerMixin):
     ) -> str:
         """Spawn a registered sub-agent and optionally await its completion."""
         completion_context = deepcopy(completion_context or {})
+        host = getattr(self._parent_executor, "_agent", None)
+        await wait_for_binding(host)
         config = self._configs.get(name)
         if config is None:
             raise ValueError(f"Sub-agent not registered: {name}")
@@ -206,6 +210,7 @@ class SubAgentManager(InteractiveManagerMixin):
         )
 
         subagent._job_id = job_id
+        subagent._persistence_host = host
 
         # Preserve the legacy shared-budget contract when configured.
         subagent.iteration_budget = self._resolve_child_budget(config)
@@ -326,12 +331,17 @@ class SubAgentManager(InteractiveManagerMixin):
         self, job_id: str, result: SubAgentResult
     ) -> None:
         """Keep canonical persisted metadata aligned with transformed results."""
-        store = self._session_store
-        if store is not None:
-            receipt = store.submit(
-                patch_result, store, self._parent_name, job_id, result_metadata(result)
-            )
-            await settle(receipt)
+        async with persistence_binding(getattr(self._parent_executor, "_agent", None)):
+            store = self._session_store
+            if store is not None:
+                receipt = store.submit(
+                    patch_result,
+                    store,
+                    self._parent_name,
+                    job_id,
+                    result_metadata(result),
+                )
+                await settle(receipt)
 
     @staticmethod
     def _stamp_model_metadata(result: SubAgentResult, subagent: SubAgent) -> None:

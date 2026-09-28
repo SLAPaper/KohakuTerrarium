@@ -104,6 +104,92 @@ async def _make(repo, **over) -> str:
     return rec.drive_id
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_handoff_drains_accepted_transaction_and_rejects_queued_callers(
+    repo, monkeypatch, cancel
+):
+    entered, release, queued_entered = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    reserving, acquired, publish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original, admission = repo._new_transaction, repo._require_transaction_admission
+    snapshot = asyncio.get_running_loop().create_future()
+    token = object()
+
+    def transaction():
+        txn = original()
+        commit = txn.commit
+
+        async def held_commit():
+            if asyncio.current_task().get_name() == "accepted-drive-writer":
+                entered.set()
+                await release.wait()
+            await commit()
+
+        txn.commit = held_commit
+        return txn
+
+    def checked():
+        admission()
+        if asyncio.current_task().get_name() == "queued-drive-writer":
+            queued_entered.set()
+
+    async def coordinator():
+        reserving.set()
+        await repo.reserve_handoff(token)
+        acquired.set()
+        snapshot.set_result([r.title for r in await repo.list_drives(DriveQuery())])
+        with pytest.raises(DriveConflictError):
+            await asyncio.create_task(repo.export_rows())
+        await publish.wait()
+        repo.finish_handoff(token, retired=cancel)
+
+    monkeypatch.setattr(repo, "_new_transaction", transaction)
+    monkeypatch.setattr(repo, "_require_transaction_admission", checked)
+    writer = asyncio.create_task(
+        _make(repo, title="accepted"), name="accepted-drive-writer"
+    )
+    queued = moving = None
+    try:
+        await asyncio.wait_for(entered.wait(), 3)
+        queued = asyncio.create_task(
+            _make(repo, title="queued"), name="queued-drive-writer"
+        )
+        await asyncio.wait_for(queued_entered.wait(), 3)
+        moving = asyncio.create_task(coordinator())
+        await asyncio.wait_for(reserving.wait(), 3)
+        assert not acquired.is_set()
+        with pytest.raises(DriveConflictError):
+            await _make(repo, title="new")
+        if cancel:
+            moving.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await moving
+            with pytest.raises(DriveConflictError):
+                await repo.export_rows()
+        release.set()
+        drive_id = await asyncio.wait_for(writer, 3)
+        with pytest.raises(DriveConflictError):
+            await queued
+        if cancel:
+            moving = asyncio.create_task(coordinator())
+        assert await asyncio.wait_for(snapshot, 3) == ["accepted"]
+        publish.set()
+        await asyncio.wait_for(moving, 3)
+        if cancel:
+            with pytest.raises(DriveConflictError):
+                await repo.get(drive_id)
+        else:
+            assert (await repo.get(drive_id)).title == "accepted"
+    finally:
+        release.set()
+        publish.set()
+        await asyncio.gather(
+            writer,
+            *([queued] if queued else []),
+            *([moving] if moving else []),
+            return_exceptions=True,
+        )
+
+
 # ── creation ──────────────────────────────────────────────────────
 
 

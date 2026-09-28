@@ -3,6 +3,7 @@
 import json
 from typing import Any, Iterable
 
+from kohakuterrarium.session.feedback_admission import project_feedback_events
 from kohakuterrarium.session.history_replay import replay_selected_events
 from kohakuterrarium.session.history_support import (
     InvalidBranchViewError,
@@ -89,6 +90,7 @@ def _inject_synthetic_announcements(
     announcements suppress duplicates. Synthetic announcements intentionally omit
     event identifiers so replay preserves their inserted position.
     """
+    events = project_feedback_events(events)
     pending: list[dict[str, Any]] = []
     announced_ids: set[str] = set()
     result: list[dict[str, Any]] = []
@@ -184,6 +186,49 @@ def normalize_tool_call_events(
     return _inject_synthetic_announcements([dict(evt) for evt in events])
 
 
+def _pair_undispatched_declarations(events):
+    """Pair durable announcements lacking a subsequent dispatch with interrupted results."""
+    output = []
+    for index, event in enumerate(events):
+        output.append(event)
+        if event.get("type") != "assistant_tool_calls" or not event.get(
+            "veto_group_id"
+        ):
+            continue
+        following = []
+        for candidate in events[index + 1 :]:
+            if candidate.get("type") == "assistant_tool_calls":
+                break
+            following.append(candidate)
+        for call in event.get("tool_calls", []):
+            provider_id = call.get("id")
+            if any(
+                row.get("tool_call_id") == provider_id
+                and row.get("type")
+                in ("tool_call", "tool_result", "subagent_call", "subagent_result")
+                for row in following
+            ):
+                continue
+            output.append(
+                {
+                    "type": "tool_result",
+                    "tool_call_id": provider_id,
+                    "call_id": provider_id,
+                    "name": call.get("function", {}).get("name", "tool"),
+                    "output": "Interrupted before dispatch confirmation",
+                    "error": "Interrupted before dispatch confirmation",
+                    "interrupted": True,
+                    "final_state": "interrupted",
+                    "_synthetic_resume": True,
+                    "turn_index": event.get("turn_index"),
+                    "branch_id": event.get("branch_id"),
+                    "parent_branch_path": event.get("parent_branch_path"),
+                    "ts": event.get("ts", 0),
+                }
+            )
+    return output
+
+
 def normalize_resumable_events(
     events: list[dict[str, Any]],
     *,
@@ -262,5 +307,5 @@ def normalize_resumable_events(
             }
         )
 
-    full = normalized + synthetic_events
+    full = _pair_undispatched_declarations(normalized) + synthetic_events
     return normalize_tool_call_events(full)

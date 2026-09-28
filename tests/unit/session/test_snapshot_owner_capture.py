@@ -73,10 +73,10 @@ async def test_snapshot_capture_is_detached_before_worker_wait(tmp_path, monkeyp
         persist = sink._persist_turn_snapshot
         original_path = deepcopy(agent._parent_branch_path)
 
-        def held(messages, branch_tag, state_kwargs):
+        def held(messages, branch_tag, state_kwargs, envelope):
             loop.call_soon_threadsafe(captured.set)
             assert release.wait(5)
-            persist(messages, branch_tag, state_kwargs)
+            persist(messages, branch_tag, state_kwargs, envelope)
 
         monkeypatch.setattr(sink, "_persist_turn_snapshot", held)
         saving = asyncio.create_task(sink.on_processing_end())

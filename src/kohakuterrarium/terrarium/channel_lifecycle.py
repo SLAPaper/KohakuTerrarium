@@ -31,7 +31,9 @@ from typing import TYPE_CHECKING
 import kohakuterrarium.terrarium.session_coord as _session_coord
 import kohakuterrarium.terrarium.topology as _topo
 from kohakuterrarium.core.environment import Environment
+from kohakuterrarium.terrarium.topology_admission import run_topology_operation
 from kohakuterrarium.terrarium.session_subagent_state import preflight_child_split
+from kohakuterrarium.terrarium.session_split_async import prepare_split
 from kohakuterrarium.terrarium.graph_identity_engine import guard_graph_model_bindings
 from kohakuterrarium.terrarium.channels import (
     bind_creature_to_environment,
@@ -50,7 +52,17 @@ if TYPE_CHECKING:
     from kohakuterrarium.terrarium.engine import CreatureRef, Terrarium
 
 
-async def disconnect_creatures(
+async def disconnect_creatures(engine, sender, receiver, *, channel=None):
+    ids = [engine._resolve_creature_id(ref) for ref in (sender, receiver)]
+    graph_ids = {engine._topology.creature_to_graph[cid] for cid in ids}
+    return await run_topology_operation(
+        engine,
+        graph_ids,
+        lambda: _disconnect_creatures(engine, sender, receiver, channel=channel),
+    )
+
+
+async def _disconnect_creatures(
     engine: "Terrarium",
     sender: "CreatureRef",
     receiver: "CreatureRef",
@@ -74,7 +86,7 @@ async def disconnect_creatures(
         return DisconnectionResult(channels=[], delta_kind="nothing")
 
     gid = sender_creature.graph_id
-    guard_graph_model_bindings(engine, gid)
+    guard_graph_model_bindings(engine, gid, store_preflight=False)
     g = engine._topology.graphs[gid]
     targets = (
         [channel]
@@ -83,7 +95,11 @@ async def disconnect_creatures(
     )
     projected = deepcopy(engine._topology)
     delta = _topo.disconnect(projected, sid, rid, channel=channel)
-    preflight_child_split(engine, projected, delta)
+    prepared = await prepare_split(engine, projected, delta)
+    if prepared is None:
+        preflight_child_split(engine, projected, delta)
+    if prepared is not None:
+        await prepared.install()
     engine._topology = projected
     for ch in targets:
         remove_channel_trigger(
@@ -97,7 +113,9 @@ async def disconnect_creatures(
             sender_creature.send_channels.remove(ch)
 
     if delta.kind == "split":
-        apply_split_bookkeeping(engine, delta)
+        apply_split_bookkeeping(engine, delta, prepared=prepared)
+        if prepared is not None:
+            await prepared.retire()
     elif targets:
         # Intra-graph unwire still mutated listen/send lists, so the
         # runtime-graph prompt block must refresh both peers.
@@ -116,7 +134,9 @@ async def disconnect_creatures(
     return DisconnectionResult(channels=list(targets), delta_kind=delta.kind)
 
 
-def apply_split_bookkeeping(engine: "Terrarium", delta: _topo.TopologyDelta) -> None:
+def apply_split_bookkeeping(
+    engine: "Terrarium", delta: _topo.TopologyDelta, *, prepared=None
+) -> None:
     """Run the engine-side bookkeeping for a topology split.
 
     For every new graph component:
@@ -201,7 +221,16 @@ def apply_split_bookkeeping(engine: "Terrarium", delta: _topo.TopologyDelta) -> 
                 ignore_sender_id=c.creature_id,
             )
 
-    _session_coord.apply_split(engine, delta)
+    if prepared is None:
+        _session_coord.apply_split(engine, delta)
+    else:
+        _session_coord._drive_topology.stash_split(
+            engine, delta.old_graph_ids[0], list(delta.new_graph_ids)
+        )
+        prepared.publish()
+        _session_coord._topo_leftovers.distribute_leftovers(
+            engine, delta.old_graph_ids[0], list(delta.new_graph_ids)
+        )
     engine._emit(
         EngineEvent(
             kind=EventKind.TOPOLOGY_CHANGED,
@@ -215,7 +244,13 @@ def apply_split_bookkeeping(engine: "Terrarium", delta: _topo.TopologyDelta) -> 
     )
 
 
-async def remove_channel_from_graph(
+async def remove_channel_from_graph(engine, graph_id, name):
+    return await run_topology_operation(
+        engine, {graph_id}, lambda: _remove_channel_from_graph(engine, graph_id, name)
+    )
+
+
+async def _remove_channel_from_graph(
     engine: "Terrarium", graph_id: str, name: str
 ) -> _topo.TopologyDelta:
     """Body of :meth:`Terrarium.remove_channel`.
@@ -232,10 +267,14 @@ async def remove_channel_from_graph(
     if name not in g.channels:
         raise KeyError(f"channel {name!r} not in graph {graph_id!r}")
 
-    guard_graph_model_bindings(engine, graph_id)
+    guard_graph_model_bindings(engine, graph_id, store_preflight=False)
     projected = deepcopy(engine._topology)
     delta = _topo.remove_channel(projected, graph_id, name)
-    preflight_child_split(engine, projected, delta)
+    prepared = await prepare_split(engine, projected, delta)
+    if prepared is None:
+        preflight_child_split(engine, projected, delta)
+    if prepared is not None:
+        await prepared.install()
     # 1. Tear down listen triggers on every listener.
     for cid, listens in list(g.listen_edges.items()):
         if name not in listens:
@@ -271,7 +310,9 @@ async def remove_channel_from_graph(
     # still emit so runtime-graph prompts refresh their listen/send
     # lists after the channel disappeared.
     if delta.kind == "split":
-        apply_split_bookkeeping(engine, delta)
+        apply_split_bookkeeping(engine, delta, prepared=prepared)
+        if prepared is not None:
+            await prepared.retire()
     else:
         engine._emit(
             EngineEvent(

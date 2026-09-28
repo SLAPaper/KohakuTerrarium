@@ -17,6 +17,9 @@ from datetime import datetime
 from typing import Any
 
 from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
+from kohakuterrarium.terrarium.drive.delivery_handoff import DeliveryHandoffBook
+from kohakuterrarium.terrarium.drive.errors import DriveHandoffError
+from kohakuterrarium.terrarium.drive.handoff import drive_handoff
 from kohakuterrarium.terrarium.drive.manager import DriveManager
 from kohakuterrarium.terrarium.drive.memory import MemoryDriveRepository
 from kohakuterrarium.terrarium.drive.sink import DriveDeliverySink, DriveObserver
@@ -90,6 +93,9 @@ class GraphDriveRegistry:
         # Detached manager stops are drained during shutdown rather than cancelled
         # mid-round.
         self._stop_tasks: set[asyncio.Task] = set()
+        self._delivery_receipts = DeliveryHandoffBook()
+        self._handoff = None
+        self._retired_managers = set()
 
     def peek(self, graph_id: str) -> DriveManager | None:
         """Return an existing graph manager without creating one."""
@@ -133,6 +139,11 @@ class GraphDriveRegistry:
             return existing
         if not create:
             return None
+        if (
+            self._handoff is not None
+            and self._handoff.owner is not asyncio.current_task()
+        ):
+            raise DriveHandoffError("Drive registry handoff is pending")
         repo, store = self._resolve_repo(graph_id)
         return self._install(graph_id, repo, store)
 
@@ -145,7 +156,8 @@ class GraphDriveRegistry:
         self._ready_graphs.add(graph_id)
         manager = self.manager_for(graph_id)
         assert manager is not None
-        await manager.start()
+        if self._handoff is None:
+            await manager.start()
         return manager
 
     async def bind_store(self, graph_id: str, session_store: Any) -> DriveManager:
@@ -160,7 +172,17 @@ class GraphDriveRegistry:
         # consuming a single-store provider during precedence checks.
         if self._provider_repo(graph_id) is not None:
             return self.manager_for(graph_id)
-        repo = open_session_drive_repository(session_store)
+        if (
+            self._handoff is not None
+            and self._handoff.owner is not asyncio.current_task()
+        ):
+            raise DriveHandoffError("Drive registry handoff is pending")
+        run = getattr(session_store, "run", None)
+        repo = (
+            await run(open_session_drive_repository, session_store)
+            if callable(run)
+            else open_session_drive_repository(session_store)
+        )
         existing = self._managers.get(graph_id)
         if existing is None:
             # Dispatch remains dormant until restoration finishes, avoiding
@@ -208,6 +230,10 @@ class GraphDriveRegistry:
         self._bound_stores.pop(graph_id, None)
         self._ready_graphs.discard(graph_id)
         if manager is not None:
+            if self._handoff is not None or manager.dispatcher._handoff_paused:
+                manager.dispatcher.pause_handoff()
+                self._retired_managers.add(manager)
+                return
             try:
                 await manager.stop()
             except Exception as exc:  # pragma: no cover
@@ -227,6 +253,7 @@ class GraphDriveRegistry:
         before active managers stop. This prevents dispatch from racing repository
         closure as the event loop shuts down.
         """
+        self._delivery_receipts.abort()
         for task in list(self._start_tasks):
             if not task.done():
                 task.cancel()
@@ -235,8 +262,9 @@ class GraphDriveRegistry:
         self._stop_tasks.clear()
         if stop_tasks:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
-        for manager in list(self._managers.values()):
+        for manager in set(self._managers.values()) | self._retired_managers:
             await manager.stop()
+        self._retired_managers.clear()
         self._active = False
 
     def set_snapshot(self, snapshot: EnabledRegistrySnapshot | None) -> None:
@@ -266,6 +294,27 @@ class GraphDriveRegistry:
     def resolve_destination_repo(self, graph_id: str) -> tuple[Any, Any]:
         """Resolve topology-movement storage with standard graph precedence."""
         return self._resolve_repo(graph_id)
+
+    async def resolve_destination_repo_async(self, graph_id: str) -> tuple[Any, Any]:
+        """Resolve topology storage with session-sidecar preparation on its worker."""
+        provided = self._provider_repo(graph_id)
+        store = None
+        if provided is not None:
+            repo = provided
+        else:
+            store = getattr(self._engine, "_session_stores", {}).get(graph_id)
+            if store is None:
+                repo = MemoryDriveRepository()
+            else:
+                run = getattr(store, "run", None)
+                repo = (
+                    await run(open_session_drive_repository, store)
+                    if callable(run)
+                    else open_session_drive_repository(store)
+                )
+        if self._handoff is not None:
+            await self._handoff.reserve(repo)
+        return repo, store
 
     def _build_manager(self, graph_id: str, repo: Any) -> DriveManager:
         return DriveManager(
@@ -300,6 +349,9 @@ class GraphDriveRegistry:
 
     def _install(self, graph_id: str, repo: Any, store: Any) -> DriveManager:
         manager = self._build_manager(graph_id, repo)
+        manager.dispatcher._receipts = self._delivery_receipts
+        if self._handoff is not None:
+            manager.dispatcher.pause_handoff()
         self._managers[graph_id] = manager
         self._repos[graph_id] = repo
         if store is not None:
@@ -318,20 +370,39 @@ class GraphDriveRegistry:
         self, graph_id: str, existing: DriveManager, repo: Any, store: Any
     ) -> None:
         """Promote ephemeral rows into session storage before replacing a manager."""
-        old_repo = self._repos.get(graph_id)
-        if getattr(old_repo, "durability", "") == "ephemeral":
-            try:
+        async with drive_handoff(self._engine, {graph_id}) as handoff:
+            await handoff.reserve(repo)
+            old_repo = existing.repository
+            if getattr(old_repo, "durability", "") == "ephemeral":
                 payload = await old_repo.export_rows()
-                if payload.get("drives"):
+                backup = await repo.export_rows()
+                previously_written = handoff.written
+                handoff.written = True
+                try:
                     await repo.import_rows(payload)
-            except Exception as exc:  # pragma: no cover
-                logger.warning("drive repo rebind migrate failed", error=str(exc))
-        await existing.stop()
-        self._install(graph_id, repo, store)
+                except (Exception, asyncio.CancelledError):
+                    try:
+                        await repo.replace_rows(backup)
+                        handoff.written = previously_written
+                    except (Exception, asyncio.CancelledError):
+                        logger.error(
+                            "Drive promotion rollback was not confirmed", exc_info=True
+                        )
+                    raise
+            payload = await repo.export_rows()
+            was_ready = graph_id in self._ready_graphs
+            self.rebind_repository(graph_id, repo, store)
+            if was_ready:
+                self._ready_graphs.add(graph_id)
+            handoff.stage({graph_id: payload})
 
     def _maybe_start(self, graph_id: str, manager: DriveManager) -> None:
         """Start a lazily created manager only after its graph is restoration-ready."""
-        if not self._active or graph_id not in self._ready_graphs:
+        if (
+            self._handoff is not None
+            or not self._active
+            or graph_id not in self._ready_graphs
+        ):
             return
         try:
             asyncio.get_running_loop()
@@ -343,6 +414,10 @@ class GraphDriveRegistry:
 
     def _schedule_stop(self, manager: DriveManager) -> None:
         """Schedule shutdown after detaching a manager without closing its store."""
+        if self._handoff is not None or manager.dispatcher._handoff_paused:
+            manager.dispatcher.pause_handoff()
+            self._retired_managers.add(manager)
+            return
         try:
             asyncio.get_running_loop()
         except RuntimeError:

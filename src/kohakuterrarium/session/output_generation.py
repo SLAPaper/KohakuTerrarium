@@ -5,6 +5,7 @@ from copy import deepcopy
 
 from kohakuterrarium.errors import SessionError
 from kohakuterrarium.llm.generation import GENERATION_SOURCE_KEYS
+from kohakuterrarium.session.output_handoff import admit_output
 
 ASSISTANT_EVENTS = frozenset(
     {
@@ -25,6 +26,7 @@ def stamp_generation(sink, event_type, data):
     return copied
 
 
+@admit_output
 async def begin_generation(sink, payload):
     """Confirm one append-plus-flush affinity unit before publishing its origin."""
     source = payload["source"]

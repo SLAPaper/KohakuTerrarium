@@ -5,7 +5,16 @@ import json
 from collections.abc import Hashable, Mapping
 from typing import Any, Iterable
 
+from kohakuterrarium.errors import HistoryCompatibilityError
 from kohakuterrarium.core.job_label import canonical_tool_name, make_job_label
+from kohakuterrarium.session.compact_coverage import make_rule, rule_covers
+from kohakuterrarium.session.native_ack import project_ack_results
+from kohakuterrarium.session.feedback_admission import project_feedback_events
+from kohakuterrarium.session.event_origin import (
+    EVENT_COORDINATE,
+    EVENT_ORIGIN,
+    validate_origin,
+)
 
 # Parent paths identify the selected branches of earlier turns. Legacy events
 # derive this ancestry from event order when no explicit path was persisted.
@@ -433,20 +442,35 @@ def _event_signature_value(value: Any) -> Hashable:
 def dedupe_adjacent_duplicate_events(
     events: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Collapse identical adjacent persisted events.
-
-    Duplicate sink attachment can persist equivalent neighboring rows with distinct
-    identifiers and timestamps. Replay consumers collapse them while the raw log
-    remains unchanged.
-    """
+    """Deduplicate marked origins; retain adjacent-content compatibility for legacy rows."""
     out: list[dict[str, Any]] = []
+    origins: dict[tuple, dict] = {}
     previous_signature: tuple[tuple[str, Hashable], ...] | None = None
     for evt in events:
+        if EVENT_ORIGIN in evt:
+            raw = evt[EVENT_ORIGIN]
+            try:
+                origin = validate_origin(raw, raw[1])
+            except (ValueError, TypeError, IndexError, KeyError) as exc:
+                raise HistoryCompatibilityError("Invalid replay event origin") from exc
+            payload = {
+                k: v
+                for k, v in evt.items()
+                if k not in ("event_id", EVENT_ORIGIN, EVENT_COORDINATE)
+            }
+            previous_signature = None
+            if origin in origins:
+                if origins[origin] != payload:
+                    raise HistoryCompatibilityError("Conflicting replay event origin")
+                continue
+            origins[origin] = payload
+            out.append(evt)
+            continue
         signature = tuple(
             sorted(
                 (k, _event_signature_value(v))
                 for k, v in evt.items()
-                if k not in {"event_id", "ts"}
+                if k not in {"event_id", "ts", EVENT_COORDINATE}
             )
         )
         if signature == previous_signature:
@@ -492,17 +516,14 @@ def compact_path_from_event(evt: Mapping[str, Any]) -> set[tuple[int, int]] | No
 
 def compact_replay_events(events, compacts, view):
     """Keep summary anchors without synthesizing calls hidden by the baseline."""
+    events = dedupe_adjacent_duplicate_events(events)
+    events = project_feedback_events(project_ack_results(events))
     selected = set(view.items())
     rules = [
-        (
-            event["replaced_from_event_id"],
-            event["replaced_to_event_id"],
-            compact_path_from_event(event),
-            event.get("summary", ""),
-        )
+        rule
         for event in compacts
-        if type(event.get("replaced_from_event_id")) is int
-        and type(event.get("replaced_to_event_id")) is int
+        if (rule := make_rule(event, events, compact_path_from_event(event)))
+        is not None
     ]
     eligible = [rule for rule in rules if _rule_priority(rule, selected)[0] > 0]
     if not eligible:
@@ -514,7 +535,8 @@ def compact_replay_events(events, compacts, view):
     return [
         (
             {**event, "type": "text_chunk", "content": ""}
-            if event.get("type") in ("tool_call", "tool_result", "assistant_tool_calls")
+            if event.get("type")
+            in ("tool_call", "tool_result", "assistant_tool_calls", "native_tool_ack")
             and _covered_by_replace(
                 event.get("event_id"),
                 event.get("turn_index"),
@@ -541,8 +563,9 @@ def _covered_by_replace(
     """
     if not isinstance(eid, int):
         return False
-    for frm, to, path, _summary in rules:
-        if not (frm <= eid <= to):
+    for rule in rules:
+        path = rule[2]
+        if not rule_covers(rule, eid):
             continue
         if path is None:
             return True
@@ -566,7 +589,7 @@ def _rule_priority(
     branch — its summary carries sibling-specific content, not just the shared
     ancestor, so it must never leak into this branch's replay.
     """
-    _frm, _to, path, _summary = rule
+    path = rule[2]
     if path is None:
         return (1, 0)
     if not path.issubset(selected_pairs):

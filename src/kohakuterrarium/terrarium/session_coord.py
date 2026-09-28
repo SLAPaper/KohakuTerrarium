@@ -12,11 +12,18 @@ from typing import TYPE_CHECKING
 
 import kohakuterrarium.terrarium.drive.topology as _drive_topology
 import kohakuterrarium.terrarium.topology_leftovers as _topo_leftovers
-from kohakuterrarium.core.session_attachment import attach_topology_member
+from kohakuterrarium.core.session_attachment import (
+    attach_topology_member,
+    topology_source_names,
+)
 from kohakuterrarium.errors import SessionNotResumableError
 from kohakuterrarium.session.event_origin import capture_events, import_events
 from kohakuterrarium.session.identity import new_conversation_id
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.terrarium.session_runtime_state import (
+    capture_runtime_transfer,
+    install_runtime_transfer,
+)
 from kohakuterrarium.terrarium.session_plugin_state import (
     guarded_plugin_state_handoff,
     transfer_graph_plugin_state,
@@ -26,6 +33,7 @@ from kohakuterrarium.terrarium.session_resources import (
     track_opened_store,
     unpublished_store_factory,
 )
+from kohakuterrarium.terrarium.topology_admission import record_topology_transfer
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -36,6 +44,10 @@ logger = get_logger(__name__)
 
 
 def copy_events_into(src: SessionStore, dst: SessionStore) -> int:
+    return _copy_session_into(src, dst, snapshots=False)
+
+
+def _copy_session_into(src: SessionStore, dst: SessionStore, *, snapshots=True) -> int:
     """Copy detached events through each store's worker; requires blocking.
 
     Preserves namespace order and branch fields. Destination event IDs are
@@ -48,6 +60,13 @@ def copy_events_into(src: SessionStore, dst: SessionStore) -> int:
         raise RuntimeError("Event copy coordinator cannot run on a store worker")
     if src is dst or Path(src.path).resolve() == Path(dst.path).resolve():
         raise ValueError("Event copy requires distinct stores")
+    if snapshots:
+        captured = src.submit(
+            capture_runtime_transfer, src, topology_source_names(src)
+        ).result()
+        receipts = dst.submit(install_runtime_transfer, dst, captured).result()
+        record_topology_transfer(src, dst, captured[0][0], receipts)
+        return len(receipts)
     captured = src.submit(capture_events, src).result()
     return len(dst.submit(import_events, dst, captured).result())
 
@@ -133,7 +152,7 @@ def merge_session_stores(
                 inherited_meta = old_meta
         except Exception:
             logger.warning("merge: load_meta failed", exc_info=True)
-        copy_events_into(old, new_store)
+        _copy_session_into(old, new_store)
     try:
         new_store.meta["session_id"] = new_store.session_id
         new_store.meta["parent_session_ids"] = parents
@@ -173,7 +192,7 @@ def split_session_store(
         logger.warning("split: load_meta failed for inheritance", exc_info=True)
     for path in new_paths:
         new_store = track_opened_store(SessionStore(path))
-        copy_events_into(old_store, new_store)
+        _copy_session_into(old_store, new_store)
         try:
             new_store.meta["session_id"] = new_store.session_id
             new_store.meta["parent_session_ids"] = [str(parent_id)] if parent_id else []
@@ -335,7 +354,7 @@ def apply_merge(
             for old in old_stores:
                 if old is kept_store:
                     continue
-                copy_events_into(old, kept)
+                _copy_session_into(old, kept)
             # Stamp the merge lineage on the kept store's meta so
             # downstream viewers still see ``parent_session_ids`` /
             # ``merged_at`` like the multi-store branch produces.
@@ -487,7 +506,7 @@ def _merge_into_existing_store(
         parent_ids.update(source.meta.get("parent_session_ids", []))
         if source_id:
             parent_ids.add(source_id)
-        copy_events_into(source, destination)
+        _copy_session_into(source, destination)
     destination.meta["parent_session_ids"] = sorted(parent_ids)
     destination.meta["merged_at"] = time.time()
     destination.flush()

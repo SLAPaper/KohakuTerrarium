@@ -28,7 +28,7 @@ def prefix_fingerprint(messages: list) -> tuple:
         if callable(to_dict):
             # Canonical serializer — covers tool_call_id / name /
             # extra provider fields, not just role+content+tool_calls.
-            out.append(repr(to_dict()))
+            out.append((repr(to_dict()), repr(getattr(m, "metadata", None))))
         else:
             out.append(
                 (

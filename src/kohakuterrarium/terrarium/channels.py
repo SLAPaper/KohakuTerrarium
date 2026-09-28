@@ -16,11 +16,13 @@ mutation and live channel injection remain coordinated.
 import asyncio
 import time
 import weakref
+from copy import deepcopy
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 import kohakuterrarium.terrarium.session_coord as _session_coord
 import kohakuterrarium.terrarium.topology as _topo
+from kohakuterrarium.terrarium.session_merge_async import prepare_merge
 from kohakuterrarium.core.channel import ChannelRegistry
 from kohakuterrarium.core.environment import Environment
 from kohakuterrarium.errors import SessionNotResumableError
@@ -34,6 +36,7 @@ from kohakuterrarium.terrarium.graph_identity_engine import (
     resolve_and_guard_connect,
 )
 from kohakuterrarium.terrarium.topology import ChannelInfo
+from kohakuterrarium.terrarium.topology_admission import run_topology_operation
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -366,7 +369,20 @@ def _spawn_trigger_runner(agent: Any, trigger_id: str, trigger: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def connect_creatures(
+async def connect_creatures(engine, sender, receiver, *, channel=None):
+    ids = [engine._resolve_creature_id(ref) for ref in (sender, receiver)]
+    graph_ids = {engine._topology.creature_to_graph[cid] for cid in ids}
+
+    async def operation():
+        endpoints = resolve_and_guard_connect(
+            engine, sender, receiver, store_preflight=False
+        )
+        return await _connect_creatures(engine, *endpoints, channel=channel)
+
+    return await run_topology_operation(engine, graph_ids, operation)
+
+
+async def _connect_creatures(
     engine: "Terrarium",
     sender: "CreatureRef",
     receiver: "CreatureRef",
@@ -401,7 +417,18 @@ async def connect_creatures(
                 + ", ".join(duplicates)
             )
 
-    channel_name, delta = _topo.connect(engine._topology, sid, rid, channel=channel)
+    projected = deepcopy(engine._topology)
+    channel_name, delta = _topo.connect(projected, sid, rid, channel=channel)
+    prepared = (
+        await prepare_merge(engine, projected, delta) if delta.kind == "merge" else None
+    )
+    if prepared is not None:
+        try:
+            await prepared.install()
+        except BaseException:
+            await prepared.abort()
+            raise
+    engine._topology = projected
     if delta.kind == "merge":
         # The kept graph's id is delta.new_graph_ids[0].  Move every
         # channel + re-point every trigger from the dropped env into
@@ -416,7 +443,17 @@ async def connect_creatures(
             if c is not None:
                 c.graph_id = engine._topology.creature_to_graph.get(cid, c.graph_id)
         # Coordinate session-store side of the merge.
-        _session_coord.apply_merge(engine, delta)
+        if prepared is None:
+            _session_coord.apply_merge(engine, delta)
+        else:
+            _session_coord._drive_topology.stash_merge(
+                engine, keep_gid, list(delta.old_graph_ids)
+            )
+            prepared.publish()
+            _session_coord._topo_leftovers.transfer_leftovers(
+                engine, list(delta.old_graph_ids), keep_gid
+            )
+            await prepared.retire()
         # Mirror the kind promotion done by ``ensure_same_graph`` so
         # the rail's listing-by-kind doesn't flicker after a
         # channel-based connect either.
@@ -481,7 +518,15 @@ async def connect_creatures(
     )
 
 
-async def ensure_same_graph(
+async def ensure_same_graph(engine, a, b):
+    ids = [engine._resolve_creature_id(ref) for ref in (a, b)]
+    graph_ids = {engine._topology.creature_to_graph[cid] for cid in ids}
+    return await run_topology_operation(
+        engine, graph_ids, lambda: _ensure_same_graph(engine, a, b)
+    )
+
+
+async def _ensure_same_graph(
     engine: "Terrarium", a: "CreatureRef", b: "CreatureRef"
 ) -> str:
     """Merge ``a``'s and ``b``'s graphs without creating a channel.
@@ -512,8 +557,17 @@ async def ensure_same_graph(
                 "Cannot merge persisted graphs with duplicate creature names: "
                 + ", ".join(duplicates)
             )
-    resolve_and_guard_connect(engine, a, b)
-    delta = _topo._merge_graphs(engine._topology, a_gid, b_gid)
+    resolve_and_guard_connect(engine, a, b, store_preflight=False)
+    projected = deepcopy(engine._topology)
+    delta = _topo._merge_graphs(projected, a_gid, b_gid)
+    prepared = await prepare_merge(engine, projected, delta)
+    if prepared is not None:
+        try:
+            await prepared.install()
+        except BaseException:
+            await prepared.abort()
+            raise
+    engine._topology = projected
     keep_gid = delta.new_graph_ids[0]
     drop_gids = [g for g in delta.old_graph_ids if g != keep_gid]
     for drop_gid in drop_gids:
@@ -524,7 +578,17 @@ async def ensure_same_graph(
             creature.graph_id = engine._topology.creature_to_graph.get(
                 cid, creature.graph_id
             )
-    _session_coord.apply_merge(engine, delta)
+    if prepared is None:
+        _session_coord.apply_merge(engine, delta)
+    else:
+        _session_coord._drive_topology.stash_merge(
+            engine, keep_gid, list(delta.old_graph_ids)
+        )
+        prepared.publish()
+        _session_coord._topo_leftovers.transfer_leftovers(
+            engine, list(delta.old_graph_ids), keep_gid
+        )
+        await prepared.retire()
     checkpoint = getattr(engine, "checkpoint_graph", None)
     if checkpoint is not None:
         await checkpoint(keep_gid)

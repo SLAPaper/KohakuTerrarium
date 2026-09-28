@@ -56,11 +56,22 @@ def _finish(entry, *, state, persisted=False, error=None):
     entry.update(state=state, persisted=persisted, error=error)
 
 
-async def _publish(agent, reservation):
+async def _publish(agent, reservation, handoff_ready=None):
     entry = await _settle(reservation)
     if entry is None:
         return
     try:
+        if handoff_ready is not None:
+            while True:
+                await handoff_ready.wait()
+                if getattr(agent, "_topology_handoff_task", None) is None:
+                    break
+                handoff_ready = agent._topology_handoff_ready
+        asyncio.current_task()._topology_deferred = False
+        if getattr(agent, "_session_attach_uncertain", False):
+            raise InvalidRequestError(
+                "Background terminal requires cold handoff recovery"
+            )
         receipt = agent._publish_bg_complete(
             entry["event"], consume=False, retry=entry["retry"]
         )
@@ -107,9 +118,15 @@ def schedule_background_terminal(agent, event, *, notify=None):
         notify = agent._should_notify_controller_on_background_complete(captured.job_id)
     reservation = _owner(agent, lambda: _reserve(agent, identity[1], captured, notify))
     pending = agent.output_router._terminal_publications
+    handoff_ready = (
+        getattr(agent, "_topology_handoff_ready", None)
+        if getattr(agent, "_topology_handoff_task", None) is not None
+        else None
+    )
 
     def start():
-        task = asyncio.create_task(_publish(agent, reservation))
+        task = asyncio.create_task(_publish(agent, reservation, handoff_ready))
+        task._topology_deferred = handoff_ready is not None
         pending.add(task)
         task.add_done_callback(done)
         return task

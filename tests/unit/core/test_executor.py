@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from kohakuterrarium.core import tool_output_persistence
 from kohakuterrarium.core.events import EventType
 from kohakuterrarium.core.executor import Executor
 from kohakuterrarium.core.job import JobState, JobStore
@@ -504,12 +505,11 @@ class TestExecutorException:
         this by mocking ``normalize_tool_result`` to raise."""
         ex = Executor()
         ex.register_tool(_EchoTool())
-        from kohakuterrarium.core import executor as ex_mod
 
         def explode(*a, **k):
             raise RuntimeError("normalize boom")
 
-        monkeypatch.setattr(ex_mod, "normalize_tool_result", explode)
+        monkeypatch.setattr(tool_output_persistence, "normalize_tool_result", explode)
         jid = await ex.submit("echo", {"msg": "hi"})
         result = await ex.wait_for(jid)
         assert result is not None
@@ -903,12 +903,11 @@ class TestRunToolExceptionWithDirect:
         cover the ``if not is_direct:`` skip-path in the except handler."""
         ex = Executor()
         ex.register_tool(_FailTool())
-        from kohakuterrarium.core import executor as ex_mod
 
         def explode(*a, **k):
             raise RuntimeError("boom")
 
-        monkeypatch.setattr(ex_mod, "normalize_tool_result", explode)
+        monkeypatch.setattr(tool_output_persistence, "normalize_tool_result", explode)
         jid = await ex.submit("fail", {}, is_direct=True)
         result = await ex.wait_for(jid)
         # No event was queued (is_direct skip).
@@ -938,12 +937,11 @@ class TestRunToolExceptionWithCallbackBackground:
 
         ex = Executor(on_complete=lambda e: called.append(e))
         ex.register_tool(_FailTool())
-        from kohakuterrarium.core import executor as ex_mod
 
         def explode(*a, **k):
             raise RuntimeError("normalize boom")
 
-        monkeypatch.setattr(ex_mod, "normalize_tool_result", explode)
+        monkeypatch.setattr(tool_output_persistence, "normalize_tool_result", explode)
         jid = await ex.submit("fail", {}, is_direct=False)
         await ex.wait_for(jid)
         # Callback fired for the failed job.

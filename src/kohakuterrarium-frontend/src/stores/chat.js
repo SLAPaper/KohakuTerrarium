@@ -1,6 +1,7 @@
 import { ElMessage } from "element-plus"
 import { getCurrentInstance, markRaw, toRaw } from "vue"
 import { extractReasoning } from "@/utils/chatReasoning"
+import { compactProjection } from "@/stores/compactCoverage"
 
 import { injectScope, registerScopeDisposer, scopeOfStoreId } from "@/composables/useScope"
 import { createVisibilityInterval } from "@/composables/useVisibilityInterval"
@@ -682,19 +683,8 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
   const events = prepared.events
   const { byTurn, liveIds, branchSelection } = prepared.branchMetadata
 
-  // Pre-pass: compact_replace ranges hide every event whose event_id
-  // falls inside the replaced range. Mirrors Python replay_conversation
-  // so resume + live show the same compact-summary bubble.
-  const replacedIds = new Set()
-  for (const evt of events) {
-    if (evt?.type === "compact_replace") {
-      const frm = evt.replaced_from_event_id
-      const to = evt.replaced_to_event_id
-      if (typeof frm === "number" && typeof to === "number") {
-        for (let i = frm; i <= to; i++) replacedIds.add(i)
-      }
-    }
-  }
+  const compaction = compactProjection(events, branchSelection, liveIds)
+  const replacedIds = compaction.winner?.members || new Set()
 
   const result = []
   let cur = null
@@ -1009,8 +999,30 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
       continue
     }
 
-    // Skip events covered by a compact_replace range (the summary
-    // bubble emitted below replaces them).
+    if (
+      compaction.winner &&
+      compaction.winner.anchorId != null &&
+      compaction.winner.anchorId === evt.event_id
+    ) {
+      const summary = compaction.winner.event
+      cur = null
+      addHistoryKey(
+        upsertCompactMessage(
+          summary.compact_round || summary.round || 0,
+          summary.summary || summary.summary_text || "",
+          "done",
+          summary.messages_compacted || 0,
+        ),
+        summary,
+      )
+    }
+    if (
+      compaction.terminals.has(evt) ||
+      (t === "compact_start" && compaction.rounds.has(evt.compact_round || evt.round || 0))
+    )
+      continue
+
+    // Skip only members of the selected compact rule.
     if (
       typeof evt.event_id === "number" &&
       replacedIds.has(evt.event_id) &&

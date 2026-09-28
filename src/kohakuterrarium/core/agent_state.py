@@ -6,6 +6,7 @@ import asyncio
 import inspect
 from typing import Any, Callable
 
+from kohakuterrarium.core.model_switch_guard import require_topology_mutation_available
 from kohakuterrarium.core.session_state_owner import SessionStateOwner
 from kohakuterrarium.errors import ConflictError, InvalidRequestError
 from kohakuterrarium.utils.logging import get_logger
@@ -100,6 +101,7 @@ def run_session_state(agent: Any, callback: Callable[..., Any]) -> Any:
     ``owner.submit`` itself still rejects re-entry; this helper must not
     deadlock by queueing work onto the task that is already running it.
     """
+    require_topology_mutation_available(agent)
     if getattr(agent, "_stopped", False) or getattr(
         agent, "_model_switch_closing", False
     ):

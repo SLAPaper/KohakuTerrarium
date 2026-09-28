@@ -22,6 +22,8 @@ from kohakuterrarium.core.interrupted_history import (
 from kohakuterrarium.core.controller import Controller
 from kohakuterrarium.core.events import create_tool_complete_event
 from kohakuterrarium.core.job import JobResult, generate_job_id
+from kohakuterrarium.core.native_ack import append_ack
+from kohakuterrarium.core.feedback_dispatch import append_dispatch_ack
 from kohakuterrarium.core.tool_origin import (
     capture_tool_context,
     promote_tool_context,
@@ -188,6 +190,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                             raise
                         self._job_terminal_claims[jid] = {
                             "result": captured,
+                            "kind": meta.get("kind", "tool"),
                             "admitted": accepted,
                             "feedback_taken": True,
                         }
@@ -213,12 +216,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
 
     async def _append_background_ack(self, job_id, tool_call_id, name, content):
         """Pair a background acknowledgement on its captured native occurrence."""
-        admitted = await submit_internal_session_state(
-            self,
-            lambda: append_pending_result(
-                self, job_id, {"tool_call_id": tool_call_id, "name": name}, content
-            ),
-        )
+        admitted = await append_ack(self, job_id, tool_call_id, name, content)
         if not admitted:
             logger.warning(
                 "Background acknowledgement rejected by current native occurrence",
@@ -240,23 +238,29 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
 
         def commit():
             promote_tool_context(self, job_id)
-            admitted = True
-            if native_mode and tool_call_id:
-                admitted = append_pending_result(
-                    self,
-                    job_id,
-                    {"tool_call_id": tool_call_id, "name": tool_name},
-                    f"[{tool_name}] Promoted to background. Result arrives in a later turn.",
-                )
             meta = self._direct_job_meta.get(job_id)
             if meta is not None:
                 meta["background"] = True
                 meta["interruptible"] = False
             if self._bg_controller_notify.get(job_id, True):
                 self._turn_dispatched_bg.add(job_id)
-            return admitted
+            if not native_mode:
+                append_dispatch_ack(
+                    self,
+                    job_id,
+                    f"[{tool_name} → {job_id}] Promoted to background. Result arrives in a later turn.",
+                )
 
-        admitted = await submit_internal_session_state(self, commit)
+        await submit_internal_session_state(self, commit)
+        admitted = True
+        if native_mode and tool_call_id:
+            admitted = await append_ack(
+                self,
+                job_id,
+                tool_call_id,
+                tool_name,
+                f"[{tool_name}] Promoted to background. Result arrives in a later turn.",
+            )
         if not admitted:
             logger.warning(
                 "Promotion acknowledgement rejected by current native occurrence",

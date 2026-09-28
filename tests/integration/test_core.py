@@ -62,7 +62,14 @@ from kohakuterrarium.llm.base import (
 )
 from kohakuterrarium.llm.codex_format import to_responses_input
 from kohakuterrarium.session.raw_history import UserMessageSelector
+from kohakuterrarium.session.compact_coverage import coordinate
+from kohakuterrarium.session.history_replay import replay_selected_events
+from kohakuterrarium.session.history_records import history_page
+from kohakuterrarium.terrarium.session_coord import copy_events_into
 from kohakuterrarium.session.reader import SessionReader
+from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.resume_replay import replay_resume_history
+from kohakuterrarium.session.compact_compile import compile_coverage
 from kohakuterrarium.skills.registry import Skill
 from kohakuterrarium.terrarium.service import LocalTerrariumService
 from kohakuterrarium.modules.plugin.base import BasePlugin, PluginBlockError
@@ -211,13 +218,7 @@ class _RaisingTool(BaseTool):
 
 
 class _MultimodalTool(BaseTool):
-    """DIRECT tool returning a multimodal ToolResult (text + image).
-
-    Drives ``tool_output.normalize_tool_output`` down its
-    list-of-parts branch: the image part has no artifact store here so
-    it is rendered as a safe text placeholder (raw base64 never reaches
-    model context) and ``render_content_text`` joins the parts.
-    """
+    """DIRECT tool returning a caption and a persistable image payload."""
 
     @property
     def tool_name(self) -> str:
@@ -568,7 +569,7 @@ class TestCoreIntegration:
         # echo call's args — the cross-cutting-concern extension point.
         agent.plugins.register(_RewriteArgsPlugin())
 
-        async with Terrarium() as engine:
+        async with Terrarium(session_dir=tmp_path / "turn-sessions") as engine:
             added = await engine.add_creature(creature)
             # The engine placed the creature in a fresh singleton graph
             # and started it.
@@ -625,6 +626,36 @@ class TestCoreIntegration:
             # The real background output ("background-finished") reached
             # the conversation as a tool-result message.
             assert "background-finished" in bg_convo
+            feedback = [
+                message
+                for message in agent.controller.conversation.get_messages()
+                if message.role == "user"
+                and "background-finished" in message.get_text_content()
+            ]
+            assert len(feedback) == 1 and feedback[0].metadata.get(
+                "feedback_admission_origin"
+            )
+            coverage = await agent.session_store.run(
+                compile_coverage,
+                agent.session_store,
+                agent.config.name,
+                [{**feedback[0].to_dict(), "metadata": deepcopy(feedback[0].metadata)}],
+                [],
+            )
+            assert coverage["coverage_mode"] == "exact"
+            feedback_session_path = agent.session_store.path
+            raw = await agent.session_store.run(
+                agent.session_store.get_events, agent.config.name
+            )
+            recovered_feedback = replay_resume_history(raw)
+            assert (
+                sum(
+                    message.get("role") == "user"
+                    and "background-finished" in str(message.get("content"))
+                    for message in recovered_feedback
+                )
+                == 1
+            )
 
             # Regression guard for B-fat2-core-1 (FIXED): a tool declared
             # ``ExecutionMode.BACKGROUND`` is submitted to the executor as
@@ -741,8 +772,23 @@ class TestCoreIntegration:
             # --- session_info snapshot ----------------------------------
             info = agent.session_info()
             assert info["agent"] == "solo"
-            assert info["tokens"] == {}
-            assert agent.session_info(tokens_view="all_loops")["tokens"] == []
+            assert info["tokens"] == {
+                "agent": "solo",
+                "total_tokens": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cached_tokens": 0,
+            }
+            assert agent.session_info(tokens_view="all_loops")["tokens"] == [
+                (
+                    "solo",
+                    {
+                        key: value
+                        for key, value in info["tokens"].items()
+                        if key != "agent"
+                    },
+                )
+            ]
 
             # --- Turn 4: a veto plugin blocks the echo tool -------------
             # Register a second plugin whose pre_tool_dispatch raises
@@ -829,10 +875,7 @@ class TestCoreIntegration:
             assert boom_status.state.value == "error"
 
             # --- Turn 7: multimodal + huge tool output normalization ----
-            # ``snap`` returns a text+image ToolResult; with no artifact
-            # store the image is rendered as a safe placeholder (no raw
-            # base64 in context). ``huge`` returns 5000 chars but its
-            # ToolConfig caps output at 100 bytes → truncated.
+            # Images use session artifacts; huge text is capped at 100 bytes.
             out7 = await _drain_chat(creature, "snapshot and blob now")
             assert "processed media" in out7
             convo7 = " ".join(
@@ -841,10 +884,23 @@ class TestCoreIntegration:
             )
             # The multimodal tool's caption reached context as text.
             assert "caption-for-the-snapshot" in convo7
-            # The raw base64 image data was NOT carried into context —
-            # only a safe data-URL placeholder.
             assert "aGVsbG8td29ybGQ=" not in convo7
-            assert "elided" in convo7
+            snap_status = next(
+                status
+                for status in agent.executor.job_store.get_completed_jobs()
+                if status.type_name == "snap"
+            )
+            image = next(
+                part
+                for part in agent.executor.job_store.get_result(
+                    snap_status.job_id
+                ).output
+                if isinstance(part, ImagePart)
+            )
+            artifact = (
+                agent.session_store.artifacts_dir / image.url.split("/artifacts/", 1)[1]
+            )
+            assert artifact.read_bytes() == b"hello-world"
             # The huge tool's output was byte-capped — the truncation
             # note landed and the full 5000-char blob did not.
             assert "truncated to 100 bytes" in convo7
@@ -991,6 +1047,82 @@ class TestCoreIntegration:
                     assert agent.controller.conversation.to_json() == before_duplicate
                     assert canvas_llm.call_count == 2
 
+            composition_release = asyncio.Event()
+
+            class CompositionWork(BaseTool):
+                tool_name = "composeheld"
+                description = "Held composition task"
+                execution_mode = ExecutionMode.DIRECT
+
+                async def _execute(self, args, **kwargs):
+                    await composition_release.wait()
+                    return ToolResult(output="composition late result")
+
+            class CompositionQuick(BaseTool):
+                tool_name = "composequick"
+                description = "Immediate composition task"
+                execution_mode = ExecutionMode.DIRECT
+
+                async def _execute(self, args, **kwargs):
+                    return ToolResult(output="composition direct result")
+
+            agent.add_tool(CompositionWork())
+            agent.add_tool(CompositionQuick())
+            notice = OutputRecorder()
+            agent.output_router.named_outputs["notice"] = notice
+            agent.controller.config.known_outputs.add("notice")
+            agent.llm = agent.controller.llm = ScriptedLLM(
+                [
+                    "[/output_notice]composition notice[output_notice/][/composeheld]@@run_in_background=true\n{}[composeheld/][/composequick]{}[composequick/]",
+                    "composition received",
+                ]
+            )
+            try:
+                assert "composition received" in await _drain_chat(
+                    creature, "dispatch composition"
+                )
+                composed = next(
+                    message
+                    for message in agent.controller.conversation.get_messages()
+                    if message.role == "user"
+                    and "composition direct result" in str(message.content)
+                )
+                assert notice.writes == ["composition notice"]
+                assert "Outputs Sent" in composed.content
+                assert composed.metadata.get("feedback_admission_origin")
+                assert "background" in composed.content.lower()
+                composed_coverage = await agent.session_store.run(
+                    compile_coverage,
+                    agent.session_store,
+                    agent.config.name,
+                    [{**composed.to_dict(), "metadata": deepcopy(composed.metadata)}],
+                    [],
+                )
+                assert composed_coverage["coverage_mode"] == "exact"
+                raw = await agent.session_store.run(
+                    agent.session_store.get_events, agent.config.name
+                )
+                output_rows = [row for row in raw if row["type"] == "output_delivery"]
+                assert (
+                    len(output_rows) == 1
+                    and output_rows[0]["content"] == "composition notice"
+                )
+                assert (
+                    list(coordinate(output_rows[0]))
+                    in composed_coverage["replaced_event_origins"]
+                )
+                assert not any(
+                    row["type"] == "tool_result" and row.get("name") == "composeheld"
+                    for row in raw
+                )
+                agent.pause()
+                composition_release.set()
+                await agent.executor.wait_all(timeout=3)
+                await agent.output_router.flush()
+            finally:
+                composition_release.set()
+                agent.resume()
+
             stop_entered = asyncio.Event()
 
             class StopBackground(BaseTool):
@@ -1026,7 +1158,29 @@ class TestCoreIntegration:
 
         # Engine __aexit__ stopped the creature.
         assert creature.is_running is False
+        with SessionReader(feedback_session_path) as reader:
+            restored = replay_resume_history(list(reader.events("solo")))
+            assert (
+                sum(
+                    message.get("role") == "user"
+                    and "background-finished" in str(message.get("content"))
+                    for message in restored
+                )
+                == 1
+            )
         with SessionReader(session_path) as reader:
+            recovered = replay_resume_history(list(reader.events("solo")))
+            assert (
+                sum(message.get("content") == composed.content for message in recovered)
+                == 1
+            )
+            assert (
+                sum(
+                    "composition late result" in str(message.get("content"))
+                    for message in recovered
+                )
+                == 1
+            )
             canvas_results = [
                 event
                 for event in reader.events("solo")
@@ -1357,6 +1511,40 @@ class TestCoreIntegration:
                 if message.tool_call_id == "ack-native"
             ]
             assert len(ack) == 1 and "background" in ack[0].content.lower()
+            store = agent.session_store
+            detached_ack = {**ack[0].to_dict(), "metadata": deepcopy(ack[0].metadata)}
+            ack_coverage = await store.run(
+                compile_coverage, store, agent.config.name, [detached_ack], []
+            )
+            assert ack_coverage["coverage_mode"] == "exact"
+            assert (
+                ack[0].metadata["tool_delivery"]["ack_origin"]
+                in ack_coverage["replaced_event_origins"]
+            )
+            session_path = store.path
+        reopened = SessionStore(session_path)
+        try:
+            raw = await reopened.run(reopened.get_events, agent.config.name)
+            calls = {
+                row["job_id"]: row.get("name")
+                for row in raw
+                if row["type"] == "subagent_call"
+            }
+            for row in raw:
+                if row["type"] == "subagent_result":
+                    assert row.get("name") == calls[row["job_id"]], row
+            cold = replay_resume_history(raw)
+            restored_ack = [
+                message
+                for message in cold
+                if message.get("role") == "tool"
+                and message.get("tool_call_id") == "ack-native"
+            ]
+            assert len(restored_ack) == 1
+            assert restored_ack[0]["content"] == ack[0].content
+            assert restored_ack[0]["metadata"]["tool_delivery"]["phase"] == "ack"
+        finally:
+            await asyncio.to_thread(reopened.close, update_status=False)
 
     async def test_compaction_and_termination(
         self, make_creature, tmp_path, monkeypatch
@@ -1510,6 +1698,51 @@ class TestCoreIntegration:
                 == 1
             )
             assert await store.run(lambda: store.state["compacted:compact_count"]) == 1
+            events = await store.run(store.get_events, "compacted")
+            first_compact = [
+                event for event in events if event["type"] == "compact_complete"
+            ][-1]
+            assert first_compact["coverage_mode"] == "exact"
+            first_coverage = set(map(tuple, first_compact["replaced_event_origins"]))
+            assert {
+                event["turn_index"]
+                for event in events
+                if coordinate(event) in first_coverage
+            } == {1, 2}
+            manager._llm = ScriptedLLM(["nested durable compact summary"])
+            assert manager.trigger_compact()
+            await asyncio.wait_for(manager.wait_for_current(), 5)
+            assert manager._compact_count == 2
+            relocation = SessionStore(tmp_path / "compact-relocation.kohakutr")
+            try:
+                await relocation.run(
+                    relocation.append_event, "other", "probe", {"event_id": 1000}
+                )
+                await asyncio.to_thread(copy_events_into, store, relocation)
+                await asyncio.to_thread(copy_events_into, store, relocation)
+            finally:
+                relocation.close(update_status=False)
+            relocation = SessionStore(tmp_path / "compact-relocation.kohakutr")
+            try:
+                page = await relocation.run(
+                    history_page,
+                    relocation,
+                    "compacted",
+                    session_id="copied",
+                    limit=400,
+                )
+                replayed = replay_selected_events(page["events"], include_metadata=True)
+                assert [
+                    (message["role"], message["content"])
+                    for message in replayed
+                    if message["role"] != "system"
+                ] == [
+                    ("assistant", "nested durable compact summary"),
+                    ("user", "fourth"),
+                    ("assistant", "fourth answer"),
+                ]
+            finally:
+                relocation.close(update_status=False)
             outcome = await saved_agent.run_event(
                 create_tool_complete_event(
                     job_id="legacy_job", content="late tool result"
@@ -2164,9 +2397,17 @@ class TestCoreIntegration:
                 expected_id = (
                     "call_history_1" if llm.native else recorded_call["call_id"]
                 )
+                live_identity = [
+                    message.metadata
+                    for message in agent.controller.conversation.get_messages()
+                    if message.role == "user" and message.metadata.get("event_id")
+                ][-1]
                 selector = UserMessageSelector(
-                    target["event_id"], target["turn_index"], target["branch_id"]
+                    live_identity["event_id"],
+                    live_identity["turn_index"],
+                    live_identity["branch_id"],
                 )
+                assert selector.event_id == target["event_id"]
                 result = await service.edit_message(
                     creature.creature_id, 0, "edited", target=selector
                 )
@@ -2176,19 +2417,56 @@ class TestCoreIntegration:
                     for message in llm.last_messages
                     for call in message.get("tool_calls") or []
                 ]
-                assert [(call["id"], call["function"]["name"]) for call in calls] == [
-                    (expected_id, "scratchpad")
-                ]
-                assert any(
-                    m.get("tool_call_id") == expected_id for m in llm.last_messages
+                assert [(call["id"], call["function"]["name"]) for call in calls] == (
+                    [(expected_id, "scratchpad")] if llm.native else []
                 )
+                if llm.native:
+                    assert any(
+                        m.get("tool_call_id") == expected_id for m in llm.last_messages
+                    )
+                else:
+                    admissions = [
+                        row
+                        for row in agent.session_store.get_events(agent.config.name)
+                        if row["type"] == "tool_feedback_admitted"
+                    ]
+                    assert len(admissions) == 1
+                    feedback_text = admissions[0]["content"]
+                    assert (
+                        sum(
+                            m.get("role") == "user"
+                            and m.get("content") == feedback_text
+                            for m in llm.last_messages
+                        )
+                        == 1
+                    )
                 assert (await creature.run("followup", timeout=5)).text == "OK"
+                followup_identity = dict(
+                    [
+                        message.metadata
+                        for message in agent.controller.conversation.get_messages()
+                        if message.role == "user" and message.metadata.get("event_id")
+                    ][-1]
+                )
+                saved = await agent.session_store.run(
+                    agent.session_store.load_conversation, agent.config.name
+                )
+                assert [
+                    message["metadata"]
+                    for message in saved
+                    if message["role"] == "user"
+                ][-1] == followup_identity
                 session_path = agent.session_store.path
             resumed = await Terrarium.resume(
                 str(session_path), llm=ScriptedLLM(["resumed OK"])
             )
             async with resumed:
                 restored = resumed.list_creatures()[0]
+                assert [
+                    message.metadata
+                    for message in restored.agent.controller.conversation.get_messages()
+                    if message.role == "user"
+                ][-1] == followup_identity
                 assert (
                     await restored.run("after resume", timeout=5)
                 ).text == "resumed OK"
@@ -2198,12 +2476,21 @@ class TestCoreIntegration:
                     for message in messages
                     for call in message.get("tool_calls") or []
                 ]
-                assert [(call["id"], call["function"]["name"]) for call in calls] == [
-                    (expected_id, "scratchpad")
-                ]
+                assert [(call["id"], call["function"]["name"]) for call in calls] == (
+                    [(expected_id, "scratchpad")] if llm.native else []
+                )
+                if not llm.native:
+                    assert (
+                        sum(
+                            m.get("role") == "user"
+                            and m.get("content") == feedback_text
+                            for m in messages
+                        )
+                        == 1
+                    )
 
     async def test_inject_event_and_unified_trigger_model(
-        self, make_creature, monkeypatch
+        self, make_creature, monkeypatch, tmp_path
     ):
         """The unified ``TriggerEvent`` model: a non-user-input event
         (a synthetic ``tool_complete``) injected straight into the
@@ -2553,6 +2840,158 @@ class TestCoreIntegration:
                 sum(
                     message["content"] == "midturn user"
                     for message in folded_llm.call_log[1]
+                )
+                == 1
+            )
+
+            tool_release, generating, provider_release, queued = [
+                asyncio.Event() for _ in range(4)
+            ]
+
+            class MixedWork(BaseTool):
+                tool_name = "mixedwork"
+                description = "Held mixed-input work"
+                execution_mode = ExecutionMode.DIRECT
+
+                async def _execute(self, args, **kwargs):
+                    await tool_release.wait()
+                    return ToolResult(output="mixed durable result")
+
+            class MixedParent(ScriptedLLM):
+                async def chat(self, messages, **kwargs):
+                    if self.call_count == 1:
+                        generating.set()
+                        await provider_release.wait()
+                    async for chunk in super().chat(messages, **kwargs):
+                        yield chunk
+
+            mixed_path = tmp_path / "mixed-inputs.kohakutr"
+            mixed = await engine.add_creature(
+                AgentConfig(name="mixed", tool_format="bracket"),
+                llm=MixedParent(
+                    [
+                        "[/mixedwork]@@run_in_background=true\n{}[mixedwork/]",
+                        "working",
+                        "all received",
+                    ]
+                ),
+                tools=[MixedWork()],
+                session=mixed_path,
+                io="headless",
+                start=True,
+            )
+            mixed_agent = mixed.agent
+            await mixed.run("start background")
+            put = mixed_agent._event_inbox.put
+
+            def observe_put(envelope):
+                result = put(envelope)
+                if envelope.event.type == "tool_complete":
+                    queued.set()
+                return result
+
+            monkeypatch.setattr(mixed_agent._event_inbox, "put", observe_put)
+            turn = asyncio.create_task(mixed.run("independent work"))
+            try:
+                await asyncio.wait_for(generating.wait(), 3)
+                assert await mixed_agent.inject_input("human constituent") is False
+                assert (
+                    await mixed_agent.inject_event(
+                        TriggerEvent(type="trigger", content="trigger constituent")
+                    )
+                    is False
+                )
+                tool_release.set()
+                await asyncio.wait_for(queued.wait(), 4)
+                provider_release.set()
+                assert (await asyncio.wait_for(turn, 5)).ok
+                group = next(
+                    message
+                    for message in mixed_agent.controller.conversation.get_messages()
+                    if message.metadata.get("kind") == "input_group"
+                )
+                assert all(
+                    text in group.get_text_content()
+                    for text in (
+                        "human constituent",
+                        "trigger constituent",
+                        "mixed durable result",
+                    )
+                )
+                assert not any(
+                    key in group.metadata for key in ("event_id", "user_pair_id")
+                )
+                store = mixed_agent.session_store
+                coverage = await store.run(
+                    compile_coverage,
+                    store,
+                    "mixed",
+                    [{**group.to_dict(), "metadata": deepcopy(group.metadata)}],
+                    [],
+                )
+                assert coverage["coverage_mode"] == "exact"
+                rows = await store.run(store.get_events, "mixed")
+                assert [
+                    row["content"]
+                    for row in rows
+                    if row["type"] == "user_input_injected"
+                ] == ["human constituent", "trigger constituent"]
+            finally:
+                tool_release.set()
+                provider_release.set()
+                await asyncio.gather(turn, return_exceptions=True)
+            batch_done = asyncio.Event()
+
+            class BatchParent(ScriptedLLM):
+                async def chat(self, messages, **kwargs):
+                    async for chunk in super().chat(messages, **kwargs):
+                        yield chunk
+                    batch_done.set()
+
+            mixed_agent.llm = mixed_agent.controller.llm = BatchParent(
+                ["batch received"]
+            )
+            mixed_agent.pause()
+            for _ in range(2):
+                assert await mixed_agent.inject_input("identical batch input") is False
+            mixed_agent.resume()
+            await asyncio.wait_for(batch_done.wait(), 4)
+            async with mixed_agent._processing_lock:
+                batch_group = next(
+                    message
+                    for message in mixed_agent.controller.conversation.get_messages()
+                    if "identical batch input" in message.get_text_content()
+                )
+                assert batch_group.metadata["kind"] == "input_group"
+                assert "event_id" not in batch_group.metadata
+                batch_coverage = await store.run(
+                    compile_coverage,
+                    store,
+                    "mixed",
+                    [
+                        {
+                            **batch_group.to_dict(),
+                            "metadata": deepcopy(batch_group.metadata),
+                        }
+                    ],
+                    [],
+                )
+                assert batch_coverage["coverage_mode"] == "exact"
+        with SessionReader(mixed_path) as reader:
+            restored = replay_resume_history(list(reader.events("mixed")))
+            groups = [
+                message
+                for message in restored
+                if message.get("metadata", {}).get("kind") == "input_group"
+            ]
+            assert len(groups) == 2 and groups[0]["content"] == group.content
+            assert (
+                groups[1]["content"] == "identical batch input\n\nidentical batch input"
+            )
+            assert (
+                sum(
+                    "human constituent" in str(message.get("content"))
+                    for message in restored
                 )
                 == 1
             )

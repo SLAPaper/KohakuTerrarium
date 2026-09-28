@@ -98,8 +98,18 @@ def replay_resume_history(events, branch_view=None):
     if not any(
         event.get("type") in ("subagent_call", "subagent_result") for event in selected
     ):
+        ToolIdentityResolver(selected)
+        compacts = [
+            event
+            for event in selected
+            if event.get("type") in ("compact_replace", "compact_complete")
+        ]
+        view = resolve_selected_branches(
+            selected, index_parent_paths(selected), branch_view
+        )
+        visible = compact_replay_events(selected, compacts, view)
         return replay_conversation(
-            normalize_resumable_events(events),
+            normalize_resumable_events(visible),
             branch_view=branch_view,
             include_metadata=True,
         )
@@ -122,11 +132,10 @@ def replay_resume_history(events, branch_view=None):
         for event in selected
         if event.get("type") in ("compact_replace", "compact_complete")
     ]
-    if compacts:
-        view = resolve_selected_branches(
-            selected, index_parent_paths(selected), branch_view
-        )
-        projected = compact_replay_events(projected, compacts, view)
+    view = resolve_selected_branches(
+        selected, index_parent_paths(selected), branch_view
+    )
+    projected = compact_replay_events(projected, compacts, view)
     projected = _interrupt_proven_children(selected, projected, text_results)
     normalized = canonicalize_provider_tool_order(
         normalize_resumable_events(projected, live_job_ids=child_ids)

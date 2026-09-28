@@ -1424,6 +1424,104 @@ describe("chat store — interrupted task handling", () => {
     expect(assistant2.parts[0].id).toBe("txt_e9")
   })
 
+  it.each(["compact_complete", "compact_replace"])(
+    "replays exact %s at its canonical anchor without swallowing holes",
+    (type) => {
+      const origin = (id) => ["11111111-1111-4111-8111-111111111111", "alice", id]
+      const events = [
+        { type: "user_message", event_id: 80, content: "covered", _kt_event_origin_v1: origin(1) },
+        { type: "user_message", event_id: 10, content: "hole", _kt_event_origin_v1: origin(2) },
+        {
+          type: "text_chunk",
+          event_id: 30,
+          content: "covered reply",
+          _kt_event_origin_v1: origin(3),
+        },
+        {
+          type,
+          event_id: 2,
+          round: 1,
+          summary: "exact summary",
+          compact_coverage_version: 1,
+          coverage_mode: "exact",
+          replaced_event_origins: [origin(1), origin(3)],
+          summary_anchor_origin: origin(1),
+          replaced_from_event_id: 1,
+          replaced_to_event_id: 100,
+        },
+      ]
+      const { messages } = _replayEvents([], events)
+      expect(messages.map((m) => m.role)).toEqual(["compact", "user"])
+      expect(messages[1].content).toBe("hole")
+    },
+  )
+
+  it.each(["legacy", "exact"])(
+    "anchors %s summary on a visible member instead of a dead sibling",
+    (mode) => {
+      const origin = (id) => ["11111111-1111-4111-8111-111111111111", "alice", id]
+      const compact = {
+        type: "compact_replace",
+        event_id: 9,
+        round: 1,
+        summary: "summary",
+        replaced_from_event_id: 1,
+        replaced_to_event_id: 4,
+      }
+      if (mode === "exact")
+        Object.assign(compact, {
+          compact_coverage_version: 1,
+          coverage_mode: "exact",
+          replaced_event_origins: [origin(1), origin(2)],
+          summary_anchor_origin: origin(1),
+        })
+      const { messages } = _replayEvents(
+        [],
+        [
+          {
+            type: "user_message",
+            event_id: 1,
+            turn_index: 1,
+            branch_id: 1,
+            content: "dead",
+            _kt_event_origin_v1: origin(1),
+          },
+          {
+            type: "user_message",
+            event_id: 4,
+            turn_index: 1,
+            branch_id: 2,
+            content: "covered",
+            _kt_event_origin_v1: origin(2),
+          },
+          compact,
+        ],
+        "",
+        { 1: 2 },
+      )
+      expect(messages.map((m) => m.role)).toEqual(["compact"])
+    },
+  )
+
+  it("retains raw destination history for an imported legacy compact interval", () => {
+    const events = [
+      { type: "user_message", event_id: 1, content: "must stay" },
+      {
+        type: "compact_replace",
+        event_id: 9,
+        replaced_from_event_id: 1,
+        replaced_to_event_id: 4,
+        summary: "old summary",
+        _kt_event_origin_v1: ["11111111-1111-4111-8111-111111111111", "alice", 99],
+      },
+    ]
+    expect(
+      _replayEvents([], events)
+        .messages.filter((m) => m.role === "user")
+        .map((m) => m.content),
+    ).toEqual(["must stay"])
+  })
+
   it("keeps later message ids stable when an earlier range is hidden by compact_replace", () => {
     const baseEvents = [
       { type: "user_input", event_id: 1, content: "q1" },

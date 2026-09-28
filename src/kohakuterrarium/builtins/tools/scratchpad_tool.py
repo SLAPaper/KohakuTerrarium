@@ -3,6 +3,7 @@
 from typing import Any
 
 from kohakuterrarium.builtins.tools.registry import register_builtin
+from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.scratchpad import is_reserved_scratchpad_key
 from kohakuterrarium.core.session import get_scratchpad
 from kohakuterrarium.modules.tool.base import (
@@ -35,6 +36,14 @@ class ScratchpadTool(BaseTool):
         self, args: dict[str, Any], context: ToolContext | None = None
     ) -> ToolResult:
         """Apply one scratchpad operation to the current session."""
+        host = getattr(context, "agent", None)
+        if host is not None and getattr(host, "_session_state_owner", None) is not None:
+            return await submit_internal_session_state(
+                host, lambda: self._apply(args, context)
+            )
+        return self._apply(args, context)
+
+    def _apply(self, args, context):
         action = args.get("action", "get")
         key = args.get("key", "")
         value = args.get("value", "")

@@ -11,6 +11,12 @@ from typing import Any
 
 from kohakuterrarium.core.agent_state import submit_internal_session_state
 
+from kohakuterrarium.session.output_handoff import output_binding
+from kohakuterrarium.session.snapshot_coverage import (
+    capture_snapshot_boundary,
+    require_snapshot_boundary,
+    save_bound_snapshot,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -86,7 +92,8 @@ def persist_compacted(
     stored for resume continuity.
     """
     try:
-        store.save_conversation(
+        save_bound_snapshot(
+            store,
             agent_name,
             conversation.snapshot_messages(preserve_pending_tail=True),
         )
@@ -144,11 +151,29 @@ async def persist_compacted_async(
 async def _capture_and_persist_compacted(
     store, agent_name, agent, conversation, compact_count, last_compact_time
 ):
+    async with output_binding(getattr(agent, "_session_output", None)):
+        if getattr(agent, "session_store", store) is not store:
+            raise ValueError(
+                "Compact session store was replaced before snapshot admission"
+            )
+        await _persist_captured_compact(
+            store, agent_name, agent, conversation, compact_count, last_compact_time
+        )
+
+
+async def _persist_captured_compact(
+    store, agent_name, agent, conversation, compact_count, last_compact_time
+):
+    run = getattr(store, "run", None)
+    envelope = (
+        await run(capture_snapshot_boundary, store, agent_name)
+        if callable(run)
+        else None
+    )
     snapshot = await submit_internal_session_state(
         agent, lambda: _capture_compacted(agent, conversation, store)
     )
-    args = (store, agent_name, *snapshot, compact_count, last_compact_time)
-    run = getattr(store, "run", None)
+    args = (store, agent_name, *snapshot, compact_count, last_compact_time, envelope)
     if callable(run):
         await run(_persist_compacted_snapshot, *args)
     else:
@@ -177,12 +202,19 @@ def _capture_compacted(agent, conversation, store):
 
 
 def _persist_compacted_snapshot(
-    store, agent_name, snapshot, update_tag, compact_count, last_compact_time
+    store,
+    agent_name,
+    snapshot,
+    update_tag,
+    compact_count,
+    last_compact_time,
+    envelope=None,
 ):
     """Write a detached compact snapshot and its captured branch selection."""
     messages, tag = snapshot
+    require_snapshot_boundary(store, agent_name, envelope)
     try:
-        store.save_conversation(agent_name, messages)
+        save_bound_snapshot(store, agent_name, messages, envelope)
     except Exception as exc:
         logger.warning(
             "Failed to save compacted conversation", error=str(exc), exc_info=True
@@ -196,6 +228,13 @@ def _persist_compacted_snapshot(
         except Exception:
             logger.warning("Failed to save compact snapshot branch", exc_info=True)
     persist_compact_state(store, agent_name, compact_count, last_compact_time)
+
+
+def persist_compact_counters(store, agent_name, compact_count, last_compact_time):
+    """Persist summary counters without claiming a newer conversation snapshot."""
+    store.save_state(agent_name, compact_count=compact_count)
+    store.state[f"{agent_name}:last_compact_time"] = last_compact_time
+    store.flush()
 
 
 def persist_compact_state(

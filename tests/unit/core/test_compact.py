@@ -2,7 +2,19 @@
 
 import asyncio
 import types
+from copy import deepcopy
 from typing import Any
+
+import pytest
+
+from kohakuterrarium import Terrarium
+from kohakuterrarium.errors import HistoryCompatibilityError
+from kohakuterrarium.core.config_types import AgentConfig
+from kohakuterrarium.session.compact_compile import compile_coverage
+from kohakuterrarium.session.history_replay import replay_selected_events
+from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.terrarium.session_coord import copy_events_into
+from kohakuterrarium.testing.llm import ScriptedLLM
 
 
 from kohakuterrarium.core.compact_branch import (
@@ -24,7 +36,10 @@ from kohakuterrarium.core.compact_splice import (
 )
 from kohakuterrarium.core.compact_text import format_messages_for_summary
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.llm.message import create_message
+from kohakuterrarium.modules.plugin.base import BasePlugin, PluginBlockError
+from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
 
 # ── stubs ────────────────────────────────────────────────────────
 
@@ -1304,6 +1319,292 @@ class TestTagSnapshotBranch:
 
 
 class TestCompactCompleteReplacedRange:
+    async def test_text_tool_feedback_has_exact_persisted_admission(self, tmp_path):
+        class Work(BaseTool):
+            tool_name = "work"
+            description = "Work"
+            execution_mode = ExecutionMode.DIRECT
+
+            async def _execute(self, args, **kwargs):
+                return ToolResult(output="text tool result")
+
+        async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+            creature = await engine.add_creature(
+                AgentConfig(name="alice", tool_format="bracket"),
+                llm=ScriptedLLM(
+                    [
+                        '[/work]{"x":1}[work/]',
+                        "answer one",
+                        "answer two",
+                        "answer three",
+                    ]
+                ),
+                tools=[Work()],
+                io="headless",
+                start=True,
+            )
+            agent = creature.agent
+            for question in ("q1", "q2", "q3"):
+                assert (await creature.run(question)).ok
+            raw = await agent.session_store.run(agent.session_store.get_events, "alice")
+            restored = replay_selected_events(raw, include_metadata=True)
+            feedback = [
+                m
+                for m in restored
+                if m.get("metadata", {}).get("kind") == "tool_results"
+            ]
+            assert len(feedback) == 1 and "text tool result" in feedback[0]["content"]
+            assert not any(m["role"] == "tool" or m.get("tool_calls") for m in restored)
+            conflicting = deepcopy(feedback)
+            conflicting[0]["metadata"]["turn_index"] = 999
+            with pytest.raises(HistoryCompatibilityError, match="feedback"):
+                await agent.session_store.run(
+                    compile_coverage, agent.session_store, "alice", conflicting, []
+                )
+            manager = agent.compact_manager
+            manager.config.keep_recent_turns = 1
+            manager._llm = ScriptedLLM(["text feedback summary"])
+            await manager._run_compact()
+            rows = await agent.session_store.run(
+                agent.session_store.get_events, "alice"
+            )
+            compact = [row for row in rows if row["type"] == "compact_complete"][-1]
+            assert compact["coverage_mode"] == "exact", compact.get("coverage_reason")
+            assert [
+                (m["role"], m["content"])
+                for m in replay_selected_events(rows)
+                if m["role"] != "system"
+            ] == [
+                ("assistant", "text feedback summary"),
+                ("user", "q3"),
+                ("assistant", "answer three"),
+            ]
+
+    @pytest.mark.parametrize("veto", [False, True])
+    async def test_native_declaration_and_result_have_exact_compact_coverage(
+        self, tmp_path, veto
+    ):
+        executed = []
+
+        class Work(BaseTool):
+            tool_name = "work"
+            description = "Work"
+            execution_mode = ExecutionMode.DIRECT
+
+            async def _execute(self, args, **kwargs):
+                executed.append(args)
+                return ToolResult(output="tool output")
+
+        class Guard(BasePlugin):
+            name = "guard"
+
+            async def pre_tool_dispatch(self, event, ctx):
+                if veto:
+                    raise PluginBlockError("denied")
+                return event
+
+        class Provider(ScriptedLLM):
+            def __init__(self):
+                super().__init__(
+                    ["unused", "first answer", "second answer", "third answer"]
+                )
+                self.last_tool_calls = []
+
+            async def chat(self, messages, **kwargs):
+                self.last_tool_calls = []
+                if self.call_count == 0:
+                    self.call_count += 1
+                    self.call_log.append(self._normalize_messages(messages))
+                    self.last_tool_calls = [
+                        NativeToolCall("native-original", "work", '{"x":1}')
+                    ]
+                    yield ""
+                else:
+                    async for chunk in super().chat(messages, **kwargs):
+                        yield chunk
+
+        async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+            creature = await engine.add_creature(
+                AgentConfig(name="alice", tool_format="native"),
+                llm=Provider(),
+                tools=[Work()],
+                plugins=[Guard()],
+                io="headless",
+                start=True,
+            )
+            agent = creature.agent
+            for question in ("one", "two", "three"):
+                assert (await creature.run(question)).ok
+                if veto and agent.controller.has_pending_events():
+                    await agent._run_controller_loop(agent.controller, [])
+                    await agent.output_router.flush()
+            rows = await agent.session_store.run(
+                agent.session_store.get_events, "alice"
+            )
+            declarations = [
+                row for row in rows if row["type"] == "assistant_tool_calls"
+            ]
+            assert len(declarations) == 1
+            assert (
+                declarations[0]["tool_calls"][0]["function"]["arguments"] == '{"x":1}'
+            )
+            assert bool(executed) is not veto
+            restored = replay_selected_events(rows, include_metadata=True)
+            restored_users = [
+                i for i, message in enumerate(restored) if message["role"] == "user"
+            ]
+            restored_coverage = await agent.session_store.run(
+                compile_coverage,
+                agent.session_store,
+                "alice",
+                restored[: restored_users[-1]],
+                restored[restored_users[-1] :],
+            )
+            assert restored_coverage["coverage_mode"] == "exact", restored_coverage.get(
+                "coverage_reason"
+            )
+            conflicting = deepcopy(restored)
+            tool = next(message for message in conflicting if message["role"] == "tool")
+            tool["metadata"]["tool_delivery"]["declaration_origin"] = next(
+                message for message in conflicting if message["role"] == "user"
+            )["metadata"]["event_origin"]
+            with pytest.raises(HistoryCompatibilityError, match="declaration"):
+                await agent.session_store.run(
+                    compile_coverage,
+                    agent.session_store,
+                    "alice",
+                    conflicting[: restored_users[-1]],
+                    conflicting[restored_users[-1] :],
+                )
+            manager = agent.compact_manager
+            manager.config.keep_recent_turns = 1
+            manager._llm = ScriptedLLM(["native summary"])
+            await manager._run_compact()
+            rows = await agent.session_store.run(
+                agent.session_store.get_events, "alice"
+            )
+            compact = [row for row in rows if row["type"] == "compact_complete"][-1]
+            assert compact["coverage_mode"] == "exact", compact.get("coverage_reason")
+            replay = replay_selected_events(rows, include_metadata=True)
+            assert [m["content"] for m in replay if m["role"] == "user"] == ["three"]
+            assert not any(m["role"] == "tool" or m.get("tool_calls") for m in replay)
+
+    async def test_actual_coverage_survives_displaced_ids_and_cold_raw_replay(
+        self, tmp_path
+    ):
+        async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+            creature = await engine.add_creature(
+                AgentConfig(name="alice"),
+                llm=ScriptedLLM(["answer one", "answer two", "answer three"]),
+                io="headless",
+                start=True,
+            )
+            agent = creature.agent
+            for text in ("question one", "question two", "question three"):
+                assert (await creature.run(text)).ok
+            manager = agent.compact_manager
+            manager.config.keep_recent_turns = 1
+            manager._llm = ScriptedLLM(["summary of first two turns"])
+            await manager._run_compact()
+            assert manager._compact_count == 1
+            source = agent.session_store
+            rows = await source.run(source.get_events, "alice")
+            compact = [e for e in rows if e["type"] == "compact_complete"][-1]
+            assert compact.get("coverage_mode") == "exact"
+            assert compact["replaced_event_origins"]
+            assert compact.get("replaced_from_event_id") is None
+            assert compact.get("replaced_to_event_id") is None
+            destination = SessionStore(tmp_path / "relocated.kohakutr")
+            try:
+                for index in range(40):
+                    await destination.run(
+                        destination.append_event, "other", "probe", {"index": index}
+                    )
+                await asyncio.to_thread(copy_events_into, source, destination)
+                await asyncio.to_thread(copy_events_into, source, destination)
+            finally:
+                destination.close(update_status=False)
+            reopened = SessionStore(tmp_path / "relocated.kohakutr")
+            try:
+                moved = await reopened.run(reopened.get_events, "alice")
+                replay = replay_selected_events(moved, include_metadata=True)
+                assert [m["content"] for m in replay if m["role"] == "user"] == [
+                    "question three"
+                ]
+                assert [m["content"] for m in replay if m["role"] == "assistant"] == [
+                    "summary of first two turns",
+                    "answer three",
+                ]
+                assert [e for e in moved if e["type"] == "compact_complete"][0][
+                    "replaced_event_origins"
+                ] == compact["replaced_event_origins"]
+            finally:
+                reopened.close(update_status=False)
+
+    async def test_nested_exact_summary_preserves_inherited_coverage_across_multiple_hops(
+        self, tmp_path
+    ):
+        async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+            creature = await engine.add_creature(
+                AgentConfig(name="alice"),
+                llm=ScriptedLLM(["a1", "a2", "a3", "a4"]),
+                io="headless",
+                start=True,
+            )
+            agent = creature.agent
+            for question in ("q1", "q2", "q3"):
+                await creature.run(question)
+            manager = agent.compact_manager
+            manager.config.keep_recent_turns = 1
+            manager._llm = ScriptedLLM(["first summary", "nested summary"])
+            await manager._run_compact()
+            source = agent.session_store
+            first = [
+                e
+                for e in await source.run(source.get_events, "alice")
+                if e["type"] == "compact_complete"
+            ][-1]
+            await creature.run("q4")
+            await manager._run_compact()
+            assert manager._compact_count == 2
+            second = [
+                e
+                for e in await source.run(source.get_events, "alice")
+                if e["type"] == "compact_complete"
+            ][-1]
+            assert second["coverage_mode"] == "exact"
+            assert set(map(tuple, first["replaced_event_origins"])) < set(
+                map(tuple, second["replaced_event_origins"])
+            )
+            stores = [SessionStore(tmp_path / f"hop-{i}.kohakutr") for i in range(2)]
+            try:
+                for i, store in enumerate(stores):
+                    for index in range(30 - i * 20):
+                        await store.run(
+                            store.append_event, "other", "probe", {"index": index}
+                        )
+                await asyncio.to_thread(copy_events_into, source, stores[0])
+                await asyncio.to_thread(copy_events_into, stores[0], stores[1])
+                await asyncio.to_thread(copy_events_into, source, stores[1])
+                await asyncio.to_thread(copy_events_into, stores[1], stores[0])
+                rows = await stores[0].run(stores[0].get_events, "alice")
+                messages = replay_selected_events(rows, include_metadata=True)
+                assert [
+                    (m["role"], m["content"]) for m in messages if m["role"] != "system"
+                ] == [
+                    ("assistant", "nested summary"),
+                    ("user", "q4"),
+                    ("assistant", "a4"),
+                ]
+                assert [
+                    e["replaced_event_origins"]
+                    for e in rows
+                    if e["type"] == "compact_complete"
+                ] == [first["replaced_event_origins"], second["replaced_event_origins"]]
+            finally:
+                for store in stores:
+                    store.close(update_status=False)
+
     async def test_replaced_range_uses_turn_window_not_message_count(self):
         """compact_complete carries a replaced range replay can use.
 

@@ -9,12 +9,18 @@ The synchronous hooks keep their signatures for producers that cannot await.
 
 import asyncio
 from concurrent.futures import Future
+from copy import deepcopy
 from typing import Any, Callable
 
 from kohakuterrarium.core.compact_branch import snapshot_branch_view
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.session.history import replay_conversation
+from kohakuterrarium.session.output_handoff import (
+    admit_output,
+    defer_output,
+    drain_deferred_output,
+)
 from kohakuterrarium.session.output_activity import (
     SessionActivityMixin,
     _parse_detail,
@@ -27,6 +33,11 @@ from kohakuterrarium.session.output_generation import (
     stamp_generation,
 )
 from kohakuterrarium.session.output_snapshot import capture_turn_snapshot
+from kohakuterrarium.session.snapshot_coverage import (
+    capture_snapshot_boundary,
+    require_snapshot_boundary,
+    save_bound_snapshot,
+)
 from kohakuterrarium.session.text_buffer import (
     OpenTextSegment,
     last_persisted_turn_branch,
@@ -231,9 +242,11 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         await self.flush()
         self._generation_id = self._generation_coordinates = None
 
+    @admit_output
     async def write(self, text: str) -> None:
         self._ingest_text(text)
 
+    @admit_output
     async def write_stream(self, chunk: str) -> None:
         self._ingest_text(chunk)
 
@@ -301,6 +314,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         return self._append_event("text_chunk", data)
 
     async def flush(self) -> None:
+        await drain_deferred_output(self)
         self._flush_text_segment()
         await self.drain()
 
@@ -314,6 +328,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
             except Exception as exc:
                 logger.warning("Session record failed", error=str(exc), exc_info=True)
 
+    @admit_output
     async def on_processing_start(self, *, request_id: str | None = None) -> None:
         self._flush_text_segment()
         self._generation_id = self._generation_coordinates = None
@@ -322,6 +337,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         payload = {"request_id": request_id} if request_id is not None else {}
         self._record("processing_start", payload)
 
+    @admit_output
     async def on_processing_end(self) -> None:
         # The snapshot below must observe every event queued during the
         # turn, so drain before reading the store.
@@ -333,6 +349,20 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         # the snapshot watermark below cannot run ahead of the log.
         await self.drain()
 
+        persist = getattr(self._store, "run", None)
+        try:
+            envelope = (
+                await persist(
+                    capture_snapshot_boundary, self._store, self._event_key_prefix
+                )
+                if callable(persist)
+                else None
+            )
+        except Exception as exc:
+            logger.warning(
+                "Snapshot boundary capture failed", error=str(exc), exc_info=True
+            )
+            return
         try:
             messages, branch_tag, state_kwargs = await capture_turn_snapshot(
                 self._agent
@@ -344,7 +374,11 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         persist = getattr(self._store, "run", None)
         if callable(persist):
             await persist(
-                self._persist_turn_snapshot, messages, branch_tag, state_kwargs
+                self._persist_turn_snapshot,
+                messages,
+                branch_tag,
+                state_kwargs,
+                envelope,
             )
         else:
             self._persist_turn_snapshot(messages, branch_tag, state_kwargs)
@@ -354,6 +388,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         messages: list | None,
         branch_tag: dict | None,
         state_kwargs: dict,
+        envelope=None,
     ) -> None:
         """Persist the post-turn snapshot, watermark, and state.
 
@@ -364,7 +399,10 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         cost linear in total session length).
         """
         try:
+            if messages is not None:
+                require_snapshot_boundary(self._store, self._event_key_prefix, envelope)
             if messages is None:
+                envelope = None
                 events = self._store.get_events(self._event_key_prefix)
                 messages = replay_conversation(events, include_metadata=True)
             try:
@@ -376,7 +414,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
                     eid = evt.get("event_id")
                     if isinstance(eid, int) and eid > last_event_id:
                         last_event_id = eid
-            self._store.save_conversation(self._event_key_prefix, messages)
+            save_bound_snapshot(self._store, self._event_key_prefix, messages, envelope)
             try:
                 self._store.state[f"{self._event_key_prefix}:snapshot_event_id"] = (
                     last_event_id
@@ -421,6 +459,12 @@ class SessionOutput(SessionActivityMixin, OutputModule):
                 "Events flush at turn end failed", error=str(e), exc_info=True
             )
 
+    @defer_output
+    def record_compact_complete(self, metadata: dict) -> Future:
+        """Return the canonical summary append receipt independent of activity capture."""
+        return self._handle_compact_complete("", "", deepcopy(metadata))
+
+    @defer_output
     def record_terminal_activity(self, activity_type: str, detail: str, metadata: dict):
         """Return the canonical terminal append receipt, not a flush acknowledgement."""
         if activity_type not in (
@@ -438,12 +482,14 @@ class SessionOutput(SessionActivityMixin, OutputModule):
             raise RuntimeError("Terminal persistence did not return a receipt")
         return receipt
 
+    @defer_output
     def on_activity(self, activity_type: str, detail: str) -> None:
         if not self._capture_activity:
             return
         name, info = _parse_detail(detail)
         self._record_activity(activity_type, name, info, {})
 
+    @defer_output
     def on_assistant_image(
         self,
         url: str,
@@ -470,6 +516,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
             payload["revised_prompt"] = revised_prompt
         self._record("assistant_image", payload)
 
+    @defer_output
     def on_activity_with_metadata(
         self, activity_type: str, detail: str, metadata: dict
     ) -> None:
@@ -478,6 +525,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         name, info = _parse_detail(detail)
         self._record_activity(activity_type, name, info, metadata)
 
+    @admit_output
     async def emit(self, event: OutputEvent) -> None:
         """Native event consumer.
 
@@ -537,6 +585,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
                 name, info = _parse_detail(detail)
                 self._record_activity(event.type, name, info, event.payload or {})
 
+    @defer_output
     def on_supersede(self, event_id: str) -> None:
         """Persist the terminal lifecycle marker used by history reconstruction."""
         if self._capture_activity:

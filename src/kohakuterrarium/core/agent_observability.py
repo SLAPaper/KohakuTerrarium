@@ -3,9 +3,12 @@
 Route scratchpad writes and plugin timings through agent observability sinks.
 """
 
+import asyncio
+from copy import deepcopy
 from typing import Any
 
 from kohakuterrarium.core.metrics_hook import metrics
+from kohakuterrarium.session.output_handoff import persist_scratchpad
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -41,6 +44,31 @@ def wire_scratchpad_observer(agent: Any) -> None:
         return
 
     def _observe(key: str, action: str, size_bytes: int) -> None:
+        sink = getattr(agent, "_session_output", None)
+        store = getattr(agent, "session_store", None)
+        if (
+            sink is not None
+            and sink._store is store
+            and callable(getattr(store, "submit", None))
+        ):
+            persist_scratchpad(sink, deepcopy(pad.to_dict()))
+        elif store is not None:
+            logger.debug(
+                "Scratchpad persistence has no matching affinity sink", agent=agent_name
+            )
+        owner = getattr(agent, "_session_state_owner", None)
+        if owner is not None and owner.task is not None:
+            try:
+                if asyncio.current_task() is owner.task:
+                    asyncio.get_running_loop().call_soon(
+                        _notify, key, action, size_bytes
+                    )
+                    return
+            except RuntimeError:
+                pass
+        _notify(key, action, size_bytes)
+
+    def _notify(key, action, size_bytes):
         try:
             router.notify_activity(
                 "scratchpad_write",

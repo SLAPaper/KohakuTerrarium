@@ -59,6 +59,14 @@ class DriveConflictError(DriveError, ConflictError):
         self.actual_revision = actual_revision
 
 
+class DriveHandoffError(DriveConflictError):
+    """A repository binding is moving, retired, or awaiting recovery."""
+
+    def __init__(self, message, *, recovery_required=False):
+        super().__init__(message)
+        self.recovery_required = recovery_required
+
+
 class DriveIdempotencyConflictError(DriveError, ConflictError):
     """An idempotency key was reused with a different normalized operation."""
 

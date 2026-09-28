@@ -23,6 +23,10 @@ from kohakuterrarium.errors import ConflictError, HistoryCompatibilityError
 from kohakuterrarium.llm.generation import provider_source
 from kohakuterrarium.llm.message import Message
 from kohakuterrarium.session.history import select_live_event_ids
+from kohakuterrarium.session.snapshot_coverage import (
+    encode_snapshot,
+    save_bound_snapshot,
+)
 from kohakuterrarium.utils.logging import get_logger
 from kohakuterrarium.session.model_switch_history import validate_switch_history
 
@@ -246,7 +250,7 @@ async def _select_locked(agent: Any, request: _SelectionRequest) -> int:
 
 
 def _prepare_on_worker(request: _SelectionRequest) -> dict[str, Any]:
-    """One raw read and strict prepare. No Agent objects and no writes."""
+    """Prepare detached selected history and its source-bound snapshot prefix."""
     events = [
         copy.deepcopy(event)
         for event in request.store.get_events(request.prefix)
@@ -275,6 +279,11 @@ def _prepare_on_worker(request: _SelectionRequest) -> dict[str, Any]:
         "selected_events": selected_events,
         "full_events": events,
         "watermark": _watermark(request, events),
+        "snapshot_envelope": (
+            encode_snapshot(request.store, request.prefix, [])
+            if hasattr(request.store, "_event_seq")
+            else None
+        ),
         "turn_index": preparation.turn_index,
         "branch_id": preparation.branch_id,
         "parent_path": tuple(preparation.parent_branch_path),
@@ -384,7 +393,9 @@ def _allocate(agent: Any, request: _SelectionRequest, prepared: dict[str, Any]) 
 
 def _persist_on_worker(request: _SelectionRequest, prepared: dict[str, Any]) -> None:
     messages = [_message_dict(message) for message in prepared["messages"]]
-    request.store.save_conversation(request.prefix, messages)
+    save_bound_snapshot(
+        request.store, request.prefix, messages, prepared["snapshot_envelope"]
+    )
     state = request.store.state
     state[f"{request.prefix}:snapshot_event_id"] = prepared["watermark"]
     view = prepared["branch_view"]

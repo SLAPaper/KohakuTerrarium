@@ -153,6 +153,39 @@ def preflight_child_merge(engine, graph_ids):
                 destination.submit(validate_children, destination, payload).result()
 
 
+async def preflight_child_split_async(engine, projected, delta):
+    """Check removal destinations and child-bearing splits before stopping a member."""
+    if delta.kind != "split":
+        return
+    parent = engine._session_stores.get(delta.old_graph_ids[0])
+    if parent is None:
+        return
+    if not callable(getattr(parent, "run", None)):
+        return preflight_child_split(engine, projected, delta)
+    directory = getattr(engine, "_session_dir", None)
+    for graph_id in delta.new_graph_ids:
+        if directory is not None:
+            path = (Path(directory) / f"{graph_id}.kohakutr").resolve()
+            if path.exists() and path != Path(parent.path).resolve():
+                raise ConflictError("Split destination exists outside its source store")
+            continue
+        if graph_id == delta.new_graph_ids[0]:
+            continue
+        for cid in projected.graphs[graph_id].creature_ids:
+            creature = engine._creatures.get(cid)
+            if creature is None:
+                continue
+            manager = getattr(creature.agent, "subagent_manager", None)
+            active = any(
+                not task.done() for task in getattr(manager, "_tasks", {}).values()
+            )
+            payload = await parent.run(
+                capture_children, parent, creature.agent.config.name
+            )
+            if active or payload["rows"] or payload["counters"]:
+                raise ConflictError("Child-bearing split requires a session directory")
+
+
 def preflight_child_split(engine, projected, delta):
     """Reject child-bearing splits without a destination or onto unrelated files."""
     if delta.kind != "split":

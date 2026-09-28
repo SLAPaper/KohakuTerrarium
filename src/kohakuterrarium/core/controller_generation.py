@@ -42,6 +42,7 @@ async def start_generation(controller: Any) -> dict[str, Any]:
     sink = _canonical_output(controller)
     if sink is not None:
         await sink._begin_generation(captured)
+        sink = _canonical_output(controller)
     router = getattr(controller, "output_router", None)
     notify = getattr(router, "_notify_generation_observers", None)
     if callable(notify):

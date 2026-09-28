@@ -1,14 +1,10 @@
-"""Activity-event payload builders for :class:`SessionOutput`.
-
-Each handler translates one routed activity into its durable event payload
-and hands it to :meth:`SessionOutput._record`. Pure dispatch + shaping —
-all persistence goes through the host class's write-behind queue.
-"""
+"""Activity payload builders routed through SessionOutput's write-behind queue."""
 
 import json
 from typing import Any
 
 from kohakuterrarium.core.job_label import canonical_tool_name, make_job_label
+from kohakuterrarium.session.compact_coverage import coverage_metadata
 from kohakuterrarium.session.output_tool_origin import record_tool_activity
 from kohakuterrarium.utils.logging import get_logger
 
@@ -364,12 +360,13 @@ class SessionActivityMixin:
             {"round": metadata.get("round", 0)},
         )
 
-    def _handle_compact_complete(self, name: str, detail: str, metadata: dict) -> None:
-        self._record(
+    def _handle_compact_complete(self, name: str, detail: str, metadata: dict):
+        return self._record(
             "compact_complete",
             {
                 "round": metadata.get("round", 0),
                 "summary": metadata.get("summary", ""),
+                **coverage_metadata(metadata),
                 "messages_compacted": metadata.get("messages_compacted", 0),
                 "replaced_from_event_id": metadata.get("replaced_from_event_id"),
                 "replaced_to_event_id": metadata.get("replaced_to_event_id"),

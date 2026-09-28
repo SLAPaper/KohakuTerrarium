@@ -23,6 +23,7 @@ coordination are all real.
 
 import asyncio
 import json
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +31,7 @@ import pytest
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.channel import ChannelMessage
 from kohakuterrarium.core.config_types import (
     AgentConfig,
@@ -38,6 +40,7 @@ from kohakuterrarium.core.config_types import (
 )
 from kohakuterrarium.modules.plugin.base import PluginContext
 from kohakuterrarium.modules.tool.base import ToolContext
+from kohakuterrarium.session.history_replay import replay_selected_events
 from kohakuterrarium.session.store import SessionStore
 import kohakuterrarium.terrarium.session_coord as _session_coord
 from kohakuterrarium.terrarium.drive.store import (
@@ -60,7 +63,7 @@ from kohakuterrarium.terrarium.drive.registration import (
     GenericDriveRegistration,
 )
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest, DriveQuery
-from kohakuterrarium.testing.llm import ScriptEntry
+from kohakuterrarium.testing.llm import ScriptEntry, ScriptedLLM
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.events import EventFilter, EventKind
 from kohakuterrarium.terrarium.output_log import OutputLogCapture
@@ -1245,6 +1248,26 @@ class TestTerrariumIntegration:
         try:
             await asyncio.wait_for(child_entered.wait(), 5)
             child_source = engine.get_creature("helper").agent.session_store
+            for index in range(2):
+                independent = SessionStore(
+                    tmp_path / f"independent-history-{index}.kohakutr"
+                )
+                try:
+                    await independent.run(
+                        independent.append_event,
+                        "helper",
+                        "user_message",
+                        {
+                            "content": "independent repeated request",
+                            "turn_index": 200,
+                            "branch_id": 1,
+                        },
+                    )
+                    await asyncio.to_thread(
+                        _session_coord.copy_events_into, independent, child_source
+                    )
+                finally:
+                    await asyncio.to_thread(independent.close, update_status=False)
             copied_payload = {
                 "parts": [{"text": "worker-captured history"}],
                 "source": "helper",
@@ -1255,10 +1278,45 @@ class TestTerrariumIntegration:
                 "handoff_probe",
                 {"payload": copied_payload},
             )
+            helper_agent = engine.get_creature("helper").agent
+            await submit_internal_session_state(
+                helper_agent,
+                lambda: helper_agent.session.scratchpad.set("moving-state", "source"),
+            )
+            await child_source.run(
+                child_source.write_artifact, "helper/handoff.bin", b"durable artifact"
+            )
+            await child_source.run(
+                lambda: child_source.state.__setitem__("helper:plugin_selection", "[]")
+            )
             await engine.disconnect("host", "helper", channel="relay")
             moved_store = engine.get_creature("helper").agent.session_store
             assert moved_store is not child_source
+            assert (
+                await moved_store.run(moved_store.load_scratchpad, "helper")
+                == helper_agent.session.scratchpad.to_dict()
+            )
+            assert (
+                await moved_store.run(
+                    lambda: moved_store.state["helper:plugin_selection"]
+                )
+                == "[]"
+            )
+            assert (
+                await moved_store.run(
+                    lambda: (
+                        moved_store.artifacts_dir / "helper/handoff.bin"
+                    ).read_bytes()
+                )
+                == b"durable artifact"
+            )
             moved_events = await moved_store.run(moved_store.get_events, "helper")
+            assert [
+                m["content"]
+                for m in replay_selected_events(moved_events)
+                if m["role"] == "user"
+                and m["content"] == "independent repeated request"
+            ] == ["independent repeated request"] * 2
             assert (
                 next(
                     event["payload"]
@@ -1271,8 +1329,23 @@ class TestTerrariumIntegration:
             assert (
                 await child_manager.wait_for(child_job, timeout=5)
             ).output == "child history survives"
+            await submit_internal_session_state(
+                helper_agent,
+                lambda: helper_agent.session.scratchpad.delete("moving-state"),
+            )
             await engine.connect("host", "helper", channel="rejoin")
             child_store = engine.get_creature("helper").agent.session_store
+            assert "moving-state" not in await child_store.run(
+                child_store.load_scratchpad, "helper"
+            )
+            assert (
+                await child_store.run(
+                    lambda: (
+                        child_store.artifacts_dir / "helper/handoff.bin"
+                    ).read_bytes()
+                )
+                == b"durable artifact"
+            )
             row = await child_store.run(
                 child_store.find_subagent_run, child_job, parent="helper"
             )
@@ -1355,9 +1428,26 @@ class TestTerrariumIntegration:
         assert held_targets[0]._closed
         reopened_child_store = SessionStore(child_path)
         try:
+            assert (
+                await reopened_child_store.run(
+                    lambda: (
+                        reopened_child_store.artifacts_dir / "helper/handoff.bin"
+                    ).read_bytes()
+                )
+                == b"durable artifact"
+            )
+            assert "moving-state" not in await reopened_child_store.run(
+                reopened_child_store.load_scratchpad, "helper"
+            )
             cold_events = await reopened_child_store.run(
                 reopened_child_store.get_events, "helper"
             )
+            assert [
+                m["content"]
+                for m in replay_selected_events(cold_events)
+                if m["role"] == "user"
+                and m["content"] == "independent repeated request"
+            ] == ["independent repeated request"] * 2
             assert [
                 event["payload"]
                 for event in cold_events
@@ -2077,6 +2167,16 @@ class TestTerrariumIntegration:
         splits so each assigned Drive follows its assignee's child graph. WAITING
         Drives with future wake times stay undelivered during row movement."""
         svc = ActorRef("service", "ops")
+        summary_entered, summary_release = asyncio.Event(), asyncio.Event()
+
+        class HeldDriveLLM(ScriptedLLM):
+            async def chat(self, messages, **kwargs):
+                summary_entered.set()
+                await summary_release.wait()
+                async for chunk in super().chat(messages, **kwargs):
+                    yield chunk
+
+        live_llm = HeldDriveLLM(["late-drive-settlement-confirmed"])
 
         def _req(graph_id: str, assignee: str) -> CreateDriveRequest:
             return CreateDriveRequest(
@@ -2098,13 +2198,20 @@ class TestTerrariumIntegration:
             drive_config=DriveRuntimeConfig(enabled=True),
             drive_registrations=default_registrations(),
         )
-        async with engine:
+        async with engine, AsyncExitStack() as cleanup:
+            cleanup.callback(summary_release.set)
             alice = await engine.add_creature(
                 _agent_config("alice", tmp_path), creature_id="alice"
             )
             bob = await engine.add_creature(
-                _agent_config("bob", tmp_path), creature_id="bob"
+                _agent_config("bob", tmp_path), creature_id="bob", llm=live_llm
             )
+            await engine.connect("alice", "bob", channel="empty-bridge")
+            empty = await engine.drives.manager_for(
+                alice.graph_id
+            ).repository.export_rows()
+            assert empty["drives"] == []
+            await engine.disconnect("alice", "bob", channel="empty-bridge")
             # Separate singleton graphs -> two isolated Drive repositories.
             alice_gid0, bob_gid0 = alice.graph_id, bob.graph_id
             assert alice_gid0 != bob_gid0
@@ -2123,6 +2230,27 @@ class TestTerrariumIntegration:
                 initial_status=DriveStatus.WAITING,
             )
 
+            await engine.start("bob")
+            source_manager = engine.drives.manager_for(bob_gid0)
+            live_drive = await source_manager.create_drive(
+                CreateDriveRequest(
+                    kind="generic",
+                    title="late-settlement",
+                    scope_type="creature",
+                    scope_id="bob",
+                    owner=svc,
+                    owner_scope="service",
+                    created_by=svc,
+                ),
+                actor=svc,
+                graph_id=bob_gid0,
+                is_privileged=True,
+            )
+            try:
+                await asyncio.wait_for(summary_entered.wait(), 5)
+            except BaseException:
+                summary_release.set()
+                raise
             for creature in (alice, bob):
                 await creature.agent._session_output.write_stream(
                     f"merge-{creature.name}"
@@ -2165,6 +2293,21 @@ class TestTerrariumIntegration:
             assert await amgr.get_drive(db.drive_id) is None
             assert await bmgr.get_drive(db.drive_id) is not None
             assert await bmgr.get_drive(da.drive_id) is None
+            summary_release.set()
+            await asyncio.wait_for(source_manager.dispatcher.drain(), 5)
+            deliveries = await bmgr.list_deliveries(live_drive.drive_id)
+            assert len(deliveries) == 1 and deliveries[0].state == "acknowledged"
+            assert live_llm.call_count == 1
+            assert await amgr.get_drive(live_drive.drive_id) is None
+            persisted_delivery = (
+                bmgr.repository._path,
+                live_drive.drive_id,
+                deliveries[0].delivery_id,
+            )
+            persisted_repositories = [
+                (amgr.repository._path, da.drive_id, db.drive_id),
+                (bmgr.repository._path, db.drive_id, da.drive_id),
+            ]
 
             for store in set(engine._session_stores.values()):
                 for creature in (alice, bob):
@@ -2175,6 +2318,25 @@ class TestTerrariumIntegration:
                         if e["type"] == "text_chunk"
                         and e["content"].startswith(("merge-", "split-"))
                     ] == [f"merge-{creature.name}", f"split-{creature.name}"]
+
+        path, drive_id, delivery_id = persisted_delivery
+        repository = SqliteDriveRepository(path)
+        try:
+            restored = await repository.list_deliveries(drive_id)
+            assert [(row.delivery_id, row.state) for row in restored] == [
+                (delivery_id, "acknowledged")
+            ]
+        finally:
+            await asyncio.to_thread(repository.close_blocking)
+
+        for path, owned_id, foreign_id in persisted_repositories:
+            repository = SqliteDriveRepository(path)
+            try:
+                owned = await repository.get(owned_id)
+                assert owned.status == DriveStatus.WAITING
+                assert await repository.get(foreign_id) is None
+            finally:
+                await asyncio.to_thread(repository.close_blocking)
 
     @pytest.mark.timeout(120)
     async def test_drive_delivery_waits_for_startup_trigger(

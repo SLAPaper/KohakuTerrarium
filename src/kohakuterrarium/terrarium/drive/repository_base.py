@@ -12,6 +12,7 @@ from typing import Any
 
 import kohakuterrarium.terrarium.drive.wire as drive_wire
 from kohakuterrarium.terrarium.drive.errors import (
+    DriveHandoffError,
     DriveIdempotencyConflictError,
     DriveNotFoundError,
 )
@@ -55,6 +56,9 @@ class BaseDriveRepository(DeliveryOpsMixin):
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         self._lock = asyncio.Lock()
+        self._handoff_token = None
+        self._handoff_owner = None
+        self._handoff_retired = False
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._mint = id_factory or (lambda: uuid.uuid4().hex)
 
@@ -68,9 +72,54 @@ class BaseDriveRepository(DeliveryOpsMixin):
     async def close(self) -> None:
         return None
 
+    async def reserve_handoff(self, token):
+        """Fence new transactions and drain already accepted repository work."""
+        caller = asyncio.current_task()
+        if self._handoff_retired or (
+            self._handoff_token is not None and self._handoff_token is not token
+        ):
+            raise DriveHandoffError(
+                "Drive repository requires handoff recovery", recovery_required=True
+            )
+        if self._handoff_owner not in (None, caller) and not self._handoff_owner.done():
+            raise DriveHandoffError("Drive repository has another handoff coordinator")
+        self._handoff_token, self._handoff_owner = token, caller
+        async with self._lock:
+            pass
+
+    def finish_handoff(self, token, *, retired=False):
+        """Publish a retained binding or permanently retire a displaced binding."""
+        if (
+            self._handoff_token is not token
+            or self._handoff_owner is not asyncio.current_task()
+        ):
+            raise DriveHandoffError("Drive handoff coordinator changed")
+        self._handoff_retired = retired
+        self._handoff_token = token if retired else None
+        self._handoff_owner = None
+
+    def revoke_handoff(self, token):
+        """Revoke coordinator access without lifting an unconfirmed handoff fence."""
+        if (
+            self._handoff_token is token
+            and self._handoff_owner is asyncio.current_task()
+        ):
+            self._handoff_owner = None
+
+    def _require_transaction_admission(self):
+        if self._handoff_retired or (
+            self._handoff_token is not None
+            and self._handoff_owner is not asyncio.current_task()
+        ):
+            raise DriveHandoffError(
+                "Drive repository is moving or retired; resolve its current binding"
+            )
+
     @asynccontextmanager
     async def _txn(self) -> AsyncIterator[DriveTransaction]:
+        self._require_transaction_admission()
         async with self._lock:
+            self._require_transaction_admission()
             txn = self._new_transaction()
             committed = False
             # ``begin`` sits inside the guard so a cancellation that lands while

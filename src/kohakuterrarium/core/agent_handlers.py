@@ -5,6 +5,7 @@ import importlib
 from functools import partial
 
 from kohakuterrarium.errors import AgentNotRunningError
+from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.agent_mid_turn import AgentMidTurnMixin
 from kohakuterrarium.core.agent_output_wiring import AgentOutputWiringMixin
 from kohakuterrarium.core.agent_pre_dispatch import (
@@ -25,12 +26,20 @@ from kohakuterrarium.core.events import (
     TriggerEvent,
     create_tool_complete_event,
 )
+from kohakuterrarium.core.feedback_dispatch import (
+    DispatchAcknowledgement,
+    arm_dispatch_feedback,
+    queue_dispatch_ack,
+)
 from kohakuterrarium.core.pending_input import stamp_pending_id
+from kohakuterrarium.core.output_feedback import route_output_feedback
 from kohakuterrarium.core.tool_origin import tool_completion_context
 from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.modules.tool.base import ExecutionMode
+from kohakuterrarium.modules.subagent.manager import subagent_background_requested
 from kohakuterrarium.parsing import (
     CommandResultEvent,
+    OutputCallEvent,
     SubAgentCallEvent,
     TextEvent,
     ToolCallEvent,
@@ -319,6 +328,8 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                 )
             elif isinstance(parse_event, CommandResultEvent):
                 self._notify_command_result(parse_event)
+            elif isinstance(parse_event, OutputCallEvent):
+                await route_output_feedback(self, controller, parse_event)
             else:
                 if isinstance(parse_event, TextEvent):
                     round_text.append(parse_event.text)
@@ -348,7 +359,9 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             return
 
         tool_call_id = parse_event.args.pop("_tool_call_id", None)
-        run_bg = parse_event.args.pop("run_in_background", False)
+        run_bg = subagent_background_requested(
+            {"run_in_background": parse_event.args.pop("run_in_background", False)}
+        )
 
         job_id, task, is_direct = await self._start_tool_async(
             parse_event, tool_call_id=tool_call_id, run_bg=run_bg
@@ -422,8 +435,8 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                 # Text mode has no role=tool slot — deliver the same
                 # acknowledgment through the feedback round instead of
                 # leaving the model with no dispatch confirmation.
-                self._bg_dispatch_acks.append(
-                    f"[{parse_event.name} → {job_id}] {_BG_PLACEHOLDER}"
+                await queue_dispatch_ack(
+                    self, job_id, f"[{parse_event.name} → {job_id}] {_BG_PLACEHOLDER}"
                 )
         else:
             # Direct — track for gathering (promotable mid-wait)
@@ -521,8 +534,8 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                     f"[{parse_event.name}] {_BG_PLACEHOLDER}",
                 )
             else:
-                self._bg_dispatch_acks.append(
-                    f"[{parse_event.name} → {job_id}] {_BG_PLACEHOLDER}"
+                await queue_dispatch_ack(
+                    self, job_id, f"[{parse_event.name} → {job_id}] {_BG_PLACEHOLDER}"
                 )
         elif handle and handles is not None and handle_order is not None:
             handles[job_id] = handle
@@ -601,6 +614,7 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
         feedback_parts: list[str] = []
 
         # Output feedback (tells model what was sent to named outputs)
+        completed_outputs = list(self.output_router.completed_outputs)
         output_feedback = self.output_router.get_output_feedback()
         if output_feedback:
             feedback_parts.append(output_feedback)
@@ -616,6 +630,7 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
         # Wait for handles (direct tools + sub-agents)
         native_results_added = False
         had_promotions = False
+        results = {}
         if handles and self._interrupt_requested:
             self._cancel_handles(handles)
             return False
@@ -661,10 +676,15 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
             logger.debug("No feedback, exiting process loop")
             return False
 
+        acks.extend(getattr(self, "_bg_dispatch_acks", None) or [])
+        self._bg_dispatch_acks = []
         # A feedback round is happening anyway — let the acks ride
         # along so the model knows the dispatch succeeded.
         if acks:
-            feedback_parts.extend(acks)
+            feedback_parts.extend(
+                ack.content if isinstance(ack, DispatchAcknowledgement) else ack
+                for ack in acks
+            )
 
         # Push feedback to controller for next turn
         if native_results_added and not feedback_parts:
@@ -678,6 +698,17 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                 exit_code=0,
                 error=None,
             )
+            if results or acks or completed_outputs:
+                await submit_internal_session_state(
+                    self,
+                    lambda: arm_dispatch_feedback(
+                        self,
+                        feedback_event,
+                        [] if native_mode else list(results),
+                        acks,
+                        completed_outputs,
+                    ),
+                )
             logger.debug("Pushing feedback to controller, continuing")
             await controller.push_event(feedback_event)
 

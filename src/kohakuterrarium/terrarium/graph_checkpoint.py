@@ -3,6 +3,8 @@
 import asyncio
 import weakref
 from contextlib import contextmanager
+from copy import deepcopy
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from kohakuterrarium.errors import (
@@ -73,55 +75,71 @@ async def preflight_add(
     )
 
 
+def _persist_checkpoint(store, manifest, snapshot):
+    """Save detached graph captures and allocate revisions on the store worker."""
+    if manifest is None:
+        store.meta[_manifest.MANIFEST_KEY] = None
+    else:
+        previous = _manifest.load_manifest(store)
+        manifest = replace(manifest, revision=previous.revision + 1 if previous else 1)
+        _manifest.save_manifest(store, manifest)
+    if snapshot is not None:
+        _topo_snap.write_snapshot(store, snapshot)
+    flush = getattr(store, "flush", None)
+    if flush is not None:
+        flush()
+
+
 async def checkpoint(engine: "Terrarium", graph_id: str) -> bool:
-    """Persist one graph manifest when the graph owns a live session."""
+    """Capture live graph state on-loop and persist detached values on its worker."""
     dirty = dirty_graphs(engine)
     if _suppression.get(engine, 0):
         dirty.add(graph_id)
         return False
-    store = engine._session_stores.get(graph_id)
-    graph = engine._topology.graphs.get(graph_id)
-    if store is None:
-        dirty.discard(graph_id)
-        return False
-    if graph is None or not graph.creature_ids:
-        if hasattr(store, "meta"):
-            store.meta[_manifest.MANIFEST_KEY] = None
-            flush = getattr(store, "flush", None)
-            if flush is not None:
-                flush()
-        dirty.discard(graph_id)
-        return False
-    if not hasattr(store, "meta"):
-        _topo_snap.snapshot(engine, graph_id)
-        dirty.discard(graph_id)
-        return False
     lock = _engine_locks(engine).setdefault(graph_id, asyncio.Lock())
     async with lock:
-        try:
-            _manifest.checkpoint_graph(engine, graph_id)
+        store = engine._session_stores.get(graph_id)
+        graph = engine._topology.graphs.get(graph_id)
+        if store is None:
+            dirty.discard(graph_id)
+            return False
+        if not hasattr(store, "meta"):
             _topo_snap.snapshot(engine, graph_id)
-        except GraphManifestPersistenceError:
+            dirty.discard(graph_id)
+            return False
+        missing = graph is None or not graph.creature_ids
+        invalid = False
+        try:
+            snapshot = _topo_snap.capture_snapshot(engine, graph_id)
+            try:
+                manifest = (
+                    None if missing else _manifest.capture_manifest(engine, graph_id)
+                )
+            except (KeyError, SessionNotResumableError):
+                manifest, invalid = None, True
+            manifest, snapshot = deepcopy((manifest, snapshot))
+            run = getattr(store, "run", None)
+            if callable(run):
+                await run(_persist_checkpoint, store, manifest, snapshot)
+            else:
+                _persist_checkpoint(store, manifest, snapshot)
+        except asyncio.CancelledError:
             dirty.add(graph_id)
             raise
-        except (KeyError, SessionNotResumableError):
-            try:
-                store.meta[_manifest.MANIFEST_KEY] = None
-                flush = getattr(store, "flush", None)
-                if flush is not None:
-                    flush()
-            finally:
-                _topo_snap.snapshot(engine, graph_id)
-                dirty.add(graph_id)
-            return False
+        except GraphManifestPersistenceError as exc:
+            dirty.add(graph_id)
+            raise GraphManifestPersistenceError(str(exc), applied=True) from exc
         except Exception as exc:
             dirty.add(graph_id)
             raise GraphManifestPersistenceError(
                 f"Graph {graph_id!r} mutated but its manifest checkpoint failed: {exc}",
                 applied=True,
             ) from exc
+        if invalid or engine._session_stores.get(graph_id) is not store:
+            dirty.add(graph_id)
+            return False
         dirty.discard(graph_id)
-        return True
+        return not missing
 
 
 async def checkpoint_many(engine: "Terrarium", graph_ids: "Iterable[str]") -> None:

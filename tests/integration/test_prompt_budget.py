@@ -49,7 +49,9 @@ def _measure(agent, mode):
 
 class TestPromptBudget:
     @pytest.mark.asyncio
-    async def test_framework_payload_stays_within_budget(self):
+    async def test_framework_payload_stays_within_budget(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         config = load_agent_config(str(FIXTURE))
         assert config.tool_format == "native"
         # kt-biome ships `full`; both modes are measured explicitly below so
@@ -59,7 +61,11 @@ class TestPromptBudget:
         # ── standard: the lean mode ────────────────────────────────────
         config.tool_doc_mode = "standard"
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            io="headless",
+            strict=False,
+            pwd=str(tmp_path),
         )
         try:
             standard_chars, schemas = _measure(agent, "standard")
@@ -115,7 +121,11 @@ class TestPromptBudget:
         # ── full: every usage tier inlined; the shipped default ────────
         config.tool_doc_mode = "full"
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            io="headless",
+            strict=False,
+            pwd=str(tmp_path),
         )
         try:
             full_chars, _ = _measure(agent, "full")
@@ -132,7 +142,11 @@ class TestPromptBudget:
             await agent.stop()
 
     @pytest.mark.asyncio
-    async def test_per_tool_full_override_costs_only_that_tool(self):
+    async def test_per_tool_full_override_costs_only_that_tool(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         # A creature on `standard` can still opt one tool into the usage tier,
         # and pays for that tool alone.
         config = load_agent_config(str(FIXTURE))
@@ -141,7 +155,11 @@ class TestPromptBudget:
             entry.doc_mode = "full" if entry.name == "multi_edit" else None
 
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            io="headless",
+            strict=False,
+            pwd=str(tmp_path),
         )
         try:
             prompt = agent._controller_config.system_prompt

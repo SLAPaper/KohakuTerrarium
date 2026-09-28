@@ -35,7 +35,9 @@ from kohakuterrarium.terrarium.drive.store import (
 from kohakuterrarium.core.environment import Environment
 from kohakuterrarium.core.session_attachment import run_explicit_attachment
 from kohakuterrarium.terrarium.session_attach import attach_reserved
-from kohakuterrarium.terrarium.session_subagent_state import preflight_child_split
+from kohakuterrarium.terrarium.session_subagent_state import preflight_child_split_async
+from kohakuterrarium.terrarium.session_split_async import prepare_split
+from kohakuterrarium.modules.plugin.state_scope import validate_legacy_state
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.creature_host import (
     Creature,
@@ -55,6 +57,10 @@ from kohakuterrarium.terrarium.runtime_prompt import RuntimeGraphPrompt
 from kohakuterrarium.terrarium.tools_group import (
     force_register_basic_tools,
     force_register_privileged_tools,
+)
+from kohakuterrarium.terrarium.topology_admission import (
+    require_topology_available,
+    run_topology_operation,
 )
 from kohakuterrarium.terrarium.topology import (
     ChannelInfo,
@@ -191,6 +197,7 @@ class Terrarium:
         llm: Any = None,
     ) -> str:
         """Adopt a saved session into this engine and return its graph ID."""
+        require_topology_available(self)
         kwargs = {"pwd": pwd, "llm": llm}
         if workspace_overrides is not None:
             kwargs["workspace_overrides"] = workspace_overrides
@@ -279,6 +286,7 @@ class Terrarium:
         _identity_reserved: bool = False,
     ) -> Creature:
         """Build and insert one creature into the engine."""
+        require_topology_available(self)
         return await _engine_creature_add.add_creature(
             self,
             config,
@@ -310,17 +318,28 @@ class Terrarium:
         c = self._creatures.get(cid)
         if c is None:
             raise KeyError(f"creature {cid!r} not in engine")
-        with _identity.reserve_graph_model_bindings(self, c.graph_id):
+
+        async def quiesce():
+            projected = deepcopy(self._topology)
+            delta = _topo.remove_creature(projected, cid)
+            await preflight_child_split_async(self, projected, delta)
+            store = self._session_stores.get(c.graph_id)
+            if isinstance(store, SessionStore):
+                await store.run(validate_legacy_state, store)
+            if c.is_running:
+                await c.stop(requested=False)
+
+        async def operation():
             await self._remove_creature_reserved(cid)
+
+        with _identity.reserve_graph_model_bindings(
+            self, c.graph_id, store_preflight=False
+        ):
+            await run_topology_operation(self, {c.graph_id}, operation, quiesce=quiesce)
 
     async def _remove_creature_reserved(self, cid: str) -> None:
         c = self._creatures[cid]
         old_gid = c.graph_id
-        projected = deepcopy(self._topology)
-        delta = _topo.remove_creature(projected, cid)
-        preflight_child_split(self, projected, delta)
-        if c.is_running:
-            await c.stop(requested=False)
         # A creature-scoped Drive orphans-and-blocks on removal,
         # a graph-scoped one unassigns / auto-assigns among the remaining
         # graph members — never a silent semantic reassignment.
@@ -349,7 +368,11 @@ class Terrarium:
                 )
         projected = deepcopy(self._topology)
         delta = _topo.remove_creature(projected, cid)
-        preflight_child_split(self, projected, delta)
+        prepared = await prepare_split(self, projected, delta)
+        if prepared is None:
+            await preflight_child_split_async(self, projected, delta)
+        else:
+            await prepared.install()
         self._topology = projected
         self._creatures.pop(cid, None)
         _wiring.install_output_wiring_resolver(self)
@@ -373,7 +396,9 @@ class Terrarium:
         # new envs are allocated, surviving creatures are repointed at
         # their new graph_id, and session stores are coordinated.
         # ``apply_split_bookkeeping`` is a no-op for non-split deltas.
-        _lifecycle.apply_split_bookkeeping(self, delta)
+        _lifecycle.apply_split_bookkeeping(self, delta, prepared=prepared)
+        if prepared is not None:
+            await prepared.retire()
         await _checkpoint.checkpoint_many(self, delta.new_graph_ids)
         await self._drain_drive_topology()
 
@@ -423,6 +448,7 @@ class Terrarium:
         listens to or sends on it yet — use :meth:`connect` (or set
         listen/send via topology helpers) to wire creatures up.
         """
+        require_topology_available(self)
         gid = self._resolve_graph_id(graph)
         info = _topo.add_channel(
             self._topology,
@@ -465,12 +491,14 @@ class Terrarium:
         in ``terrarium.channels.remove_channel_from_graph``.
         """
         gid = self._resolve_graph_id(graph)
-        delta = await _lifecycle.remove_channel_from_graph(self, gid, name)
-        # remove_channel may auto-split; snapshot every store-attached
-        # graph so each one reflects its post-removal topology.
-        await _checkpoint.checkpoint_many(self, delta.new_graph_ids)
-        await self._drain_drive_topology()
-        return delta
+
+        async def operation():
+            delta = await _lifecycle.remove_channel_from_graph(self, gid, name)
+            await _checkpoint.checkpoint_many(self, delta.new_graph_ids)
+            await self._drain_drive_topology()
+            return delta
+
+        return await run_topology_operation(self, {gid}, operation)
 
     async def connect(
         self,
@@ -486,13 +514,24 @@ class Terrarium:
         attached session stores are merged into a single store on the
         surviving graph.
 
+        Accepted handoffs finish before caller cancellation is raised; cancellation
+        does not imply that the topology mutation was rolled back.
         Body lives in ``terrarium.channels.connect_creatures``.
         """
-        endpoints = _identity.resolve_and_guard_connect(self, sender, receiver)
-        result = await _channels.connect_creatures(self, *endpoints, channel=channel)
-        await _checkpoint.checkpoint(self, result.graph_id)
-        await self._drain_drive_topology()
-        return result
+        graph_ids = {
+            self._topology.creature_to_graph[self._resolve_creature_id(ref)]
+            for ref in (sender, receiver)
+        }
+
+        async def operation():
+            result = await _channels.connect_creatures(
+                self, sender, receiver, channel=channel
+            )
+            await _checkpoint.checkpoint(self, result.graph_id)
+            await self._drain_drive_topology()
+            return result
+
+        return await run_topology_operation(self, graph_ids, operation)
 
     async def disconnect(
         self,
@@ -506,18 +545,28 @@ class Terrarium:
         When ``channel`` is None, every sender→receiver edge is
         unwired.  Body lives in
         ``terrarium.channel_lifecycle.disconnect_creatures``.
+        Accepted handoffs finish before caller cancellation is raised; cancellation
+        does not imply that the topology mutation was rolled back.
         """
-        result = await _lifecycle.disconnect_creatures(
-            self, sender, receiver, channel=channel
-        )
-        graph_ids = (
-            graph.graph_id
-            for graph in self.list_graphs()
-            if graph.graph_id in self._session_stores
-        )
-        await _checkpoint.checkpoint_many(self, graph_ids)
-        await self._drain_drive_topology()
-        return result
+        graph_ids = {
+            self._topology.creature_to_graph[self._resolve_creature_id(ref)]
+            for ref in (sender, receiver)
+        }
+
+        async def operation():
+            result = await _lifecycle.disconnect_creatures(
+                self, sender, receiver, channel=channel
+            )
+            affected = (
+                graph.graph_id
+                for graph in self.list_graphs()
+                if graph.graph_id in self._session_stores
+            )
+            await _checkpoint.checkpoint_many(self, affected)
+            await self._drain_drive_topology()
+            return result
+
+        return await run_topology_operation(self, graph_ids, operation)
 
     # ------------------------------------------------------------------
     # output wiring
@@ -525,6 +574,7 @@ class Terrarium:
 
     async def wire_output(self, creature: CreatureRef, target) -> str:
         """Add a runtime ``config.output_wiring`` edge; return its id."""
+        require_topology_available(self)
         c = self._creature(creature)
         edge_id = _wiring.add_output_edge(c.agent, target)
         self._emit(
@@ -540,6 +590,7 @@ class Terrarium:
 
     async def unwire_output(self, creature: CreatureRef, edge_id: str) -> bool:
         """Remove a runtime ``config.output_wiring`` edge by id."""
+        require_topology_available(self)
         c = self._creature(creature)
         removed = _wiring.remove_output_edge(c.agent, edge_id)
         if removed:
@@ -561,11 +612,13 @@ class Terrarium:
 
     async def wire_output_sink(self, creature: CreatureRef, sink) -> str:
         """Attach a secondary output sink to a creature."""
+        require_topology_available(self)
         c = self._creature(creature)
         return _wiring.add_secondary_sink(c.agent, sink)
 
     async def unwire_output_sink(self, creature: CreatureRef, sink_id: str) -> bool:
         """Remove a secondary output sink."""
+        require_topology_available(self)
         c = self._creature(creature)
         return _wiring.remove_secondary_sink(c.agent, sink_id)
 
@@ -593,6 +646,7 @@ class Terrarium:
 
         Body lives in :func:`terrarium.root.assign_root_to`.
         """
+        require_topology_available(self)
         result = await _root.assign_root_to(
             self, creature, report_channel=report_channel
         )
@@ -642,6 +696,7 @@ class Terrarium:
         ``session`` follows ``add_creature`` and creates one graph store.
         ``created_ids`` collects only creatures added by this call.
         """
+        require_topology_available(self)
         kwargs = {
             "graph": graph,
             "pwd": pwd if pwd is not None else self._pwd,
@@ -686,6 +741,7 @@ class Terrarium:
     async def start(self, creature: CreatureRef) -> None:
         """Start a (previously-added) creature whose lifecycle was
         deferred via ``add_creature(..., start=False)``."""
+        require_topology_available(self)
         c = self._creature(creature)
         await c.start()
         # Re-arm Drive reconciliation behind the restoration barrier.
@@ -694,6 +750,7 @@ class Terrarium:
 
     async def stop(self, creature: CreatureRef) -> None:
         """Stop a running creature without removing it from the graph."""
+        require_topology_available(self)
         c = self._creature(creature)
         await c.stop()
         if self._drive_runtime is not None:
@@ -701,6 +758,7 @@ class Terrarium:
 
     async def stop_graph(self, graph: GraphRef) -> None:
         """Stop every creature in a graph (without removing them)."""
+        require_topology_available(self)
         gid = self._resolve_graph_id(graph)
         g = self._topology.graphs.get(gid)
         if g is None:
@@ -717,6 +775,7 @@ class Terrarium:
 
         Called automatically by ``__aexit__``.
         """
+        require_topology_available(self)
         if not self._creatures and not self._running:
             return
         # The stop loop can be cancelled mid-await; run store closure +
@@ -806,6 +865,7 @@ class Terrarium:
         store there with validated meta (and closes it on shutdown).
         See ``terrarium.session_coord`` for merge/split details.
         """
+        require_topology_available(self)
         gid = self._resolve_graph_id(graph)
         agents = [c.agent for c in self._creatures.values() if c.graph_id == gid]
         await run_explicit_attachment(

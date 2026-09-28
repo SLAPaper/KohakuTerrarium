@@ -13,6 +13,7 @@ from kohakuterrarium.core.compact_splice import (
     select_compact_boundary,
 )
 from kohakuterrarium.core.compact_text import format_messages_for_summary
+from kohakuterrarium.core.controller_generation import _canonical_output
 from kohakuterrarium.llm.generation import provider_identity
 
 
@@ -34,6 +35,9 @@ class CompactInput:
     fingerprint: tuple
     context_length: int
     summary_input: str
+    prefix_messages: list
+    retained_messages: list
+    sink: Any
 
 
 def capture_compact(manager) -> CompactInput:
@@ -81,7 +85,33 @@ def capture_compact(manager) -> CompactInput:
         prefix_fingerprint(compact_messages),
         conversation.get_context_length(),
         format_messages_for_summary(compact_messages),
+        [_detached_message(message) for message in compact_messages],
+        [_detached_message(message) for message in messages[boundary:]]
+        + (
+            [
+                _detached_message(
+                    next(
+                        message
+                        for message in reversed(compact_messages)
+                        if is_real_user_message(message)
+                    )
+                )
+            ]
+            if boundary > preferred
+            and any(is_real_user_message(message) for message in compact_messages)
+            else []
+        ),
+        (
+            _canonical_output(controller)
+            if agent is not None
+            and getattr(controller, "session_store", None) is not None
+            else None
+        ),
     )
+
+
+def _detached_message(message):
+    return deepcopy({**message.to_dict(), "metadata": message.metadata})
 
 
 def compact_source_matches(manager, captured: CompactInput) -> bool:
@@ -106,6 +136,18 @@ def compact_source_matches(manager, captured: CompactInput) -> bool:
     agent = manager._agent
     if getattr(agent, "session_store", captured.store) is not captured.store:
         return False
+    if (
+        agent is not None
+        and getattr(controller, "_state_host", None) is agent
+        and captured.store is not None
+    ):
+        if (
+            getattr(controller, "session_store", None) is not captured.store
+            or captured.sink is None
+        ):
+            return False
+        if _canonical_output(controller) is not captured.sink:
+            return False
     path = current_path(captured.branch)
     view = getattr(agent, "_branch_view", None)
     if isinstance(view, dict) and any(
@@ -115,7 +157,9 @@ def compact_source_matches(manager, captured: CompactInput) -> bool:
     return path.issubset(current_path(agent))
 
 
-def apply_compact(manager, captured: CompactInput, summary: str, elide) -> str | None:
+def apply_compact(
+    manager, captured: CompactInput, summary: str, elide, coverage=None
+) -> str | None:
     """Validate and apply one summary, its counters, usage reset, and elision."""
     if manager._controller.conversation is not captured.conversation:
         manager._last_compact_time = time.time()
@@ -145,6 +189,8 @@ def apply_compact(manager, captured: CompactInput, summary: str, elide) -> str |
         if not applied:
             manager._last_compact_time = time.time()
             return "conversation_changed"
+        if coverage is not None:
+            conversation._messages[1].metadata["compact_coverage"] = deepcopy(coverage)
         manager._compact_count += 1
         manager._last_compact_time = time.time()
         manager._controller._last_usage = {}

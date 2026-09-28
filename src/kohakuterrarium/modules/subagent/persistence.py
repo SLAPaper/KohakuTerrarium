@@ -1,7 +1,38 @@
 """Detached child history writes and accepted affinity receipt settlement."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from copy import deepcopy
+
+from kohakuterrarium.errors import ConflictError
+
+
+async def wait_for_binding(host):
+    while getattr(host, "_topology_handoff_task", None) is not None:
+        if host._topology_handoff_task is asyncio.current_task():
+            return
+        await host._topology_handoff_ready.wait()
+    if getattr(host, "_session_attach_uncertain", False):
+        raise ConflictError("Child persistence requires cold handoff recovery")
+
+
+@asynccontextmanager
+async def persistence_binding(host):
+    """Admit a finite child persistence operation before selecting its store."""
+    await wait_for_binding(host)
+    if host is None:
+        yield
+        return
+    receipt = asyncio.get_running_loop().create_future()
+    pending = getattr(host, "_inflight_child_writes", None)
+    if pending is None:
+        pending = host._inflight_child_writes = set()
+    pending.add(receipt)
+    try:
+        yield
+    finally:
+        receipt.set_result(None)
+        pending.discard(receipt)
 
 
 async def settle(receipt, accept=None):
@@ -21,7 +52,12 @@ async def settle(receipt, accept=None):
                 raise asyncio.CancelledError() from exc
             raise
     if accept is not None:
-        accept(value)
+        try:
+            accept(value)
+        except BaseException as exc:
+            if cancelled:
+                raise asyncio.CancelledError() from exc
+            raise
     if cancelled:
         raise asyncio.CancelledError()
     return value
@@ -32,6 +68,9 @@ def bind_children(manager, store, parent):
     manager._session_store, manager._parent_name = store, parent
     for job in manager._jobs.values():
         child = job.subagent
+        child._persistence_host = getattr(
+            getattr(manager, "_parent_executor", None), "_agent", None
+        )
         child._session_store, child._parent_name = store, parent
         if child._run_index is None and child._run_receipt is None:
             child._run_receipt = store.submit(
@@ -58,6 +97,11 @@ def result_metadata(result):
 
 async def save_result(child, result):
     """Persist a child snapshot captured before selecting its current store worker."""
+    async with persistence_binding(getattr(child, "_persistence_host", None)):
+        await _save_result(child, result)
+
+
+async def _save_result(child, result):
     if child._session_store is None:
         return
     if child._run_index is None:

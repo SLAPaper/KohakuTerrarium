@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from kohakuterrarium import Terrarium
+from kohakuterrarium.core.branch_selection import select_branch
 from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.modules.plugin.base import BasePlugin, PluginContext
@@ -12,7 +13,79 @@ from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
 from kohakuterrarium.modules.plugin.state_scope import state_prefix
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.compact_coverage import coordinate
 from kohakuterrarium.testing.llm import ScriptedLLM
+from kohakuterrarium.terrarium import session_merge_async, topology_admission
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_remerge_uses_current_owner_snapshot_not_copied_peer_cache(
+    tmp_path, monkeypatch, legacy
+):
+    committed = []
+    relocate = topology_admission.relocate_topology_selectors
+
+    def observed(agent, *args):
+        assert asyncio.current_task() is agent._session_state_owner.task
+        committed.append(agent.config.name)
+        return relocate(agent, *args)
+
+    monkeypatch.setattr(topology_admission, "relocate_topology_selectors", observed)
+    monkeypatch.setattr(session_merge_async, "relocate_topology_selectors", observed)
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        alice = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=ScriptedLLM(["alice-before", "alice-after"]),
+            io="headless",
+            start=True,
+        )
+        bob = await engine.add_creature(
+            AgentConfig(name="bob"),
+            llm=ScriptedLLM(["bob-before", "bob-after"]),
+            io="headless",
+            start=True,
+        )
+        for creature in (alice, bob):
+            assert (await creature.run("before")).ok
+        legacy_messages = []
+        if legacy:
+
+            def remove_canonical_identity():
+                for message in bob.agent.controller.conversation.get_messages():
+                    if message.metadata.get("event_origin"):
+                        legacy_messages.append(
+                            (message, tuple(message.metadata.pop("event_origin")))
+                        )
+
+            await bob.agent._session_state_owner.submit_internal(
+                remove_canonical_identity
+            )
+        await select_branch(alice.agent, None)
+        await engine.connect(alice, bob, channel="bridge")
+        await engine.disconnect(alice, bob, channel="bridge")
+        for creature in (alice, bob):
+            assert (await creature.run("after")).ok
+        await engine.connect(alice, bob, channel="bridge")
+        for creature in (alice, bob):
+            store = creature.agent.session_store
+            saved = await store.run(store.load_conversation, creature.name)
+            assert saved[-1]["content"] == f"{creature.name}-after"
+            assert creature.name in committed
+            raw = await store.run(store.get_events, creature.name)
+            canonical = {coordinate(event): event["event_id"] for event in raw}
+            if creature is bob:
+                for message, origin in legacy_messages:
+                    assert message.metadata["event_id"] == canonical[origin]
+            messages = list(creature.agent.controller.conversation.get_messages())
+            bundle = getattr(creature.agent, "_installed_runtime_context_bundle", None)
+            if bundle is not None:
+                messages.extend(bundle.provider_conversation)
+            for message in messages:
+                if message.metadata.get("event_origin"):
+                    assert (
+                        message.metadata["event_id"]
+                        == canonical[tuple(message.metadata["event_origin"])]
+                    )
 
 
 @pytest.mark.parametrize("operation", ["merge", "split"])
