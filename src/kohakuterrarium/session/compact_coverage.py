@@ -99,7 +99,17 @@ def make_rule(event, events, path):
         )
         if type(first) is not int or type(last) is not int:
             return None
-        return CompactRule(first, last, path, summary)
+        return CompactRule(
+            first,
+            last,
+            path,
+            summary,
+            metadata={
+                **coverage_metadata(event),
+                "replaced_from_event_id": first,
+                "replaced_to_event_id": last,
+            },
+        )
     if not origins:
         return None
     members = frozenset(e["event_id"] for e in events if coordinate(e) in origins)

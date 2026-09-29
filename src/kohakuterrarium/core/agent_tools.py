@@ -29,6 +29,7 @@ from kohakuterrarium.core.tool_origin import (
     promote_tool_context,
     tool_completion_context,
 )
+from kohakuterrarium.core.tool_dispatch import start_tool_task
 from kohakuterrarium.core.tool_output import render_content_text
 from kohakuterrarium.llm.message import content_parts_to_dicts
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode
@@ -38,8 +39,10 @@ from kohakuterrarium.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-def _is_user_input(event: Any) -> bool:
-    return getattr(event, "type", "") == "user_input"
+def _is_interactive_user_input(event: Any) -> bool:
+    return getattr(event, "type", "") == "user_input" and not (
+        getattr(event, "context", None) or {}
+    ).get("await_turn")
 
 
 class AgentToolsMixin(AgentRuntimeToolsMixin):
@@ -67,21 +70,12 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 "direct" if is_direct and not run_bg else "background",
                 tool_call_id,
             )
-            job_id = await self.executor.submit_from_event(
+            return await start_tool_task(
+                self.executor,
                 tool_call,
-                is_direct=is_direct,
                 job_id=job_id,
                 completion_context=completion_context,
             )
-            task = self.executor.get_task(job_id)
-            if task is None:
-
-                async def _get_result():
-                    return self.executor.get_result(job_id)
-
-                task = asyncio.create_task(_get_result())
-
-            return job_id, task, is_direct
         except Exception as e:
             logger.error("Failed to start tool", tool_name=tool_call.name, error=str(e))
             error_msg = str(e)
@@ -103,7 +97,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
     ) -> tuple[dict[str, Any], bool]:
         """Collect direct results while processing background promotions.
 
-        Queued user input must not wait out a long direct job: the only
+        Interactive user input must not wait out a long direct job: the only
         mid-turn drain runs AFTER this wait, so its arrival promotes the
         remaining handles — the round boundary (and the drain behind it)
         runs now, and each promoted job's real result returns through the
@@ -121,7 +115,7 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         }
 
         while waiters:
-            if self._event_inbox.has_event(_is_user_input):
+            if self._event_inbox.has_event(_is_interactive_user_input):
                 for handle in pending.values():
                     if not handle.promoted:
                         handle.promote()

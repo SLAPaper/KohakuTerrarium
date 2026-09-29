@@ -42,6 +42,106 @@ def _state(store, key):
     return store.state[key]
 
 
+async def test_branch_input_continues_selected_history_and_restores_it(tmp_path):
+    provider = ScriptedLLM(["original", "edited", "continued"])
+    engine, creature = await _agent(tmp_path, provider)
+    try:
+        agent = creature.agent
+        await creature.run("ROOT")
+        await agent.edit_and_rerun(1, "EDITED")
+        assert await agent.inject_input(
+            "CONTINUE", source="web", pending_id="selected-input", branch_view={"1": 1}
+        )
+        inputs = [m["content"] for m in provider.last_messages if m["role"] == "user"]
+        assert inputs == ["ROOT", "CONTINUE"]
+        restored = await Agent.build(
+            AgentConfig(name="alice"), llm=ScriptedLLM(), io="headless"
+        )
+        await inject_saved_state_async(restored, agent.session_store, "alice")
+        assert [
+            m.content
+            for m in restored.controller.conversation.get_messages()
+            if m.role == "user"
+        ] == inputs
+        await restored.stop()
+    finally:
+        await engine.shutdown()
+
+
+async def test_branch_input_save_failure_never_enqueues_or_changes_live(
+    tmp_path, monkeypatch
+):
+    provider = ScriptedLLM(["original", "edited"])
+    engine, creature = await _agent(tmp_path, provider)
+    try:
+        agent = creature.agent
+        await creature.run("ROOT")
+        await agent.edit_and_rerun(1, "EDITED")
+        before = agent.controller.conversation.to_json()
+
+        def fail(*args):
+            raise OSError("selection save failed")
+
+        monkeypatch.setattr(branch_selection, "_persist_on_worker", fail)
+        with pytest.raises(OSError, match="selection save failed"):
+            await agent.inject_input("NEVER", branch_view={1: 1})
+        assert agent.controller.conversation.to_json() == before
+        assert agent._event_inbox.empty()
+        assert provider.call_count == 2
+    finally:
+        await engine.shutdown()
+
+
+async def test_branch_continuation_admission_precedes_later_input(
+    tmp_path, monkeypatch
+):
+    provider = ScriptedLLM(
+        ["original", "edited", "selected answer", "later answer", "final"]
+    )
+    engine, creature = await _agent(tmp_path, provider)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    selected = None
+    try:
+        agent = creature.agent
+        await creature.run("ROOT")
+        await agent.edit_and_rerun(1, "EDITED")
+        persist = branch_selection._persist_on_worker
+
+        def held(*args):
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(5)
+            return persist(*args)
+
+        monkeypatch.setattr(branch_selection, "_persist_on_worker", held)
+        selected = asyncio.create_task(
+            agent.inject_input("SELECTED", branch_view={1: 1})
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        with pytest.raises(ConflictError):
+            await agent.inject_input("WRONG", branch_view={1: 2})
+        assert await agent.inject_input("LATER") is False
+        for _ in range(8):
+            await asyncio.sleep(0)
+        release.set()
+        assert await selected
+        await creature.run("FINAL")
+        requests = [
+            [m["content"] for m in call if m["role"] == "user"]
+            for call in provider.call_log[2:]
+        ]
+        assert requests[0] == ["ROOT", "SELECTED"]
+        assert all(
+            "WRONG" not in str(call) and "EDITED" not in str(call) for call in requests
+        )
+    finally:
+        release.set()
+        if selected is not None:
+            await asyncio.gather(selected, return_exceptions=True)
+        await engine.shutdown()
+
+
 async def test_branch_latest_keeps_live_system_and_persists_full_context(tmp_path):
     provider = ScriptedLLM(["original answer"])
     engine, creature = await _agent(tmp_path, provider, max_messages=1)

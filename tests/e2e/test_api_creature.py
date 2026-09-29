@@ -166,11 +166,14 @@ def client(
 # ── WS helpers ────────────────────────────────────────────────────────
 
 
-def _stream_turn(ws, message: str) -> tuple[str, list[dict]]:
+def _stream_turn(ws, message: str, *, branch_view=None) -> tuple[str, list[dict]]:
     """Send one user input over an attached IO WebSocket and collect
     the streamed assistant text + every activity frame, stopping at the
     post-turn ``idle`` frame."""
-    ws.send_json({"type": "input", "content": message})
+    payload = {"type": "input", "content": message}
+    if branch_view is not None:
+        payload["branch_view"] = branch_view
+    ws.send_json(payload)
     chunks: list[str] = []
     activities: list[dict] = []
     while True:
@@ -613,6 +616,22 @@ class TestApiCreatureJourney:
         assert any(
             "edited hello creature" in (m.get("content") or "") for m in live_user
         )
+
+        with client.websocket_connect(ws_url) as ws:
+            ws.receive_json()
+            _stream_turn(ws, "continue viewed original", branch_view={"1": 1})
+        selected_request = [
+            m for m in scripted_llm.last_messages if m.get("role") != "system"
+        ]
+        assert "edited hello creature" not in str(selected_request)
+        assert "hello creature" in str(selected_request)
+        assert selected_request[-1]["content"] == "continue viewed original"
+        selected_snapshot = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
+            params={"stream": "snapshot", "limit": 400},
+        ).json()["messages"]
+        assert "edited hello creature" not in str(selected_snapshot)
+        assert "continue viewed original" in str(selected_snapshot)
 
         # 8.5 Rename the live creature (frontend: agentAPI.rename), run
         #     another turn, and read history under the NEW display name.

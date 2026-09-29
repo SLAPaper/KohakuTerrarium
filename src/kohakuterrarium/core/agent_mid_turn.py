@@ -121,8 +121,8 @@ class AgentMidTurnMixin:
         return self._event_inbox.cancel(pending_id)
 
     async def _drain_mid_turn_pending_inputs(self, controller: Controller) -> int:
-        """Claim every queued event into the active controller turn."""
-        claimed = await admit_background_run(self, self._event_inbox.drain_all())
+        """Claim the leading lineage-admitted foldable events into the active turn."""
+        claimed = await admit_background_run(self, self._event_inbox.drain_foldable())
         if not claimed:
             return 0
         events = deepcopy([envelope.event for envelope in claimed])

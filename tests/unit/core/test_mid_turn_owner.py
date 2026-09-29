@@ -344,7 +344,11 @@ async def test_failed_fold_reports_error_without_delivery_or_partial_append(
             else create_user_input_event("folded question")
         )
         future = asyncio.get_running_loop().create_future()
-        agent._event_inbox.put(EventEnvelope(event=event, future=future))
+        awaiting = EventEnvelope(
+            event=create_user_input_event("awaited remains queued"), future=future
+        )
+        agent._event_inbox.put(EventEnvelope(event=event))
+        agent._event_inbox.put(awaiting)
         agent._turn_dispatched_bg.add("work_job")
         conversation = agent.controller.conversation
         before = conversation.to_json()
@@ -377,7 +381,9 @@ async def test_failed_fold_reports_error_without_delivery_or_partial_append(
                 await agent._drain_mid_turn_pending_inputs(agent.controller)
         assert conversation.to_json() == before
         assert agent.controller.conversation.to_json() == before
-        assert future.done() and future.result().status == "error"
+        assert not future.done()
+        assert agent._event_inbox.drain_all() == [awaiting]
+        agent._event_inbox.put(awaiting)
         assert "work_job" in agent._turn_dispatched_bg
         await agent.output_router.flush()
         raw = await agent.session_store.run(agent.session_store.get_events, "alice")

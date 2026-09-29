@@ -5,18 +5,19 @@ from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any
 
-from kohakuterrarium.core.agent_message_history import (
-    resolve_edit_message_index,
-    turn_index_for_user_position,
-)
+from kohakuterrarium.core.agent_message_history import resolve_edit_message_index
 from kohakuterrarium.core.agent_raw_history import reload_raw_prefix_for_target
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.history_compatibility import validate_history_compatibility
-from kohakuterrarium.core.message_locator import is_turn_user_message
+from kohakuterrarium.core.message_locator import (
+    is_turn_user_message,
+    user_message_indices_for_content,
+)
 from kohakuterrarium.core.runtime_context_replacement_prepare import (
     prepare_selected_branch_context,
 )
 from kohakuterrarium.llm.message import normalize_content_parts
+from kohakuterrarium.session.event_origin import EVENT_COORDINATE, EVENT_ORIGIN
 from kohakuterrarium.session.generation_validation import (
     validate_selected_generation_events,
 )
@@ -48,6 +49,49 @@ class _EventSnapshot:
 
     def get_events(self, _name):
         return self.events
+
+
+def _message_turn(message, selected_events, *, persisted):
+    """Resolve a retained user message by identity or unique legacy content."""
+    metadata = message.metadata or {}
+    turn = metadata.get("turn_index")
+    if "turn_index" in metadata and (type(turn) is not int or turn <= 0):
+        raise ValueError("Invalid edit target turn metadata")
+    if not persisted:
+        return turn
+    candidates = [
+        event for event in selected_events if event.get("type") == "user_message"
+    ]
+    if turn is not None:
+        candidates = [event for event in candidates if event.get("turn_index") == turn]
+        if "branch_id" in metadata:
+            candidates = [
+                event
+                for event in candidates
+                if event.get("branch_id") == metadata["branch_id"]
+            ]
+        if "event_origin" in metadata:
+            candidates = [
+                event
+                for event in candidates
+                if event.get(EVENT_COORDINATE, event.get(EVENT_ORIGIN))
+                == metadata["event_origin"]
+            ]
+        elif "event_id" in metadata:
+            candidates = [
+                event
+                for event in candidates
+                if event.get("event_id") == metadata["event_id"]
+            ]
+    else:
+        candidates = [
+            event
+            for event in candidates
+            if user_message_indices_for_content([message], event.get("content"))
+        ]
+    if len(candidates) != 1 or type(candidates[0].get("turn_index")) is not int:
+        raise ValueError("Edit target has no unique selected user event")
+    return candidates[0]["turn_index"]
 
 
 def prepare_edit(store, prefix, messages, coordinates, config, source, request):
@@ -142,9 +186,8 @@ def prepare_edit(store, prefix, messages, coordinates, config, source, request):
     if idx is None or not is_turn_user_message(msgs[idx]):
         return None
     if target_turn is None:
-        position = sum(is_turn_user_message(m) for m in msgs[: idx + 1]) - 1
-        target_turn = turn_index_for_user_position(
-            candidate, position, branch_view=view
+        target_turn = _message_turn(
+            msgs[idx], selected_events, persisted=store is not None
         )
     if target_turn is None:
         target_turn = turn
@@ -221,6 +264,7 @@ def prepare_edit(store, prefix, messages, coordinates, config, source, request):
         "turn": target_turn,
         "branch": new_branch,
         "path": parent,
+        "source_view": dict(view),
         "content": content,
         "normalized": normalized,
     }

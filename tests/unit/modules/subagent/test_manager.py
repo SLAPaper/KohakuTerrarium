@@ -10,12 +10,15 @@ import asyncio
 import pytest
 
 from kohakuterrarium.core.budget import IterationBudget
+from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.core.job import JobState, JobType
 from kohakuterrarium.core.registry import Registry
+from kohakuterrarium.modules.plugin.base import BasePlugin
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.subagent.manager import SubAgentManager
 from kohakuterrarium.modules.subagent.result import SubAgentResult
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 
@@ -637,3 +640,80 @@ class TestLiveMessaging:
             await mgr.send_to_subagent("nobody", job_id="agent_ghost_deadbeef") is False
         )
         assert await mgr.send_to_subagent("nobody", name="ghost") is False
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_hosted_plugin_startup_failure_preserves_receipt_and_parent(
+    tmp_path, cancel
+):
+    class StartupPlugin(BasePlugin):
+        name = "startup_probe"
+
+        def __init__(self):
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.loads = 0
+            self.unloads = 0
+            self.working_dir = None
+
+        async def on_load(self, context):
+            self.loads += 1
+            self.working_dir = context.working_dir
+            self.entered.set()
+            if cancel:
+                await self.release.wait()
+            raise RuntimeError("hosted startup failure")
+
+        async def on_unload(self):
+            self.unloads += 1
+
+    class ParentLLM(ScriptedLLM):
+        def __init__(self):
+            super().__init__(["parent still usable"])
+            self.closes = 0
+
+        async def close(self):
+            self.closes += 1
+            await super().close()
+
+    llm = ParentLLM()
+    async with Terrarium(
+        pwd=str(tmp_path), session_dir=tmp_path / "sessions"
+    ) as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="parent", agent_path=tmp_path),
+            llm=llm,
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        agent.add_subagent(SubAgentConfig(name="child", max_turns=1))
+        manager = agent.subagent_manager
+        manager._strict = True
+        job_id = await manager.spawn("child", "must not call the model")
+        child = manager._jobs[job_id].subagent
+        plugin = StartupPlugin()
+        child.plugins.register(plugin)
+        await asyncio.wait_for(plugin.entered.wait(), 5)
+        if cancel:
+            assert await manager.cancel(job_id)
+        result = await manager.wait_for(job_id, timeout=5)
+        expected = JobState.CANCELLED if cancel else JobState.ERROR
+        assert manager.get_status(job_id).state is expected
+        assert result.success is False
+        assert result.cancelled is cancel
+        if not cancel:
+            assert result.error == "hosted startup failure"
+        assert child._run_index is not None
+        saved = await agent.session_store.run(
+            agent.session_store.find_subagent_run, job_id, parent=agent.config.name
+        )
+        assert saved["run"] == child._run_index
+        assert saved["meta"]["success"] is False
+        assert saved["meta"]["cancelled"] is cancel
+        assert saved["meta"]["error"] == result.error
+        assert plugin.loads == plugin.unloads == 1
+        assert plugin.working_dir == tmp_path
+        assert llm.closes == 0
+        assert (await creature.run("continue parent")).text == "parent still usable"

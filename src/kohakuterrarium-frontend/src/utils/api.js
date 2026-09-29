@@ -1210,8 +1210,27 @@ export const settingsAPI = {
     const { data } = await api.get("/settings/codex-status", _nodeQuery(node))
     return data
   },
+  async getAntigravityStatus(node = "_host") {
+    const { data } = await api.get("/settings/antigravity-status", _nodeQuery(node))
+    return data
+  },
+  async getAntigravityUsage(node = "_host") {
+    const { data } = await api.get("/settings/antigravity-usage", {
+      timeout: 90000,
+      ..._nodeQuery(node),
+    })
+    return data
+  },
   async getGrokStatus(node = "_host") {
     const { data } = await api.get("/settings/grok-status", _nodeQuery(node))
+    return data
+  },
+  /**
+   * Node-local Grok subscription usage. The body is the normalized
+   * contract only — never an upstream error or credential.
+   */
+  async getGrokUsage(node = "_host") {
+    const { data } = await api.get("/settings/grok-usage", { timeout: 120000, ..._nodeQuery(node) })
     return data
   },
   async codexLogin(node = "_host") {

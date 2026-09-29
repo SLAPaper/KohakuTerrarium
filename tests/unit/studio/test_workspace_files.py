@@ -1,5 +1,3 @@
-"""Unit tests for :mod:`kohakuterrarium.studio.attach.workspace_files`."""
-
 import sys
 from pathlib import Path
 
@@ -151,6 +149,10 @@ class TestGetFileTree:
 
 
 class TestBrowseDirectories:
+    @pytest.fixture(autouse=True)
+    def _isolate_roots(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(wf, "_list_browse_roots", lambda: [tmp_path])
+
     async def test_no_path_returns_roots(self):
         out = await wf.browse_directories(None)
         assert out["current"] is None
@@ -202,6 +204,20 @@ class TestReadFile:
         out = await wf.read_file(str(f))
         assert out["content"] == "hello"
         assert out["language"] == "plaintext"
+
+
+class TestReadFileRaw:
+    async def test_not_found(self, tmp_path):
+        with pytest.raises(HTTPException) as exc:
+            await wf.read_file_raw(str(tmp_path / "ghost"))
+        assert exc.value.status_code == 404
+
+    async def test_serves_bytes_and_content_type(self, tmp_path):
+        f = tmp_path / "shot.png"
+        f.write_bytes(b"\x89PNG-magic")
+        data, mime = await wf.read_file_raw(str(f))
+        assert data == b"\x89PNG-magic"
+        assert mime == "image/png"
 
 
 class TestWriteFile:
@@ -293,7 +309,16 @@ class TestMakeDirectory:
 
 
 class TestListBrowseRoots:
-    def test_returns_paths(self):
+    def test_returns_paths(self, monkeypatch):
+        original_exists = Path.exists
+
+        def _exists(self):
+            drive_str = str(self).rstrip("/\\").upper()
+            if len(drive_str) == 2 and drive_str[1] == ":" and drive_str[0].isalpha():
+                return drive_str == "C:"
+            return original_exists(self)
+
+        monkeypatch.setattr(Path, "exists", _exists)
         out = wf._list_browse_roots()
         assert out
         assert all(isinstance(p, Path) for p in out)

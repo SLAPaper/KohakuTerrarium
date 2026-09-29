@@ -14,6 +14,91 @@ from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 
+@pytest.mark.parametrize(
+    "selector", ["message_idx", "user_position", "turn_index", "raw", "view"]
+)
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_edit_after_compact_keeps_canonical_turn_on_branch_round_trip(
+    tmp_path, selector, legacy
+):
+    provider = ScriptedLLM(
+        ["one", "two", "three", "edited", "regenerated", "continued"]
+    )
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(
+                name="alice",
+                compact={
+                    "max_tokens": 100000,
+                    "keep_recent_turns": 1,
+                    "cooldown_seconds": 0,
+                },
+            ),
+            llm=provider,
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        await creature.run("first")
+        await creature.run("second")
+        await creature.run("third")
+        if legacy:
+            await agent._submit_session_state(
+                lambda: next(
+                    m
+                    for m in agent.controller.conversation.get_messages()
+                    if m.role == "assistant"
+                ).metadata.pop("generation")
+            )
+        agent.compact_manager._llm = ScriptedLLM(["COMPACTED_PREFIX"])
+        assert agent.compact_manager.trigger_compact()
+        await agent.compact_manager.wait_for_current()
+        messages = agent.controller.conversation.get_messages()
+        index = next(
+            i
+            for i, m in enumerate(messages)
+            if m.role == "user" and m.content == "third"
+        )
+        assert messages[index].metadata["turn_index"] == 3
+        options = (
+            {"user_position": 0}
+            if selector == "user_position"
+            else ({"turn_index": 3} if selector == "turn_index" else {})
+        )
+        if selector == "raw":
+            options = {
+                "target": UserMessageSelector(
+                    messages[index].metadata["event_id"], 3, 1
+                )
+            }
+        elif selector == "view":
+            options = {"turn_index": 3, "branch_view": {1: 1, 2: 1, 3: 1}}
+        assert await agent.edit_and_rerun(index, "EDITED_THIRD", **options)
+        assert agent._turn_index == 3
+        assert "COMPACTED_PREFIX" in str(provider.last_messages)
+        await agent.regenerate_last_response()
+        assert agent._turn_index == 3
+        view = dict(agent._parent_branch_path)
+        view[3] = agent._branch_id
+        await agent.select_branch({1: 1, 2: 1, 3: 1})
+        assert "EDITED_THIRD" not in agent.controller.conversation.to_json()
+        await agent.select_branch(view)
+        await creature.run("after switch")
+        request = [m for m in provider.last_messages if m["role"] != "system"]
+        assert "COMPACTED_PREFIX" in str(request)
+        assert [m["content"] for m in request if m["role"] == "user"] == [
+            "EDITED_THIRD",
+            "after switch",
+        ]
+        events = await agent.session_store.run(agent.session_store.get_events, "alice")
+        edits = [
+            e
+            for e in events
+            if e["type"] == "user_message" and e.get("content") == "EDITED_THIRD"
+        ]
+        assert edits and all(e["turn_index"] == 3 for e in edits)
+
+
 @pytest.mark.parametrize("check", ["metadata", "system"])
 async def test_raw_edit_retains_system_and_installs_canonical_user(tmp_path, check):
     async with Terrarium(session_dir=tmp_path / "sessions") as engine:
@@ -50,6 +135,24 @@ async def test_raw_edit_retains_system_and_installs_canonical_user(tmp_path, che
             assert user.metadata["event_id"] == written["event_id"]
             assert user.metadata["turn_index"] == 1
             assert user.metadata["branch_id"] == 2
+            assert user.metadata["event_origin"][-1] == written["event_id"]
+            assert user.metadata["user_pair_id"] == written["user_pair_id"]
+            first_origin = user.metadata["event_origin"]
+            await agent.regenerate_last_response()
+            regenerated = next(
+                m
+                for m in agent.controller.conversation.get_messages()
+                if m.role == "user"
+            )
+            assert regenerated.metadata["event_origin"] != first_origin
+            assert (
+                regenerated.metadata["event_origin"][-1]
+                == regenerated.metadata["event_id"]
+            )
+            assert (
+                regenerated.metadata["user_pair_origin"][-1]
+                < regenerated.metadata["event_id"]
+            )
 
 
 @pytest.mark.parametrize("target_kind", ["raw", "view"])

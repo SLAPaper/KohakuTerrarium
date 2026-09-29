@@ -1,11 +1,14 @@
 """Prepared merge failures preserve membership and source retirement responsibility."""
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
 from kohakuterrarium import Terrarium
 from kohakuterrarium.core.config_types import AgentConfig
+from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.version import FORMAT_VERSION, detect_format_version
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.terrarium import (
     channels,
@@ -15,12 +18,33 @@ from kohakuterrarium.terrarium import (
     topology,
     topology_admission,
 )
+from kohakuterrarium.terrarium.session_merge_async import _metadata
 
 
 async def _member(engine, name):
     return await engine.add_creature(
         AgentConfig(name=name), llm=ScriptedLLM([name]), io="headless", start=True
     )
+
+
+@pytest.mark.parametrize("kind", ["merge", "split"])
+async def test_fresh_merge_metadata_records_current_format_version(tmp_path, kind):
+    store_path = tmp_path / f"fresh_{kind}.jsonl"
+    store = SessionStore(store_path)
+    inherited = {"format_version": 1, "session_id": "parent-1"}
+    parents = ["parent-1", "parent-2"]
+    names = ["alice", "bob"]
+    await store.run(_metadata, store, inherited, parents, names, kind, True)
+    await store.run(store.flush)
+    await asyncio.to_thread(store.close, update_status=False)
+
+    assert detect_format_version(store_path) == FORMAT_VERSION
+    verify_store = SessionStore(store_path)
+    try:
+        meta = await verify_store.run(verify_store.load_meta)
+        assert meta.get("format_version") == FORMAT_VERSION
+    finally:
+        await asyncio.to_thread(verify_store.close, update_status=False)
 
 
 @pytest.mark.parametrize("cleanup", ["close", "archive", "owner"])

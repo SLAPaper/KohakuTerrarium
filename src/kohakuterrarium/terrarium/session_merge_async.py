@@ -17,6 +17,7 @@ from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.session_attachment import relocate_topology_selectors
 from kohakuterrarium.session.output import SessionOutput
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.version import FORMAT_VERSION
 from kohakuterrarium.terrarium.session_resources import (
     archive_unpublished_store,
     retain_store,
@@ -47,6 +48,7 @@ def _metadata(store, inherited, parents, names, kind, fresh):
     session_coord._inherit_conversation_lifecycle(
         inherited, store, new_identity=kind == "split" and fresh
     )
+    store.meta["format_version"] = FORMAT_VERSION
     store.meta["parent_session_ids"] = parents
     store.meta["split_at" if kind == "split" else "merged_at"] = time.time()
     store.meta["agents"] = names

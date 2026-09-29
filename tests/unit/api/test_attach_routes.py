@@ -1,7 +1,6 @@
-"""Unit tests for :mod:`kohakuterrarium.api.routes.attach.*`."""
-
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -21,6 +20,15 @@ def _files_client() -> TestClient:
 
 
 class TestAttachFilesRoute:
+    @pytest.fixture
+    def isolated_browse_roots(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            attach_files_mod.workspace_files,
+            "_list_browse_roots",
+            lambda: [tmp_path],
+        )
+        return [tmp_path]
+
     def test_get_tree(self, tmp_path):
         (tmp_path / "f.txt").write_text("hi")
         r = _files_client().get(f"/x/tree?root={tmp_path}")
@@ -33,7 +41,7 @@ class TestAttachFilesRoute:
         assert children["f.txt"]["type"] == "file"
         assert children["f.txt"]["size"] == 2
 
-    def test_browse_directories(self, tmp_path):
+    def test_browse_directories(self, tmp_path, isolated_browse_roots):
         (tmp_path / "sub").mkdir()
         r = _files_client().get(f"/x/browse?path={tmp_path}")
         assert r.status_code == 200

@@ -64,12 +64,16 @@ class SubAgentManager(InteractiveManagerMixin):
         max_depth: int = 3,
         tool_format: str | None = None,
         default_plugin_specs: list[dict[str, Any]] | None = None,
+        strict: bool = False,
+        working_dir: Path | None = None,
     ):
         """Initialize parent resources, depth limits, and job tracking."""
         self.parent_registry = parent_registry
         self.llm = llm
         self.job_store = job_store or JobStore()
         self.agent_path = agent_path
+        self._strict = strict
+        self._working_dir = working_dir
         self._current_depth: int = current_depth
         self._max_depth: int = max_depth
         self._tool_format: str | None = tool_format
@@ -194,7 +198,7 @@ class SubAgentManager(InteractiveManagerMixin):
         effective_tool_format = config.tool_format or self._tool_format
 
         plugin_manager = build_plugin_manager(
-            config, self._loader, self._default_plugin_specs
+            config, self._loader, self._default_plugin_specs, strict=self._strict
         )
         llm = resolve_llm(self.llm, config)
         compact_manager = build_compact_manager(config, llm)
@@ -214,6 +218,12 @@ class SubAgentManager(InteractiveManagerMixin):
 
         # Preserve the legacy shared-budget contract when configured.
         subagent.iteration_budget = self._resolve_child_budget(config)
+        if host is None:
+            try:
+                await self._load_child_plugins(subagent)
+            except BaseException:
+                await plugin_manager.unload_all()
+                raise
 
         if self._on_tool_activity:
             sa_name = name
@@ -355,6 +365,24 @@ class SubAgentManager(InteractiveManagerMixin):
             }
         )
 
+    async def _load_child_plugins(self, subagent) -> None:
+        """Load child policy before execution and release failed startup resources."""
+        try:
+            await load_and_wrap_plugins(
+                subagent.plugins,
+                subagent,
+                subagent.llm,
+                self._working_dir or self.agent_path,
+                strict=self._strict,
+            )
+        except BaseException:
+            if subagent.compact_manager is not None:
+                await subagent.compact_manager.cancel()
+            if subagent.llm is not self.llm:
+                await subagent.llm.close()
+            raise
+        subagent._plugins_loaded = True
+
     async def _run_subagent(
         self,
         job_id: str,
@@ -368,9 +396,8 @@ class SubAgentManager(InteractiveManagerMixin):
                 await settle(
                     receipt, lambda value: setattr(job.subagent, "_run_index", value)
                 )
-            await load_and_wrap_plugins(
-                job.subagent.plugins, job.subagent, job.subagent.llm, self.agent_path
-            )
+            if not getattr(job.subagent, "_plugins_loaded", False):
+                await self._load_child_plugins(job.subagent)
             result = await job.run(task)
             # Result-site hooks may transform output without mutating shared job methods.
             pm = self._parent_plugins

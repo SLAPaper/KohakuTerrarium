@@ -39,6 +39,10 @@ from kohakuterrarium.core.agent_observability import (
 from kohakuterrarium.core.agent_budget_recovery import (
     sync_emergency_drop_conversation,
 )
+from kohakuterrarium.core.branch_continuation import (
+    continue_on_branch,
+    normalize_branch_view,
+)
 from kohakuterrarium.core.compact import CompactConfig, CompactManager
 from kohakuterrarium.core.config import AgentConfig, load_agent_config
 from kohakuterrarium.core.event_inbox import EventInbox, TurnOutcome
@@ -591,14 +595,10 @@ class Agent(
         fresh turn (no explicit re-fire needed). Queued Drive deliveries
         are dropped WITHOUT running and settle as user-interrupted, so the
         dispatcher pauses their drive instead of redelivering."""
-        already_requested = self._interrupt_requested
-        self._interrupt_requested = True
-        self.controller._interrupted = True
-        processing = getattr(self, "_processing_task", None)
-        if processing and not processing.done() and not already_requested:
-            processing.cancel()
-        for job_id in list(self._active_handles.keys()):
-            self._interrupt_direct_job(job_id)
+        active = getattr(self, "_active_event_run", None)
+        if active:
+            active[0].event.context["interrupted_by_user"] = True
+        self._interrupt_active_turn()
         if self.plugins:
             asyncio.create_task(self.plugins.notify("on_interrupt"))
         dropped = self._event_inbox.remove_where(
@@ -620,6 +620,17 @@ class Agent(
                 count=len(dropped),
             )
         logger.info("Agent interrupted", agent_name=self.config.name)
+
+    def _interrupt_active_turn(self) -> None:
+        """Cancel the current controller and its foreground jobs."""
+        already_requested = self._interrupt_requested
+        self._interrupt_requested = True
+        self.controller._interrupted = True
+        processing = getattr(self, "_processing_task", None)
+        if processing and not processing.done() and not already_requested:
+            processing.cancel()
+        for job_id in list(self._active_handles.keys()):
+            self._interrupt_direct_job(job_id)
 
     def _cancel_job(self, job_id: str, job_name: str) -> None:
         """Cancel a single running job by ID (tool or sub-agent).
@@ -819,18 +830,15 @@ class Agent(
         content: str | list[ContentPart],
         source: str = "programmatic",
         pending_id: str | None = None,
+        *,
+        branch_view: dict[int, int] | None = None,
     ) -> bool:
-        """Inject user input programmatically.
+        """Inject input, optionally continuing a selected persisted branch.
 
-        Returns True when the event ran; False when buffered for
-        mid-turn drain — callers (WS attach) skip the post-call
-        ``idle`` frame on False so KohakUwUing stays visible.
-
-        ``pending_id`` lets a shell mint the queued-message id up front
-        (UXI-08a) so it can target the message with ``edit_pending`` /
-        ``cancel_pending`` the moment the queued ack lands. Ignored when
-        the input runs immediately (it was never queued).
+        Returns True for a primary turn; False for buffered mid-turn input.
+        ``pending_id`` identifies buffered input for editing or cancellation.
         """
+        view = normalize_branch_view(branch_view)
         content = await self._prepare_injected_input(content, source)
         if content is None:
             # Slash-command or filter consumed the input — treat the
@@ -839,6 +847,8 @@ class Agent(
         event = create_user_input_event(content, source=source)
         if pending_id:
             event.context["pending_id"] = pending_id
+        if view:
+            return await continue_on_branch(self, event, view)
         return await self._process_event(event)
 
     async def inject_event(self, event: TriggerEvent) -> bool:
@@ -982,12 +992,7 @@ class Agent(
 
 
 async def run_agent(config_path: str) -> None:
-    """
-    Convenience function to run an agent from config path.
-
-    Args:
-        config_path: Path to agent config folder
-    """
+    """Run an agent's autonomous loop from a config folder."""
     config = load_agent_config(config_path)
     agent = Agent(config)
     await agent.run_forever()

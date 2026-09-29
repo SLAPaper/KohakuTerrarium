@@ -15,7 +15,11 @@ from kohakuterrarium.core.pending_input import new_pending_id
 from kohakuterrarium.laboratory.ws_proxy import proxy_ws_to_lab
 from kohakuterrarium.modules.output.event import UIReply
 from kohakuterrarium.studio._runtime import host_engine_or_none
-from kohakuterrarium.studio.attach._event_stream import StreamOutput, get_event_log
+from kohakuterrarium.studio.attach._event_stream import (
+    StreamOutput,
+    get_event_log,
+    model_recovery_snapshot,
+)
 from kohakuterrarium.studio.attach.input_ops import (
     _handle_pending_op,
     _normalize_input_content,
@@ -64,6 +68,7 @@ def _session_info_frame(creature: Any) -> dict[str, Any]:
         "config_ref": getattr(creature, "config_ref", None),
         "max_context": max_context,
         "compact_threshold": compact_at,
+        "model_recovery": model_recovery_snapshot(agent),
         "ts": time.time(),
     }
 
@@ -410,7 +415,12 @@ async def attach_io(
             # Do not block delivery of replies that the injected turn may await.
             task = asyncio.create_task(
                 _process_input(
-                    target_agent, content, queue, target_creature.name, pending_id
+                    target_agent,
+                    content,
+                    queue,
+                    target_creature.name,
+                    pending_id,
+                    branch_view=data.get("branch_view"),
                 )
             )
             input_tasks.append(task)

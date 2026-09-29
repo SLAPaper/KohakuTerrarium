@@ -47,6 +47,8 @@ from kohakuterrarium.session.resume import resume_agent
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.creature_host import Creature
 from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.mcp_server.config import MCPToolsConfig
+from kohakuterrarium.mcp_server.runtime import ToolRuntime
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
 pytestmark = pytest.mark.timeout(60)
@@ -275,6 +277,61 @@ class TestProgCreatureJourney:
         config_path = _write_config(tmp_path / "creature", name="pilot")
         session_path = tmp_path / "pilot.kohakutr.v2"
         out_file = tmp_path / "artifact.txt"
+
+        delegated_models = []
+
+        def delegation_model(_target):
+            model = ScriptedLLM(["delegated first reply", "delegated followup"])
+            delegated_models.append(model)
+            return model
+
+        mcp_config = MCPToolsConfig.model_validate(
+            {
+                "workspace": tmp_path,
+                "tools": [],
+                "delegation": {
+                    "pilot": {"kind": "creature", "config": str(config_path)}
+                },
+            }
+        )
+        async with ToolRuntime(mcp_config, llm_factory=delegation_model) as mcp:
+            delegated = await mcp.delegation.submit(
+                "pilot", "remember delegated context"
+            )
+            assert (await mcp.wait(delegated["job_id"], 10))[
+                "output"
+            ] == "delegated first reply"
+            continued = await mcp.delegation.submit(
+                "pilot",
+                "continue this context",
+                session_id=delegated["session_id"],
+            )
+            assert (await mcp.wait(continued["job_id"], 10))[
+                "output"
+            ] == "delegated followup"
+            assert "remember delegated context" in str(delegated_models[0].call_log[-1])
+            independent = await mcp.delegation.submit("pilot", "independent task")
+            assert (await mcp.wait(independent["job_id"], 10))[
+                "output"
+            ] == "delegated first reply"
+            assert "remember delegated context" not in str(delegated_models[1].call_log)
+            await mcp.delegation.close_session(delegated["session_id"])
+            assert "delegated followup" in str(
+                mcp.delegation.history(
+                    delegated["session_id"],
+                    view="conversation",
+                )
+            )
+        async with ToolRuntime(
+            mcp_config, llm_factory=delegation_model
+        ) as restarted_mcp:
+            assert restarted_mcp.job(delegated["job_id"])["error"] == "Unknown job"
+            with pytest.raises(ValueError, match="Unknown session"):
+                await restarted_mcp.delegation.submit(
+                    "pilot",
+                    "must not restore",
+                    session_id=delegated["session_id"],
+                )
 
         # The controller script for the live phase. Each entry is keyed
         # by a substring of the triggering user turn so the run is
@@ -662,6 +719,18 @@ class TestProgCreatureJourney:
                 rebuilt.get_last_assistant_message().get_text_content()
                 == conv.get_last_assistant_message().get_text_content()
             )
+
+            # Concurrent typed requests survive persistence as separate turns.
+            owned_llm = ScriptedLLM(["owned answer one", "owned answer two"])
+            resumed_agent.llm = owned_llm
+            resumed_agent.controller.llm = owned_llm
+            one, two = await asyncio.gather(
+                resumed_agent.run("owned input one"),
+                resumed_agent.run("owned input two"),
+            )
+            assert (one.text, two.text) == ("owned answer one", "owned answer two")
+            assert owned_llm.call_count == 2
+            assert resumed_agent._turn_index == 4
         finally:
             await resumed_agent.stop()
 
@@ -670,6 +739,12 @@ class TestProgCreatureJourney:
         # ``store=`` sharing param is gone) — read the events out and
         # close the resume handle FIRST so there is a single owner.
         events = resumed_store.get_events("pilot")
+        assert [
+            event["content"]
+            for event in events
+            if event["type"] == "user_input"
+            and str(event["content"]).startswith("owned input")
+        ] == ["owned input one", "owned input two"]
         resumed_store.close()
 
         # FTS keyword search finds the EXACT recorded user turn.

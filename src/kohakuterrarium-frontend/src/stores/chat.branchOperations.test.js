@@ -1,5 +1,4 @@
-import { createPinia, setActivePinia } from "pinia"
-import { beforeEach, describe, expect, it } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { useChatStore } from "./chat.js"
 
@@ -111,5 +110,85 @@ describe("chat branch operation state", () => {
     expect(chat.branchOperationByTab.alpha).toBeNull()
     expect(chat.branchOperationErrorByTab.alpha).toBe("collision")
     expect(chat.branchOperationByTab.beta.type).toBe("regenerate")
+  })
+
+  describe("branch view capture on send", () => {
+    it("rejects an invalid explicit selection without sending on another branch", async () => {
+      const chat = useChatStore()
+      chat.activeTab = "main"
+      chat.tabs = ["main"]
+      chat.messagesByTab = { main: [] }
+      const wsSend = vi.fn()
+      chat._ws = { readyState: WebSocket.OPEN, send: wsSend }
+      for (const view of [{ 1: "wrong" }, { 1: true }, { 0: 1 }, { 1: 0 }]) {
+        chat.branchViewByTab.main = view
+        await expect(chat.send("must not run")).rejects.toThrow(/branch/i)
+        expect(wsSend).not.toHaveBeenCalled()
+        expect(chat.messagesByTab.main).toEqual([])
+      }
+    })
+    it("attaches detached branch_view copy when sending under an older branch view and resists subsequent mutations", async () => {
+      const chat = useChatStore()
+      chat.activeTab = "main"
+      chat.tabs = ["main"]
+      chat.messagesByTab = { main: [] }
+      const wsSend = vi.fn()
+      chat._ws = { readyState: WebSocket.OPEN, send: wsSend }
+
+      chat.selectBranch(1, 1)
+      expect(chat.branchViewByTab.main).toEqual({ 1: 1 })
+
+      await chat.send("continue from branch 1")
+
+      expect(wsSend).toHaveBeenCalledTimes(1)
+      const payload = JSON.parse(wsSend.mock.calls[0][0])
+      expect(payload).toMatchObject({
+        type: "input",
+        target: "main",
+        content: [{ type: "text", text: "continue from branch 1" }],
+        branch_view: { 1: 1 },
+      })
+
+      // Mutating original branchViewByTab after send must not change the payload that was already sent
+      chat.branchViewByTab.main[1] = 99
+      chat.branchViewByTab.main[2] = 42
+      expect(payload.branch_view).toEqual({ 1: 1 })
+    })
+
+    it("keeps branch views isolated across active tabs and omits branch_view when empty", async () => {
+      const chat = useChatStore()
+      chat.tabs = ["alpha", "beta", "gamma"]
+      chat.messagesByTab = { alpha: [], beta: [], gamma: [] }
+      const wsSend = vi.fn()
+      chat._ws = { readyState: WebSocket.OPEN, send: wsSend }
+
+      chat.branchViewByTab = {
+        alpha: { 1: 2 },
+        beta: { 2: 4 },
+        gamma: {},
+      }
+
+      // Send on alpha
+      chat.activeTab = "alpha"
+      await chat.send("msg from alpha")
+      const alphaPayload = JSON.parse(wsSend.mock.calls[0][0])
+      expect(alphaPayload.target).toBe("alpha")
+      expect(alphaPayload.branch_view).toEqual({ 1: 2 })
+
+      // Send on beta
+      chat.activeTab = "beta"
+      await chat.send("msg from beta")
+      const betaPayload = JSON.parse(wsSend.mock.calls[1][0])
+      expect(betaPayload.target).toBe("beta")
+      expect(betaPayload.branch_view).toEqual({ 2: 4 })
+
+      // Send on gamma (empty map) -> legacy payload without branch_view
+      chat.activeTab = "gamma"
+      await chat.send("msg from gamma")
+      const gammaPayload = JSON.parse(wsSend.mock.calls[2][0])
+      expect(gammaPayload.target).toBe("gamma")
+      expect(gammaPayload.branch_view).toBeUndefined()
+      expect("branch_view" in gammaPayload).toBe(false)
+    })
   })
 })

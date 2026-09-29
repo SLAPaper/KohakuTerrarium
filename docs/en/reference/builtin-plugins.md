@@ -114,6 +114,13 @@ plugins:
       blocked_tools: ["web_fetch", "web_search", "bash"]
 ```
 
+For `glob`, the read policy checks the actual `path` (default `.`) using the
+tool's path resolution, including local file URIs. Literal pattern prefixes
+are resolved relative to that base. Enforcing mode rejects absolute patterns
+and parent traversal after wildcard segments; use an explicit allowed `path`
+instead. Audit mode logs violations and off mode bypasses these checks.
+These argument checks do not provide recursive symlink or OS process isolation.
+
 ## `budget`
 
 Multi-axis budget accounting and enforcement.
@@ -137,8 +144,11 @@ work down voluntarily before the hard cap fires.
 
 ### State
 
-State is per-session and namespaced under `plugin:budget:*` in the
-session store, so resume preserves accumulated counts.
+Usage belongs to the live plugin instance. Updating limits preserves
+already-accounted usage and recomputes alarms for changed axes; unchanged
+axes retain their pending alarms. Disabling and re-enabling an axis retains
+its previous count, but work performed while that axis is disabled is not
+counted. These counters are not persisted across process/session resume.
 
 ### Example
 

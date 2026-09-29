@@ -2,10 +2,78 @@
 
 import pytest
 
-from kohakuterrarium.core.branch_edit_prepare import EditRequest, prepare_edit
+from kohakuterrarium.core.branch_edit_prepare import (
+    EditRequest,
+    _message_turn,
+    prepare_edit,
+)
 from kohakuterrarium.core.conversation import ConversationConfig
 from kohakuterrarium.llm.message import Message
+from kohakuterrarium.session.event_origin import EVENT_COORDINATE
 from kohakuterrarium.session.store import SessionStore
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"turn_index": 6, "branch_id": 2, "event_origin": ["source", "alice", 40]},
+        {"turn_index": 6, "branch_id": 2, "event_id": 99},
+        {"turn_index": 6, "branch_id": 2},
+        {},
+    ],
+)
+def test_compacted_user_resolves_by_evidence_not_position(metadata):
+    events = [
+        {
+            "type": "user_message",
+            "content": "older",
+            "turn_index": 1,
+            "branch_id": 1,
+            "event_id": 1,
+        },
+        {
+            "type": "user_message",
+            "content": "retained",
+            "turn_index": 6,
+            "branch_id": 2,
+            "event_id": 99,
+            EVENT_COORDINATE: ["source", "alice", 40],
+        },
+    ]
+    message = Message(role="user", content="retained", metadata=metadata)
+    assert _message_turn(message, events, persisted=True) == 6
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"turn_index": True},
+        {"turn_index": 0},
+        {"turn_index": -1},
+        {"turn_index": "6"},
+        {"turn_index": 6, "branch_id": 9},
+        {"turn_index": 6, "event_id": 123},
+        {"turn_index": 6, "event_origin": ["foreign", "alice", 99]},
+        {},
+    ],
+)
+def test_missing_or_conflicting_user_evidence_never_guesses(metadata):
+    events = [
+        {
+            "type": "user_message",
+            "content": "same",
+            "turn_index": turn,
+            "branch_id": 1,
+            "event_id": turn,
+        }
+        for turn in (1, 6)
+    ]
+    with pytest.raises(ValueError):
+        _message_turn(
+            Message(role="user", content="same", metadata=metadata),
+            events,
+            persisted=True,
+        )
 
 
 @pytest.mark.parametrize("locator", ["index", "turn"])

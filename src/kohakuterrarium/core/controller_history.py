@@ -69,15 +69,18 @@ async def _capture_turn_messages(controller, events, content, skip_empty):
                 if isinstance(identity, dict):
                     message.metadata.update(
                         {
-                            key: identity[key]
-                            for key in ("event_id", "turn_index", "branch_id")
+                            key: deepcopy(identity[key])
+                            for key in (
+                                "event_id",
+                                "turn_index",
+                                "branch_id",
+                                "event_origin",
+                                "user_pair_origin",
+                                "user_pair_id",
+                            )
                             if key in identity
                         }
                     )
-            if handled and primary_identity:
-                for key in ("event_origin", "user_pair_origin", "user_pair_id"):
-                    if key in primary_identity:
-                        message.metadata[key] = deepcopy(primary_identity[key])
             if feedback or receipt is not None:
                 message.metadata["kind"] = (
                     receipt.kind if receipt is not None else TOOL_FEEDBACK_KIND

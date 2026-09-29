@@ -3,6 +3,7 @@
 from copy import deepcopy
 from typing import Any, Iterable
 
+from kohakuterrarium.llm.antigravity_format import replay_target
 from kohakuterrarium.session.compact_coverage import coordinate, make_rule
 from kohakuterrarium.session.event_origin import EVENT_ORIGIN
 from kohakuterrarium.session.feedback_admission import project_feedback_events
@@ -160,7 +161,12 @@ def replay_selected_events(
                 # otherwise delimit the text buffer).
                 _flush_text()
                 if summary:
-                    messages.append({"role": "assistant", "content": summary})
+                    message = {"role": "assistant", "content": summary}
+                    if include_metadata and rule.metadata:
+                        message["metadata"] = {
+                            "compact_coverage": deepcopy(rule.metadata)
+                        }
+                    messages.append(message)
                 pending_rules.pop(i)
                 continue
             if eid > to:
@@ -390,6 +396,7 @@ def replay_selected_events(
                     "reasoning_details",
                     "reasoning",
                     "_kt_assistant_segments",
+                    "_kt_antigravity_content",
                 )
                 if evt.get(key) not in (None, "", [], {})
             }
@@ -402,7 +409,12 @@ def replay_selected_events(
                 ),
                 None,
             )
-            if target is None and linked and reasoning:
+            state = evt.get("_kt_antigravity_content")
+            if state:
+                target = replay_target(messages, target, state)
+                if target is not None:
+                    generations.attach(target, generation_key)
+            elif target is None and linked and reasoning:
                 target = generations.attach(
                     {"role": "assistant", "content": ""}, generation_key
                 )

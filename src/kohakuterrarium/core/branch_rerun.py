@@ -17,6 +17,9 @@ from kohakuterrarium.core.runtime_context import (
 )
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.llm.generation import provider_source
+from kohakuterrarium.session.compact_coverage import coverage_metadata, exact_origins
+from kohakuterrarium.session.event_origin import EVENT_ORIGIN
+from kohakuterrarium.session.history import select_live_event_ids
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -214,10 +217,10 @@ def _commit(agent, capture, branch, request_id, bundle, user_event_id):
     user = capture["messages"][capture["last_user"]]
     metadata = dict(user.metadata)
     metadata.update(turn_index=agent._turn_index, branch_id=branch)
+    for key in ("event_id", "event_origin", "user_pair_id", "user_pair_origin"):
+        metadata.pop(key, None)
     if user_event_id is not None:
-        metadata["event_id"] = user_event_id
-    else:
-        metadata.pop("event_id", None)
+        metadata.update(user_event_id)
     capture["conversation"].truncate_from(capture["last_user"] + 1)
     user.metadata = metadata
     agent._branch_id = branch
@@ -241,7 +244,7 @@ def _commit_edit(agent, capture, edit, request_id, bundle, user_event_id):
             "_history_user_identity": {
                 "turn_index": edit["turn"],
                 "branch_id": edit["branch"],
-                **({"event_id": user_event_id} if user_event_id is not None else {}),
+                **(user_event_id or {}),
             },
         },
         stackable=False,
@@ -262,6 +265,88 @@ def _commit_edit(agent, capture, edit, request_id, bundle, user_event_id):
     agent._runtime_context_bundle = bundle
     agent._installed_runtime_context_bundle = bundle
     return (completion,)
+
+
+def _legacy_baseline(store, prefix, view, message, coverage):
+    """Recover a same-store legacy interval from its selected durable summary."""
+    events = store.get_events(prefix)
+    live_ids = select_live_event_ids(events, branch_view=view)
+    intervals = set()
+    bounds = (
+        coverage.get("replaced_from_event_id"),
+        coverage.get("replaced_to_event_id"),
+    )
+    has_bounds = any(
+        key in coverage for key in ("replaced_from_event_id", "replaced_to_event_id")
+    )
+    if has_bounds and not (
+        all(type(value) is int for value in bounds) and 0 < bounds[0] <= bounds[1]
+    ):
+        raise ValueError("Invalid retained legacy interval")
+    for event in events:
+        if (
+            event.get("type") not in ("compact_complete", "compact_replace")
+            or event.get("event_id") not in live_ids
+            or EVENT_ORIGIN in event
+            or coverage_metadata(event) != coverage_metadata(coverage)
+        ):
+            continue
+        summary = event.get("summary", "") or event.get("summary_text", "")
+        rendered = f"[Previous context summary (compact round {event.get('round')})]\n\n{summary}"
+        if message.content not in (summary, rendered):
+            continue
+        first, last = event.get("replaced_from_event_id"), event.get(
+            "replaced_to_event_id"
+        )
+        if type(first) is int and type(last) is int and 0 < first <= last:
+            if not has_bounds:
+                intervals.add((first, last))
+            elif first <= bounds[0] <= bounds[1] <= last:
+                intervals.add(bounds)
+    if len(intervals) != 1:
+        raise ValueError("Retained legacy summary has no unique local baseline")
+    first, last = intervals.pop()
+    return {"replaced_from_event_id": first, "replaced_to_event_id": last}
+
+
+def _persist_rerun(
+    store, append_pair, prefix, content, turn, branch, path, retained, source_view
+):
+    """Persist the new user and the compact baselines retained by its branch."""
+    baselines = []
+    for message in retained:
+        coverage = (message.metadata or {}).get("compact_coverage")
+        if coverage is None:
+            continue
+        if message.role != "assistant" or not isinstance(message.content, str):
+            raise ValueError("Invalid retained compact summary")
+        origins = exact_origins(coverage)
+        interval = (
+            _legacy_baseline(store, prefix, source_view, message, coverage)
+            if origins is None
+            else {}
+        )
+        baselines.append(
+            {
+                **coverage_metadata(coverage),
+                **interval,
+                "summary": message.content,
+                "compact_path": [*path, (turn, branch)],
+            }
+        )
+    user_event_id = append_pair(
+        store, prefix, {"content": content}, turn, branch, list(path), with_receipt=True
+    )
+    for payload in baselines:
+        store.append_event(
+            prefix,
+            "compact_replace",
+            payload,
+            turn_index=turn,
+            branch_id=branch,
+            parent_branch_path=list(path),
+        )
+    return user_event_id
 
 
 async def _admit(agent, append_pair, request_id, edit=None):
@@ -308,17 +393,27 @@ async def _admit(agent, append_pair, request_id, edit=None):
     user_event_id = None
     try:
         if store is not None:
-            turn, _, path = capture["coordinates"]
+            turn, old_branch, path = capture["coordinates"]
+            source_view = dict((*path, (turn, old_branch)))
             if prepared_edit is not None:
                 turn, path = prepared_edit["turn"], prepared_edit["path"]
+                source_view = prepared_edit["source_view"]
+            retained = (
+                prepared_edit["messages"]
+                if prepared_edit is not None
+                else capture["retained"][:-1]
+            )
             user_event_id = await store.run(
-                append_pair,
+                _persist_rerun,
                 store,
+                append_pair,
                 capture["prefix"],
-                {"content": content},
+                content,
                 turn,
                 branch,
-                list(path),
+                path,
+                retained,
+                source_view,
             )
         if prepared_edit is not None:
             receipt = await owner.submit_internal(

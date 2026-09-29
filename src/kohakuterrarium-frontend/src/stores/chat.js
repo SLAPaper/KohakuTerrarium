@@ -2,6 +2,7 @@ import { ElMessage } from "element-plus"
 import { getCurrentInstance, markRaw, toRaw } from "vue"
 import { extractReasoning } from "@/utils/chatReasoning"
 import { compactProjection } from "@/stores/compactCoverage"
+import { reduceModelRecovery } from "./chatRecovery"
 
 import { injectScope, registerScopeDisposer, scopeOfStoreId } from "@/composables/useScope"
 import { createVisibilityInterval } from "@/composables/useVisibilityInterval"
@@ -296,6 +297,29 @@ export function _parseSlashCommand(content) {
   const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(text)
   if (!match) return null
   return { command: match[1].toLowerCase(), args: match[2] || "" }
+}
+
+function _detachBranchView(rawView) {
+  if (rawView == null) return null
+  if (typeof rawView !== "object" || Array.isArray(rawView)) {
+    throw Error("Invalid branch selection")
+  }
+  const entries = Object.entries(rawView)
+  if (entries.length === 0) return null
+  const snapshot = {}
+  for (const [key, branchId] of entries) {
+    const turnIndex = Number(key)
+    if (
+      !/^[1-9]\d*$/.test(key) ||
+      !Number.isSafeInteger(turnIndex) ||
+      !Number.isSafeInteger(branchId) ||
+      branchId <= 0
+    ) {
+      throw Error("Invalid branch selection")
+    }
+    snapshot[turnIndex] = branchId
+  }
+  return snapshot
 }
 
 function textSignature(content) {
@@ -1931,6 +1955,7 @@ const _chatStoreOptions = {
      * @type {Object<string, boolean>}
      */
     processingByTab: {},
+    modelRecoveryByTab: {},
     /** @type {Object<string, {prompt: number, completion: number, total: number, cached: number}>} Per-source token usage */
     tokenUsage: {},
     /**
@@ -2323,6 +2348,7 @@ const _chatStoreOptions = {
       removeAttentionScope(scopeOfStoreId(this.$id) || "default")
       this.queuedMessagesByTab = {}
       this.processingByTab = {}
+      this.modelRecoveryByTab = {}
       this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
@@ -2687,6 +2713,7 @@ const _chatStoreOptions = {
       if (typeof text === "string" ? !text.trim() : !text.length) return
 
       const tab = this.activeTab
+      const branchView = _detachBranchView(this.branchViewByTab?.[tab])
       const slashCommand = _parseSlashCommand(text)
       if (slashCommand && !tab.startsWith("ch:")) {
         const tabInfo = this.tabs[tab]
@@ -2750,9 +2777,11 @@ const _chatStoreOptions = {
         }
       } else {
         const target = tab
-        this._ws.send(
-          JSON.stringify({ type: "input", target, content: contentParts, event_id: eventId }),
-        )
+        const payload = { type: "input", target, content: contentParts, event_id: eventId }
+        if (branchView) {
+          payload.branch_view = branchView
+        }
+        this._ws.send(JSON.stringify(payload))
         // Flip processing optimistically — the backend's
         // processing_start event will confirm it; this ensures the
         // indicator and interrupt button appear immediately on the
@@ -2869,6 +2898,7 @@ const _chatStoreOptions = {
         if (generation !== this._instanceGeneration || ws !== this._ws) return
         const wasOpen = this.wsStatus === "open"
         this.wsStatus = "reconnecting"
+        this.modelRecoveryByTab = {}
         for (const tab of Object.keys(this.branchOperationByTab)) {
           this._failBranchOperation(tab, "Connection closed before the operation completed.")
         }
@@ -3064,6 +3094,8 @@ const _chatStoreOptions = {
     /** Handle ALL incoming WS messages */
     _onMessage(data) {
       const source = this._tabForSource(data.source || "")
+      if (source) this._updateModelRecovery(source, data)
+      if (data.type === "model_recovery") return
       if (source) {
         if (
           ["ask_text", "confirm", "selection", "card", "ui_supersede", "ui_reply_ack"].includes(
@@ -3411,6 +3443,16 @@ const _chatStoreOptions = {
       }
 
       if (at === "session_info") {
+        if (Object.prototype.hasOwnProperty.call(data, "model_recovery")) {
+          if (data.model_recovery) {
+            this._updateModelRecovery(source, { ...data.model_recovery, type: "model_recovery" })
+          } else if (
+            !this.modelRecoveryByTab[source] ||
+            data.ts >= this.modelRecoveryByTab[source].request_started_at
+          ) {
+            delete this.modelRecoveryByTab[source]
+          }
+        }
         // Session id is global regardless of which creature emitted.
         if (data.session_id) this.sessionInfo.sessionId = data.session_id
         // Model fields are PER CREATURE — key them by the emitting
@@ -4063,6 +4105,25 @@ const _chatStoreOptions = {
         if (latest > 0) return latest === fb
       }
       return true
+    },
+
+    _updateModelRecovery(tab, frame) {
+      if (!tab) return
+      const previous = this.modelRecoveryByTab[tab]
+      const next = reduceModelRecovery(previous, frame)
+      if (!next || next === previous) return
+      this.modelRecoveryByTab[tab] = next
+      if (next.phase) {
+        this.processingByTab[tab] = true
+        if (typeof next.turn_index === "number" && typeof next.branch_id === "number") {
+          this._streamingBranchByTab[tab] = { turnIndex: next.turn_index, branchId: next.branch_id }
+        }
+      }
+    },
+
+    modelRecoveryForTab(tab) {
+      const state = this.modelRecoveryByTab[tab]
+      return state?.phase && this._frameMatchesViewedBranch(tab, state) ? state.phase : null
     },
 
     /**
@@ -5627,6 +5688,7 @@ const _chatStoreOptions = {
       this.queuedMessagesByTab = {}
       this.processingByTab = {}
       this.eventsByTab = {}
+      this.modelRecoveryByTab = {}
       this._localCommandResultsByTab = {}
       this._pendingCommandResultContextsByTab = {}
       this._commandResultDispatchSeq = 0
@@ -5673,6 +5735,7 @@ const _chatStoreOptions = {
       this._historyLoaded = false
       this._wsBuffer = []
       this.branchOperationByTab = {}
+      this.modelRecoveryByTab = {}
       this.branchOperationErrorByTab = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}

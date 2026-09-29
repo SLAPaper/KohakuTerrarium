@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import threading
 import types
 from pathlib import Path
 from typing import Any
@@ -10,17 +11,21 @@ import pytest
 
 from kohakuterrarium.core import tool_output_persistence
 from kohakuterrarium.core.events import EventType
+from kohakuterrarium.core.execution_context import ExecutionBinding
 from kohakuterrarium.core.executor import Executor
 from kohakuterrarium.core.job import JobState, JobStore
+from kohakuterrarium.modules.plugin.manager import PluginManager
 from kohakuterrarium.modules.tool.base import (
     BaseTool,
     ExecutionMode,
     ToolConfig,
+    ToolContext,
     ToolResult,
 )
 from kohakuterrarium.llm.message import ImagePart
 from kohakuterrarium.modules.tool.media_policy import MediaPolicy
 from kohakuterrarium.parsing.events import ToolCallEvent
+from kohakuterrarium.session.store import SessionStore
 
 # ── tool fixtures ────────────────────────────────────────────────
 
@@ -263,6 +268,45 @@ class TestSubmitWaitFor:
             "/api/sessions/session-1/artifacts/generated_images/"
         )
         assert list((tmp_path / "generated_images").glob("*.png"))
+
+    async def test_explicit_binding_persists_images_on_its_store_worker(
+        self, tmp_path, monkeypatch
+    ):
+        store = SessionStore(tmp_path / "bound.kohakutr")
+        try:
+            worker = await store.run(threading.get_ident)
+            written = []
+            original = store.write_artifact
+
+            def record(filename, data):
+                assert threading.get_ident() == worker
+                path = original(filename, data)
+                written.append(path)
+                return path
+
+            monkeypatch.setattr(store, "write_artifact", record)
+            binding = ExecutionBinding(
+                context=ToolContext(
+                    agent_name="mcp", session=None, working_dir=tmp_path
+                ),
+                plugins=PluginManager(),
+                artifact_store=store,
+            )
+            ex = Executor(binding=binding, queue_completion_events=False)
+            ex._agent = types.SimpleNamespace(
+                session_store=_ArtifactStore(tmp_path / "unrelated")
+            )
+            ex.register_tool(_GeneratedImageTool())
+            result = await ex.wait_for(await ex.submit("generated_image", {}))
+            assert result.success
+            assert len(written) == 1
+            assert written[0].read_bytes() == b"IMAGE"
+            assert result.output[0].url.startswith(
+                f"/api/sessions/{store.session_id}/artifacts/generated_images/"
+            )
+            assert not (tmp_path / "unrelated").exists()
+        finally:
+            store.close(update_status=False)
 
     async def test_tool_media_policy_skips_persistence_and_reaches_metadata(
         self, tmp_path
@@ -1062,3 +1106,92 @@ class TestToolContextBuild:
         jid = await ex.submit("needs", {})
         await ex.wait_for(jid)
         assert captured["services"] == {"db": "sqlite-conn"}
+
+
+class TestCompletionQueuePolicy:
+    @pytest.mark.parametrize("bound", [True, False])
+    @pytest.mark.parametrize("queue_enabled", [True, False])
+    @pytest.mark.parametrize(
+        "outcome",
+        ["success", "failure", "exception", "cancel", "cancel_before_start", "direct"],
+    )
+    async def test_completion_delivery(self, tmp_path, bound, queue_enabled, outcome):
+        class RaisesOnExecute(_FailTool):
+            async def execute(self, args, **kwargs):
+                raise RuntimeError("uncaught tool failure")
+
+        seen = []
+        binding = (
+            ExecutionBinding(
+                context=ToolContext(
+                    agent_name="mcp", session=None, working_dir=tmp_path
+                ),
+                plugins=PluginManager(),
+                job_namespace="workspace_runtime",
+            )
+            if bound
+            else None
+        )
+        ex = Executor(
+            on_complete=seen.append,
+            binding=binding,
+            queue_completion_events=queue_enabled,
+        )
+        tool = (
+            _SlowTool()
+            if outcome.startswith("cancel")
+            else (
+                RaisesOnExecute()
+                if outcome == "exception"
+                else _FailTool() if outcome == "failure" else _EchoTool()
+            )
+        )
+        ex.register_tool(tool)
+        job = await ex.submit(
+            tool.tool_name,
+            {"msg": "payload", "seconds": 10},
+            is_direct=outcome == "direct",
+        )
+        prefix = "workspace_runtime_" if bound else ""
+        assert job.startswith(f"{prefix}{tool.tool_name}_")
+        if outcome.startswith("cancel"):
+            if outcome == "cancel":
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            assert await ex.cancel(job)
+        await ex.wait_for(job)
+        await asyncio.sleep(0)
+        result = ex.get_result(job)
+        assert result is not None
+        if outcome.startswith("cancel"):
+            assert ex.get_status(job).state == JobState.CANCELLED
+        elif outcome in ("failure", "exception"):
+            assert result.error
+        else:
+            assert result.output == "payload"
+        assert len(seen) == (0 if outcome == "direct" else 1)
+        queued = ex.get_next_event_nowait()
+        if queue_enabled and outcome != "direct":
+            assert queued is seen[0]
+        else:
+            assert queued is None
+        assert ex.get_next_event_nowait() is None
+
+    async def test_callback_only_does_not_retain_completed_payloads(self):
+        completions = 0
+
+        def completed(event):
+            nonlocal completions
+            completions += 1
+            assert len(event.content) == 4096
+
+        ex = Executor(
+            JobStore(max_completed=2), completed, queue_completion_events=False
+        )
+        ex.register_tool(_EchoTool())
+        for _ in range(250):
+            job = await ex.submit("echo", {"msg": "x" * 4096})
+            assert (await ex.wait_for(job)).output == "x" * 4096
+        assert completions == 250
+        assert ex._event_queue.qsize() == 0
+        assert len(ex.job_store.get_completed_jobs()) == 2

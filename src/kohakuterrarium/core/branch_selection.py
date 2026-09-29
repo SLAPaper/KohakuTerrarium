@@ -168,6 +168,11 @@ def _capture(agent: Any, view: dict[int, int] | None) -> _SelectionRequest:
 
 async def select_branch(agent: Any, branch_view: dict[int, int] | None = None) -> int:
     """Select a persisted branch while locally idle. Returns the live message count."""
+    return await _select_branch(agent, branch_view)
+
+
+async def _select_branch(agent, branch_view, continuation=None):
+    """Publish a selection and its optional continuation in one owner commit."""
     _reject_not_idle(agent)
     require_history_selection_available(agent)
     gate = getattr(agent, "_history_selection_request_lock", None)
@@ -183,13 +188,18 @@ async def select_branch(agent: Any, branch_view: dict[int, int] | None = None) -
         if lock is not None:
             await lock.acquire()
         agent._history_selection_pending = True
+        ready = asyncio.Event() if continuation is not None else None
+        if ready is not None:
+            agent._history_rerun_ready = ready
         try:
             task = asyncio.create_task(
-                _run_selection(agent, view),
+                _run_selection(agent, view, continuation),
                 name=f"history_selection_{agent.config.name}",
             )
         except BaseException:
             agent._history_selection_pending = False
+            if ready is not None:
+                ready.set()
             if lock is not None and lock.locked():
                 lock.release()
             raise
@@ -200,6 +210,8 @@ async def select_branch(agent: Any, branch_view: dict[int, int] | None = None) -
         if getattr(agent, "_history_selection_task", None) is task and task.done():
             agent._history_selection_task = None
         agent._history_selection_pending = False
+        if ready is not None:
+            ready.set()
         if lock is not None and lock.locked():
             lock.release()
 
@@ -225,7 +237,9 @@ async def _join_accepted(task: asyncio.Task) -> Any:
     return result
 
 
-async def _run_selection(agent: Any, view: dict[int, int] | None) -> int:
+async def _run_selection(
+    agent: Any, view: dict[int, int] | None, continuation=None
+) -> int:
     lock = getattr(agent, "_processing_lock", None)
     previous = getattr(agent, "_turn_lock_holder", None)
     if lock is not None:
@@ -234,7 +248,7 @@ async def _run_selection(agent: Any, view: dict[int, int] | None) -> int:
         request = await _await_owner(
             agent._session_state_owner.submit_internal(lambda: _capture(agent, view))
         )
-        return await _select_locked(agent, request)
+        return await _select_locked(agent, request, continuation)
     finally:
         if (
             lock is not None
@@ -243,9 +257,11 @@ async def _run_selection(agent: Any, view: dict[int, int] | None) -> int:
             agent._turn_lock_holder = previous
 
 
-async def _select_locked(agent: Any, request: _SelectionRequest) -> int:
+async def _select_locked(
+    agent: Any, request: _SelectionRequest, continuation=None
+) -> int:
     prepared = await request.store.run(_prepare_on_worker, request)
-    await _publish_on_owner(agent, request, prepared)
+    await _publish_on_owner(agent, request, prepared, continuation)
     return int(prepared["count"])
 
 
@@ -354,7 +370,7 @@ def _validate_prepared(prepared: dict[str, Any], request: _SelectionRequest) -> 
 
 
 async def _publish_on_owner(
-    agent: Any, request: _SelectionRequest, prepared: dict[str, Any]
+    agent: Any, request: _SelectionRequest, prepared: dict[str, Any], continuation=None
 ) -> None:
     owner = agent._session_state_owner
     bundle = await _await_owner(
@@ -363,9 +379,13 @@ async def _publish_on_owner(
     try:
         await request.store.run(_persist_on_worker, request, prepared)
         prepared["persisted"] = True
-        await _await_owner(
-            owner.submit_internal(lambda: _bind(agent, request, prepared, bundle))
-        )
+
+        def publish():
+            _bind(agent, request, prepared, bundle)
+            if continuation is not None:
+                agent._event_inbox.put_front([continuation])
+
+        await _await_owner(owner.submit_internal(publish))
         prepared["published"] = True
     except BaseException:
         # A failed multi-key save can already be partial on disk. Fail closed.

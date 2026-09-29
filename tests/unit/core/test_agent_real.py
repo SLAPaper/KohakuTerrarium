@@ -4098,11 +4098,10 @@ class TestRunControllerLoopInterruptAtTop:
 
 
 class TestInterruptQueueHandoff:
-    async def test_interrupt_handoff_keeps_user_and_background_together(
-        self, make_agent
-    ):
+    async def test_interrupt_leaves_handoff_for_the_consumer(self, make_agent):
         agent = make_agent()
         await agent.start()
+        agent.pause()
         try:
             interrupted = create_user_input_event("active")
             interrupted.context["interrupted_by_user"] = True
@@ -4120,11 +4119,9 @@ class TestInterruptQueueHandoff:
             agent._process_batch_with_controller = fake_process  # type: ignore[method-assign]
             await agent._run_turn_for_batch([EventEnvelope(interrupted)])
 
-            assert rounds == [
-                ["user_input"],
-                ["user_input", "tool_complete"],
-            ]
-            assert len(agent._event_inbox) == 0
+            # The consumer owns the next claim; no recursive turn or FIFO bypass.
+            assert rounds == [["user_input"]]
+            assert agent._event_inbox.drain_all() == [queued_user, background]
         finally:
             await agent.stop()
 
@@ -4553,7 +4550,7 @@ class TestOpportunisticInputInjection:
         finally:
             await agent.stop()
 
-    async def test_drain_claims_awaited_background_and_fifo_tail(self, make_agent):
+    async def test_drain_preserves_awaited_boundary_and_fifo_tail(self, make_agent):
         agent = make_agent()
         await agent.start()
         try:
@@ -4576,19 +4573,10 @@ class TestOpportunisticInputInjection:
 
             drained = await agent._drain_mid_turn_pending_inputs(agent.controller)
 
-            assert drained == 3
-            assert agent._active_event_run == [first, awaited, background, tail]
-            assert agent._active_event_captures == [capture]
-            assert len(agent._event_inbox) == 0
-            content = "\n".join(
-                getattr(message, "content", "")
-                for message in agent.controller.conversation.get_messages()
-            )
-            assert (
-                content.index("queued user")
-                < content.index("background done")
-                < content.index("tail user")
-            )
+            assert drained == 0
+            assert agent._active_event_run == [first]
+            assert agent._active_event_captures == []
+            assert agent._event_inbox.drain_all() == [awaited, background, tail]
             assert not awaited.future.done()
         finally:
             await agent.stop()

@@ -227,6 +227,8 @@ class TerrariumRuntimeAdapter:
         if not provider:
             return
         backend_type = profile.get("backend_type") or provider
+        if backend_type == "google-antigravity":
+            raise ValueError("Antigravity: local_host_only")
         set_remote_backend(
             LLMBackend(
                 name=provider,
@@ -385,6 +387,9 @@ class TerrariumRuntimeAdapter:
                 # The tee keeps worker persistence and the controller mirror consistent.
                 if self._session_attacher is not None:
                     self._session_attacher.attach(creature.creature_id)
+                    store = self._engine._session_stores.get(creature.graph_id)
+                    if store is not None:
+                        await self._engine.attach_session(creature.graph_id, store)
                 return {"creature_info": pack_creature_info(creature_to_info(creature))}
 
             case "remove_creature":

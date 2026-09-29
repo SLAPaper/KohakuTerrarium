@@ -263,8 +263,13 @@ async def test_unrelated_completion_is_rejected_before_conversation(
             async with agent._processing_lock:
                 agent._event_inbox.put(envelope)
                 assert await agent._drain_mid_turn_pending_inputs(agent.controller) == 0
-        else:
-            await agent._run_turn_for_batch([envelope])
+                assert not future.done()
+                assert agent._event_inbox.drain_all() == [envelope]
+                assert agent.controller.conversation.to_json() == before
+                agent._event_inbox.put(EventEnvelope(deepcopy(event)))
+                assert await agent._drain_mid_turn_pending_inputs(agent.controller) == 0
+                assert agent._event_inbox.empty()
+        await agent._run_turn_for_batch([envelope])
         assert future.done()
         assert future.result().was_primary is False
         assert agent.controller.conversation.to_json() == before

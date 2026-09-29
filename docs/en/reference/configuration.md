@@ -235,23 +235,85 @@ beyond them; upstream generation deadlines still apply.
 
 Boolean values, nonfinite numbers, zero or negative limits, and unrelated
 connection arguments such as `proxy` or `additional_headers` are rejected.
-These options do not change the SDK's outgoing failed-send queue or the retry
-policy. For ordinary Responses requests, a transport failure before the first
-server event permits one reconnect and full-history resend. This applies to
-requests without tools or with only client-executed function tools. The original
-generation may already have started, so this bounded retry can duplicate remote
-generation; it is not an exactly-once guarantee.
+Recovery is enabled with WebSocket mode. Before the provider delivers nonempty
+text to its caller (normally the controller), a transport failure or
+`websocket_connection_limit_reached` permits at most one uncertain replay on a
+fresh connection with full history. Internal metadata such as `response.created`,
+reasoning, and buffered client function calls do not end this window; failed
+attempt state is discarded. Tools allow request replay by default, including
+image generation and unrecognized server tool types. The original generation may already have started,
+so this bounded retry can duplicate remote generation; it is not an exactly-once
+guarantee.
 
-Any server event, including `response.created`, ends that retry window. Partial
-output, cancellation, explicit server errors, and submitted requests with
-server-executed tools or `background: true` are not automatically replayed.
+Delivered text ends the retry window, even if it has not appeared in the UI:
+the controller can already have executed commands or dispatched tools from it.
+Cancellation and terminal server errors stop recovery. Submitted requests with
+`background: true`, or a server-executed tool explicitly declaring
+`request_replay: forbid`, are not automatically replayed after an uncertain
+failure. A tool-start event need not have arrived for that protection to apply.
 Explicit protocol, policy, message-size, and application-specific WebSocket
 close codes are also terminal; retry does not bypass those limits.
-An explicit `previous_response_not_found` still permits full-history recovery.
+An explicit `previous_response_not_found` rejecting a delta before response
+events permits immediate full-history recovery. Connection expiry also recovers
+immediately; transient transport errors use the retry policy's backoff and jitter.
+Expired connections are closed even when replay is disallowed.
+
+Tool integrations must declare `request_replay: forbid` when repeating server
+execution could cause unacceptable side effects. This is permission to resubmit
+the model request, not an assertion of mathematical idempotence, a local tool
+retry, or a retry of the whole user turn. Client function calls remain buffered
+until a successful response, so their declarations do not block model replay
+before delivery. Direct users of `ResponsesWSSession.stream_turn()` receive raw
+events: any yielded event closes their replay window.
+
+An implementation can set the `BaseTool.request_replay` class attribute to
+`"allow"` or `"forbid"`. Configuration overrides that default in either direction:
+
+```yaml
+tools:
+  - name: image_gen
+    type: builtin
+    options:
+      request_replay: forbid
+```
+
+Programmatic construction uses `ImageGenTool(config=ToolConfig(request_replay="forbid"))`.
+Both classes are available from `kohakuterrarium.builtins.tools.image_gen` and
+`kohakuterrarium.modules.tool.base`, respectively. Custom and package tool
+configuration accepts the same reserved option without forwarding it to the
+tool constructor. There is no Studio control for this field.
+
+Raw `extra_body.tools` entries can also carry `request_replay: allow | forbid`.
+Only the final selected tool list governs WebSocket recovery. The framework
+removes this field from outgoing HTTP and WebSocket tool specifications;
+invalid declarations are rejected. The selected policy is fixed for the
+request's WebSocket attempts; edits apply to subsequent requests.
+
+The default `image_gen` policy accepts possible duplicate generation, additional
+cost, and different output on replay. Images from failed WebSocket attempts are
+discarded, and image results are published only after the successful attempt.
+Merely supporting the Responses background API does not enable background mode.
+Only an actual top-level `background: true` request activates that separate guard.
+
+Recovery-stop logs include `stop_reason`, `blocked_tools`, `max_retries`,
+`submissions`, `uncertain_replays`, and delivery/event state, distinguishing a
+tool-policy block from a spent recovery budget.
+
+`retry_policy.max_retries` bounds extra submissions for the entire logical
+request, including cache recovery and HTTP fallback. Zero disables automatic
+retries. HTTP fallback disables hidden SDK retries so all submissions share the
+same budget. No new total generation deadline is imposed.
 Once a send has been attempted, exhausting the reconnect does not fall through
 to HTTP or the provider's additional retries, even if the reconnect itself
 failed before sending. Failures entirely before submission retain connection
-retry and HTTP-fallback behavior.
+retry and HTTP-fallback eligibility, as does the existing busy-session HTTP path.
+After fallback, retries stay on HTTP. Ordinary HTTP-only mode is unchanged.
+
+Studio shows a transient model-connection recovery or retry-wait label in the
+existing generation indicator, retaining the background-job count. It returns
+to generation on the next attempt's first normal response event and clears on
+completion, failure, or cancellation. It is scoped to the main controller of the
+current creature and branch, restored on attach, and never added to chat history.
 
 ### Input
 
@@ -733,9 +795,11 @@ runtime:
 registrations:
   generic:                        # a registration is keyed by its stable name
     enabled: true
+    unconditional_wake: false     # keep waiting until conditions or explicit resume
     options: {}
   goal:
     enabled: false                # installed != enabled (see below)
+    unconditional_wake: false
     options: {}
 ```
 
@@ -766,13 +830,41 @@ is already active.
 ### `registrations`: installed is not enabled
 
 Each key under `registrations` is a registration's stable **name** with
-`{ enabled: bool, options: {...} }`. A registration must be **installed**
+`{ enabled: bool, unconditional_wake: bool, options: {...} }`. A registration must be **installed**
 (declared by a package's [`drive_registrations:`](#package-manifest-kohakuyaml)
 manifest slot, or passed directly to `Terrarium`) *and* enabled here
 before its `kind` can be created, validated, projected, or scheduled.
 Installation alone never enables anything. Enabling the runtime with no
 enabled registration is rejected. Only enabled registrations are
 imported and only they contribute prompt prose.
+
+`unconditional_wake` is a framework policy, separate from extension `options`.
+It defaults to `false`: without `not_before` or `dependency_ids`, a Drive stays
+`waiting` until explicitly resumed. Set it to `true` to retain legacy automatic
+`waiting` → `active` transitions for that registration's kind. Explicit time and
+dependency conditions still gate the transition; `paused` and delivery readiness
+are unaffected. Readiness callbacks continue receiving active records, even if
+their own delivery condition is not yet satisfied.
+
+Settings → Drives exposes **Auto-wake without conditions** on each registration
+card. **Save** persists the choice; **Apply** publishes a new running registry
+snapshot without a restart when only this policy changes. Disabling a registration
+or changing runtime tuning retains the existing restart rules.
+
+For an explicitly constructed engine, configure the registration before passing it
+to `Terrarium(drive_registrations=[registration])`:
+
+```python
+from kohakuterrarium.terrarium.drive.registration_options import (
+    apply_registration_wake_policy,
+)
+
+apply_registration_wake_policy(registration, unconditional_wake=True)
+```
+
+The helper does not invoke the extension's `configure()` hook. An existing
+engine keeps its current policy until `engine.reconfigure_drives([...])` builds
+a new snapshot; changing an instance alone does not alter a running snapshot.
 
 ### Save is not apply
 

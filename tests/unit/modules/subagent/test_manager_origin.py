@@ -5,8 +5,11 @@ from copy import deepcopy
 
 import pytest
 
+from kohakuterrarium import Agent
+from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.core.job import JobState
 from kohakuterrarium.core.registry import Registry
+from kohakuterrarium.modules.plugin.base import BasePlugin
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
 from kohakuterrarium.modules.subagent.manager import (
     SubAgentManager,
@@ -42,46 +45,54 @@ async def test_cancel_before_runner_entry_finishes_status():
 
 
 @pytest.mark.parametrize("cancel", [False, True])
-async def test_plugin_initialization_is_a_registered_job(monkeypatch, cancel):
+async def test_plugin_initialization_is_a_registered_job(tmp_path, cancel):
     entered, release = asyncio.Event(), asyncio.Event()
 
-    class Plugins:
+    class StartupPlugin(BasePlugin):
+        name = "startup_origin_probe"
+
         def __init__(self):
+            super().__init__()
             self.unloaded = 0
 
-        async def load_all(self, context):
+        async def on_load(self, context):
             entered.set()
             await release.wait()
             raise RuntimeError("plugin load failed")
 
-        async def unload_all(self):
+        async def on_unload(self):
             self.unloaded += 1
 
-    plugins = Plugins()
-    monkeypatch.setattr(
-        "kohakuterrarium.modules.subagent.manager.build_plugin_manager",
-        lambda *args: plugins,
+    plugin = StartupPlugin()
+    provider = ScriptedLLM(["must not run"])
+    agent = await Agent.build(
+        AgentConfig(name="parent", agent_path=tmp_path), llm=provider, io="headless"
     )
-    manager = SubAgentManager(Registry(), ScriptedLLM(["must not run"]))
+    await agent.start()
+    manager = agent.subagent_manager
+    manager._strict = True
     manager.register(SubAgentConfig(name="child", default_plugins=False))
     context = {
         "origin": {"turn_index": 1, "parent_branch_path": []},
         "tool_call_id": "provider",
     }
     expected = deepcopy(context)
-    spawning = asyncio.create_task(
-        manager.spawn(
+    try:
+        job_id = await manager.spawn(
             "child", "work", job_id="agent_child_one", completion_context=context
         )
-    )
-    try:
-        await asyncio.wait_for(entered.wait(), 3)
+        manager._jobs[job_id].subagent.plugins.register(plugin)
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+        except TimeoutError:
+            pytest.fail(
+                f"Plugin startup never entered: {manager.get_result('agent_child_one')}"
+            )
         status = manager.job_store.get_status("agent_child_one")
         assert status is not None
         assert status.context == expected
         context["origin"]["turn_index"] = 99
-        assert spawning.done()
-        job_id = await spawning
+        assert provider.call_count == 0
         if cancel:
             manager._tasks[job_id].cancel()
         else:
@@ -92,8 +103,8 @@ async def test_plugin_initialization_is_a_registered_job(monkeypatch, cancel):
             JobState.CANCELLED if cancel else JobState.ERROR
         )
         assert manager.job_store.get_status(job_id).context == expected
-        assert plugins.unloaded == 1
+        assert plugin.unloaded == 1
+        assert provider.call_count == 0
     finally:
         release.set()
-        await asyncio.gather(spawning, return_exceptions=True)
-        await manager.cancel_all()
+        await agent.stop()

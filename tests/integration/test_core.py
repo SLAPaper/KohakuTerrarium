@@ -614,6 +614,7 @@ class TestCoreIntegration:
                     break
                 await asyncio.sleep(0.02)
             assert "background acknowledged" in _assistant_text(agent)
+            assert agent.executor._event_queue.qsize() == 0
             assert all(
                 sum(m.get("content") == hint for m in call) == 1
                 for call in agent.llm.call_log[:4]
@@ -1773,6 +1774,38 @@ class TestCoreIntegration:
                 sum(m.get("content") == "fourth answer" for m in restored_messages) == 1
             )
             assert not any(m.get("content") == "first" for m in restored_messages)
+            restored_agent = restored.agent
+            original_view = dict(restored_agent._parent_branch_path)
+            original_view[restored_agent._turn_index] = restored_agent._branch_id
+            messages = restored_agent.controller.conversation.get_messages()
+            target_index = max(
+                i for i, message in enumerate(messages) if message.role == "user"
+            )
+            assert await restored_agent.edit_and_rerun(
+                target_index, "edit restored compact tail"
+            )
+            await restored_agent.regenerate_last_response()
+            edited_view = dict(restored_agent._parent_branch_path)
+            edited_view[restored_agent._turn_index] = restored_agent._branch_id
+            await restored_agent.select_branch(original_view)
+            assert (
+                "edit restored compact tail"
+                not in restored_agent.controller.conversation.to_json()
+            )
+            await restored_agent.select_branch(edited_view)
+            await restored.run("continue edited compact tail")
+            assert "nested durable compact summary" in str(continued_llm.last_messages)
+            assert "edit restored compact tail" in str(continued_llm.last_messages)
+            assert not any(
+                m.get("content") in ("first", "continue compacted history")
+                for m in continued_llm.last_messages
+            )
+            persisted = await restored_agent.session_store.run(
+                restored_agent.session_store.load_conversation,
+                restored_agent.config.name,
+            )
+            assert "edit restored compact tail" in str(persisted)
+            assert "nested durable compact summary" in str(persisted)
 
         class RefreshDuringRequest(BasePlugin):
             name = "refresh_during_request"
@@ -2094,6 +2127,46 @@ class TestCoreIntegration:
                 r for jid, r in all_results.items() if jid.startswith("bgboom_")
             )
             assert "background-kaboom" in (bgboom_result.error or "")
+
+            # Awaited requests retain ownership while a real DIRECT job runs.
+            owned_llm = ScriptedLLM(
+                [
+                    ScriptEntry("[/block][block/]", match="owned blocking"),
+                    ScriptEntry("must not execute", match="withdrawn request"),
+                    ScriptEntry("owned answer one", match="owned input one"),
+                    ScriptEntry("owned answer two", match="owned input two"),
+                ]
+            )
+            agent.llm = owned_llm
+            agent.controller.llm = owned_llm
+            block.started.clear()
+            owner = asyncio.create_task(agent.run("owned blocking"))
+            try:
+                await asyncio.wait_for(block.started.wait(), 5)
+                withdrawn = await agent.run(
+                    "withdrawn request", timeout=0.05, raise_on_error=False
+                )
+                assert withdrawn.status == "timeout"
+                assert not owner.done()
+                assert owned_llm.call_count == 1
+                owner.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await owner
+                assert not agent.is_processing
+                one, two = await asyncio.gather(
+                    agent.run("owned input one"), agent.run("owned input two")
+                )
+                assert (one.text, two.text) == ("owned answer one", "owned answer two")
+                assert owned_llm.call_count == 3
+                assert all(
+                    "withdrawn request" not in str(message.get("content", ""))
+                    for call in owned_llm.call_log
+                    for message in call
+                )
+            finally:
+                if not owner.done():
+                    owner.cancel()
+                await asyncio.gather(owner, return_exceptions=True)
 
     async def test_history_ops(self, make_creature, tmp_path, monkeypatch):
         """One workflow over the three history operations: run a turn,

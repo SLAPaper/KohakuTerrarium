@@ -5,6 +5,7 @@ import base64
 import hashlib
 import re
 import tempfile
+from contextlib import aclosing
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -402,6 +403,12 @@ class Controller:
 
         return user_content, combined_text
 
+    def _chat_with_recovery(
+        self, messages: list[dict], **kwargs: Any
+    ) -> AsyncIterator[str]:
+        """Bind this controller's output router to its model request."""
+        return recovery_chat(self, messages, **kwargs)
+
     async def _run_native_completion(
         self, messages: list[dict], tool_schemas: "list[ToolSchema]"
     ) -> AsyncIterator[ParseEvent]:
@@ -419,20 +426,21 @@ class Controller:
 
         await start_generation(self)
         with time_llm_call(self.llm) as _t:
-            async for chunk in recovery_chat(
-                self,
-                messages,
-                stream=True,
-                tools=tool_schemas or None,
-                provider_native_tools=provider_native_tools or None,
-            ):
-                if self._interrupted:
-                    _t.status = "interrupted"
-                    break
-                assistant_content += chunk
-                if chunk:
-                    yield TextEvent(text=chunk)
-
+            async with aclosing(
+                self._chat_with_recovery(
+                    messages,
+                    stream=True,
+                    tools=tool_schemas or None,
+                    provider_native_tools=provider_native_tools or None,
+                )
+            ) as stream:
+                async for chunk in stream:
+                    if self._interrupted:
+                        _t.status = "interrupted"
+                        break
+                    assistant_content += chunk
+                    if chunk:
+                        yield TextEvent(text=chunk)
         self._log_token_usage()
 
         # Materialize binary output before recording it so the conversation
@@ -562,25 +570,28 @@ class Controller:
 
         await start_generation(self)
         with time_llm_call(self.llm) as _t:
-            async for chunk in recovery_chat(
-                self,
-                messages,
-                stream=True,
-                provider_native_tools=provider_native_tools or None,
-            ):
-                if self._interrupted:
-                    _t.status = "interrupted"
-                    break
-                assistant_content += chunk
+            async with aclosing(
+                self._chat_with_recovery(
+                    messages,
+                    stream=True,
+                    provider_native_tools=provider_native_tools or None,
+                )
+            ) as stream:
+                async for chunk in stream:
+                    if self._interrupted:
+                        _t.status = "interrupted"
+                        break
+                    assistant_content += chunk
 
-                for event in self._parser.feed(chunk):
-                    if isinstance(event, CommandEvent):
-                        text, result_event = await self._execute_command_inline(event)
-                        assistant_content += text
-                        yield result_event
-                    else:
-                        yield event
-
+                    for event in self._parser.feed(chunk):
+                        if isinstance(event, CommandEvent):
+                            text, result_event = await self._execute_command_inline(
+                                event
+                            )
+                            assistant_content += text
+                            yield result_event
+                        else:
+                            yield event
             # Flush remaining parser state
             for event in self._parser.flush():
                 if isinstance(event, CommandEvent):

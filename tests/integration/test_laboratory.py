@@ -14,6 +14,7 @@ import asyncio
 
 import pytest
 
+from kohakuterrarium.api.routes.identity.grok import grok_usage
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.laboratory.config import ClientConfig, HostConfig
@@ -27,6 +28,7 @@ from kohakuterrarium.laboratory._internal.transport_inproc import InProcTranspor
 from kohakuterrarium.laboratory.adapters import (
     StudioCatalogAdapter,
     StudioDeployAdapter,
+    StudioIdentityAdapter,
     StudioSettingsAdapter,
     TerrariumAttachAdapter,
     TerrariumBroadcastAdapter,
@@ -44,6 +46,10 @@ from kohakuterrarium.llm.api_keys import (
     register_api_key_resolver,
 )
 from kohakuterrarium.studio.nodes import NodeMap
+from kohakuterrarium.studio.studio import Studio
+from kohakuterrarium.studio.sessions import lifecycle as session_lifecycle
+from kohakuterrarium.session.readonly import read_session_meta
+from kohakuterrarium.terrarium.graph_manifest import MANIFEST_KEY
 from kohakuterrarium.studio.catalog.packages import install_package_op
 from kohakuterrarium.terrarium import Terrarium
 from kohakuterrarium.terrarium.drive.config import (
@@ -60,6 +66,17 @@ from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest
 from kohakuterrarium.terrarium.multi_node_service import MultiNodeTerrariumService
 from kohakuterrarium.terrarium.service import LocalTerrariumService
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
+
+from tests.helpers.grok_usage_script import (
+    FAKE_ACCESS,
+    assert_empty,
+    assert_usage_ok,
+    billing_body,
+    install_billing_script,
+    install_grok_home,
+    patch_cli_version_probe,
+    write_cli_auth,
+)
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -220,6 +237,30 @@ class TestLaboratoryMultiNodeService:
         service.add_remote("w2")
 
         try:
+            with monkeypatch.context() as usage_patch:
+                grok_home = install_grok_home(tmp_path, usage_patch)
+                patch_cli_version_probe(usage_patch)
+                billing = install_billing_script(usage_patch)
+                identity_adapter = StudioIdentityAdapter(w1_client)
+                try:
+                    assert_empty(
+                        await grok_usage(node="w1", service=service), "not_logged_in"
+                    )
+                    write_cli_auth(grok_home, FAKE_ACCESS)
+                    billing.push(200, billing_body(1.0))
+                    assert_usage_ok(await grok_usage(node="w1", service=service), 1.0)
+                    billing.push(503)
+                    assert_empty(
+                        await grok_usage(node="w1", service=service), "unavailable"
+                    )
+                    (grok_home / "auth.json").unlink()
+                    assert_empty(
+                        await grok_usage(node="w1", service=service), "not_logged_in"
+                    )
+                    assert len(billing.requests) == 2
+                finally:
+                    identity_adapter.detach()
+
             # ── 2.4. Attach RuntimeGraphPrompt so topology changes
             # trigger the per-creature system-prompt regeneration path.
             try:
@@ -676,11 +717,11 @@ class TestLaboratoryMultiNodeService:
 
         try:
             # Real privileged creatures on each worker; capture their graph ids.
-            c1 = await w1_engine.add_creature(
-                cfg_a, is_privileged=True, io="none", strict=False, session=False
+            c1 = await service.add_creature(
+                str(cfg_a), is_privileged=True, on_node="w1"
             )
-            c2 = await w2_engine.add_creature(
-                cfg_b, is_privileged=True, io="none", strict=False, session=False
+            c2 = await service.add_creature(
+                str(cfg_b), is_privileged=True, on_node="w2"
             )
             g1, g2 = c1.graph_id, c2.graph_id
 
@@ -791,6 +832,63 @@ class TestLaboratoryMultiNodeService:
             got2 = await service.get_drive(did, actor=admin, is_privileged=True)
             assert got2 is not None and got2.record.drive_id == did
             assert service._drive_routes.get_drive_home(did) == "w1"
+
+            saved_path = w1_engine._session_stores[g1].path
+            assert w1_engine.drives._registry._bound_stores[g1].path == saved_path
+            actor = ActorRef("creature", c1.creature_id)
+            goal = await service.create_drive(
+                CreateDriveRequest(
+                    kind="goal",
+                    title="preserve remote goal",
+                    scope_type="creature",
+                    scope_id=c1.creature_id,
+                    owner=actor,
+                    owner_scope="creature",
+                    created_by=actor,
+                    spec={"objective": "test", "autonomy": "manual"},
+                ),
+                graph_id=g1,
+                actor=actor,
+            )
+            goal = await service.transition_drive(
+                goal.record.drive_id,
+                DriveStatus.PAUSED,
+                expected_revision=goal.record.revision,
+                actor=actor,
+            )
+            session_lifecycle.meta_for(service)[g1] = {
+                "on_node": "w1",
+                "creature_id": c1.creature_id,
+                "remote_session_path": str(saved_path),
+            }
+            await Studio(service=service).sessions.stop(g1)
+            retry = await host_engine_lab.request(
+                to_node="w1",
+                namespace="terrarium.session",
+                type="unload",
+                body={"graph_id": g1, "session_path": str(saved_path)},
+                timeout=5,
+            )
+            assert retry == {"ok": True, "removed": [c1.creature_id]}
+            assert w1_engine.list_creatures() == []
+            assert w2_engine.get_creature(c2.creature_id).is_running
+            assert c1.creature_id not in service._home
+            assert read_session_meta(saved_path)[MANIFEST_KEY] is not None
+            response = await host_engine_lab.request(
+                to_node="w1",
+                namespace="terrarium.session",
+                type="resume",
+                body={"path": str(saved_path), "pwd_override": str(tmp_path)},
+                timeout=10,
+            )
+            assert response["session_id"] == g1
+            restored = await service.get_drive(goal.record.drive_id, actor=actor)
+            assert restored.record.owner == actor
+            assert restored.record.scope_id == c1.creature_id
+            assert restored.record.status is DriveStatus.PAUSED
+            assert restored.assignee_creature_id == c1.creature_id
+            assert restored.assignment_state == "assigned"
+            assert w1_att._graph_tees[g1]._store is w1_engine._session_stores[g1]
         finally:
             for attacher in (w1_att, w2_att):
                 try:

@@ -208,7 +208,8 @@ async def test_partial_pair_failure_fences_select_and_preserves_context(
         assert (await creature.run("question", timeout=5)).text == "original"
         before = agent.controller.conversation.get_messages()[:]
 
-        def partial(store, name, payload, turn, branch, path):
+        def partial(store, name, payload, turn, branch, path, *, with_receipt=False):
+            assert with_receipt is True
             store.append_event(
                 name,
                 "user_input",

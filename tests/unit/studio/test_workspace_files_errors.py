@@ -1,5 +1,3 @@
-"""Error-path coverage tests for studio.attach.workspace_files."""
-
 from pathlib import Path
 
 import pytest
@@ -107,7 +105,7 @@ class TestBuildTreeFileStatError:
         from kohakuterrarium.studio.attach import workspace_files as m
 
         original_stat = Path.stat
-        # Stage 1 (before ``arm`` flips): is_dir() / is_file() and any
+        # Stage 1 (before ``armed`` flips): is_dir() / is_file() and any
         # other pathlib-internal stat calls in ``_dir_entry`` must
         # succeed so the implementation reaches the size-lookup branch.
         # Counting calls is fragile across CPython versions — 3.13
@@ -147,6 +145,10 @@ class TestBuildTreeFileStatError:
 
 
 class TestBrowseDirectoriesPermissionError:
+    @pytest.fixture(autouse=True)
+    def _isolate_roots(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(wf, "_list_browse_roots", lambda: [tmp_path])
+
     async def test_permission_error_during_walk(self, monkeypatch, tmp_path):
         (tmp_path / "sub").mkdir()
 

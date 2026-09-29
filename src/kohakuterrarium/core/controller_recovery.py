@@ -1,19 +1,25 @@
-"""Request-stamped owner commits for provider emergency tool-round removal."""
+"""Request-stamped recovery commits and provider execution notifications."""
 
 import asyncio
+from contextlib import aclosing
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any, AsyncIterator
 
 from kohakuterrarium.core.compact_branch import current_path
 from kohakuterrarium.core.compact_splice import prefix_fingerprint
 from kohakuterrarium.core.conversation_elide import TOOL_FEEDBACK_KIND
 from kohakuterrarium.core.conversation_sanitize import normalize_tool_names
 from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.llm.base import LLMProvider
 from kohakuterrarium.llm.generation import provider_identity
 from kohakuterrarium.llm.message import create_message
+from kohakuterrarium.llm.model_recovery_status import observe_model_recovery
 from kohakuterrarium.llm.recovery import drop_last_tool_round
 from kohakuterrarium.llm.recovery_scope import RecoveryScope, scoped_chat
+from kohakuterrarium.modules.output.event import OutputEvent
+from kohakuterrarium.modules.output.router import OutputRouter
 
 
 @dataclass
@@ -243,5 +249,50 @@ async def recovery_chat(controller, messages, **kwargs):
     scope = RecoveryScope(
         capture.provider, asyncio.current_task(), messages, commit, rescue
     )
-    async for chunk in scoped_chat(capture.provider, messages, scope, **kwargs):
-        yield chunk
+    async with aclosing(
+        chat_with_recovery(
+            capture.provider,
+            controller.output_router,
+            messages,
+            recovery_scope=scope,
+            **kwargs,
+        )
+    ) as stream:
+        async for chunk in stream:
+            yield chunk
+
+
+async def chat_with_recovery(
+    llm: LLMProvider,
+    output_router: OutputRouter | None,
+    messages: list[dict],
+    *,
+    recovery_scope: RecoveryScope | None = None,
+    **kwargs: Any,
+) -> AsyncIterator[str]:
+    """Observe only provider execution, never a consumer or inherited child task."""
+
+    async def notify(payload: dict) -> None:
+        if output_router is not None:
+            await output_router.emit(
+                OutputEvent(type="model_recovery", surface="status", payload=payload)
+            )
+
+    stream = (
+        llm.chat(messages, **kwargs)
+        if recovery_scope is None
+        else scoped_chat(llm, messages, recovery_scope, **kwargs)
+    )
+    try:
+        while True:
+            with observe_model_recovery(notify):
+                try:
+                    chunk = await anext(stream)
+                except StopAsyncIteration:
+                    return
+            yield chunk
+    finally:
+        with observe_model_recovery(notify):
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()

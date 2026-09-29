@@ -11,7 +11,9 @@ from kohakuterrarium.session.output_handoff import output_binding
 from kohakuterrarium.modules.tool.media_policy import resolve_media_policy
 
 
-async def normalize_completed_tool(host, tool, result, *, max_output, job_id):
+async def normalize_completed_tool(
+    host, tool, result, *, max_output, job_id, artifact_store=None
+):
     """Normalize completed output on its current store worker, not the tool lifetime."""
     captured = SimpleNamespace(
         output=deepcopy(result.output), metadata=deepcopy(result.metadata)
@@ -44,7 +46,7 @@ async def normalize_completed_tool(host, tool, result, *, max_output, job_id):
             store = (
                 sink._store
                 if sink is not None
-                else getattr(host, "session_store", None)
+                else getattr(host, "session_store", artifact_store)
             )
             kwargs = {
                 "max_output": max_output,

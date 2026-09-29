@@ -35,14 +35,31 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from kohakuterrarium.llm import antigravity_auth as agy_auth
 from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import set_service
 from kohakuterrarium.api.routes.catalog import _deps as catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.studio.catalog import packages as _catalog_packages_ops
+from kohakuterrarium.studio.attach import pty_posix, workspace_files
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
+
+from tests.helpers.antigravity_usage import install_quota_script, assert_quota
+
+from tests.helpers.grok_usage_script import (
+    FAKE_ACCESS,
+    assert_billing_request,
+    assert_empty,
+    assert_usage_ok,
+    billing_body,
+    install_billing_script,
+    install_grok_home,
+    patch_cli_version_probe,
+    write_cli_auth,
+    write_metadata_version,
+)
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -181,6 +198,7 @@ class TestApiStudioJourney:
         client: TestClient,
         workspace_root: Path,
         scripted_llm: ScriptedLLM,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Catalog browse → workspace authoring → validate → start a
         session → chat → history.
@@ -191,6 +209,62 @@ class TestApiStudioJourney:
         start a live session from that creature directory and take a
         turn.
         """
+        with monkeypatch.context() as agy_patch:
+            agy_patch.setattr(agy_auth, "read_sources", lambda: [])
+            status = client.get("/api/settings/antigravity-status")
+            assert status.status_code == 200
+            assert status.json()["state"] == "login_required"
+            assert (
+                client.get("/api/settings/antigravity-status?node=worker").status_code
+                == 400
+            )
+            assert client.post("/api/settings/antigravity-refresh").status_code == 409
+
+        with monkeypatch.context() as quota_patch:
+            quota = install_quota_script(quota_patch)
+            usage_url = "/api/settings/antigravity-usage"
+            assert client.get(usage_url).json()["status"] == "not_logged_in"
+            quota["logged_in"] = True
+            response = client.get(usage_url)
+            assert response.status_code == 200
+            assert_quota(response.json(), 25)
+            quota["remaining"] = 0.5
+            assert_quota(client.get(usage_url).json(), 50)
+            remote = client.get(usage_url + "?node=worker").json()
+            assert remote["status"] == "unsupported"
+            assert remote["groups"] == []
+            quota["status"] = 503
+            assert client.get(usage_url).json()["status"] == "unavailable"
+            quota["logged_in"] = False
+            assert client.get(usage_url).json()["groups"] == []
+
+        with monkeypatch.context() as usage_patch:
+            grok_home = install_grok_home(workspace_root, usage_patch)
+            patch_cli_version_probe(usage_patch)
+            write_metadata_version(grok_home)
+            billing = install_billing_script(usage_patch)
+            url = "/api/settings/grok-usage?node=_host"
+            response = client.get(url)
+            assert response.status_code == 200
+            assert_empty(response.json(), "not_logged_in")
+            write_cli_auth(grok_home, FAKE_ACCESS)
+            for used in (1.0, 4.0):
+                billing.push(200, billing_body(used))
+                response = client.get(url)
+                assert response.status_code == 200
+                assert_usage_ok(response.json(), used)
+                assert_billing_request(
+                    billing.requests[-1], FAKE_ACCESS, version="1.0.5"
+                )
+            for code, status in ((503, "unavailable"), (403, "auth_expired")):
+                billing.push(code)
+                response = client.get(url)
+                assert response.status_code == 200
+                assert_empty(response.json(), status)
+            (grok_home / "auth.json").unlink()
+            assert_empty(client.get(url).json(), "not_logged_in")
+            assert len(billing.requests) == 4
+
         # 1. Catalog: browse builtin tools — the read-only module pool.
         resp = client.get("/api/studio/catalog/tools")
         assert resp.status_code == 200
@@ -239,6 +313,29 @@ class TestApiStudioJourney:
         assert resp.status_code == 200
         models = resp.json()
         assert models and all("name" in m for m in models)
+        agy_models = {
+            entry["model"]: entry
+            for entry in models
+            if entry["provider"] == "google-antigravity"
+        }
+        for model in ("gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"):
+            entry = agy_models[model]
+            assert (entry["max_context"], entry["max_output"]) == (1048576, 65536)
+            assert list(entry["variation_groups"]["reasoning"]) == [
+                "low",
+                "medium",
+                "high",
+            ]
+        assert list(agy_models["gemini-3.1-pro"]["variation_groups"]["reasoning"]) == [
+            "low",
+            "high",
+        ]
+        for model in ("claude-sonnet-4-6", "claude-opus-4-6-thinking"):
+            assert agy_models[model]["variation_groups"] == {}
+            assert (
+                agy_models[model]["max_context"],
+                agy_models[model]["max_output"],
+            ) == (250000, 64000)
 
         # Embedding presets + plugin-hook catalog round out the catalog.
         resp = client.get("/api/studio/catalog/embedding_presets")
@@ -587,6 +684,31 @@ class TestApiStudioJourney:
         resp = client.post(f"{base}/tasks/no-such-job/stop")
         assert resp.status_code == 404
 
+        # Open, resize, use, and disconnect an idle embedded terminal.
+        if os.name == "posix":
+            terminal_home = workspace_root / "terminal-home"
+            terminal_home.mkdir()
+            (terminal_home / ".bash_profile").write_text("PS1='kt-test> '\n")
+            with monkeypatch.context() as terminal_patch:
+                terminal_patch.setenv("HOME", str(terminal_home))
+                terminal_patch.delenv("BASH_ENV", raising=False)
+                terminal_patch.delenv("ENV", raising=False)
+                terminal_patch.setattr(pty_posix, "_find_shell", lambda: "/bin/bash")
+                with client.websocket_connect(
+                    f"/ws/sessions/{session_id}/creatures/{creature_id}/pty"
+                ) as terminal:
+                    assert terminal.receive_json() == {"type": "output", "data": ""}
+                    output = ""
+                    while "kt-test> " not in output:
+                        output += terminal.receive_json()["data"]
+                    terminal.send_json({"type": "resize", "rows": 37, "cols": 91})
+                    terminal.send_json({"type": "input", "data": "stty size\n"})
+                    output = ""
+                    while "37 91\r\n" not in output:
+                        output += terminal.receive_json()["data"]
+                    assert client.get(f"{base}/jobs").json() == []
+            assert client.get("/api/sessions/open").status_code == 200
+
         # 12. A second chat turn, then regenerate the tail reply.
         resp = client.post(f"{base}/chat", json={"message": "ping again"})
         assert resp.status_code == 200
@@ -829,7 +951,11 @@ class TestApiStudioJourney:
         child_names = {c["name"] for c in tree_root["children"]}
         assert "creatures" in child_names
         # browse_directories returns the current dir + its subdirs.
-        resp = client.get("/api/files/browse", params={"path": str(workspace_root)})
+        with pytest.MonkeyPatch.context() as roots:
+            roots.setattr(
+                workspace_files, "_list_browse_roots", lambda: [workspace_root]
+            )
+            resp = client.get("/api/files/browse", params={"path": str(workspace_root)})
         assert resp.status_code == 200
         browse = resp.json()
         assert browse["current"]["path"] == str(workspace_root)
