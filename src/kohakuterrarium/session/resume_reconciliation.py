@@ -94,12 +94,25 @@ def _provider(event):
     return _text(event.get("tool_call_id")) or _text(event.get("call_id"))
 
 
+def _recorded_job(event):
+    job_id = _text(event.get("job_id"))
+    if job_id:
+        return job_id
+    call_id = _text(event.get("call_id"))
+    if call_id and call_id != _text(event.get("tool_call_id")):
+        return call_id
+    return ""
+
+
 def _job_key(event):
     origin = event.get("origin")
     scope = origin.get("runtime_scope_id") if isinstance(origin, dict) else None
     if scope is not None and not isinstance(scope, str):
         raise HistoryCompatibilityError("Invalid resume scope")
-    return scope, _text(event.get("job_id"))
+    job_id = _recorded_job(event)
+    if not job_id:
+        return None
+    return scope, job_id
 
 
 def _recorded_name(event):
@@ -168,7 +181,7 @@ def _bind(jobs, provider, job_id):
         jobs[job_id] = provider
     elif provider and previous and previous != provider:
         raise HistoryCompatibilityError(
-            "Selected resume job is bound to a different provider"
+            "Cannot resume: the same tool job was recorded under two different tool calls"
         )
     elif provider and not previous:
         jobs[job_id] = provider
@@ -201,7 +214,7 @@ def _collect_evidence(events, announcements):
         if _kind(event) is None:
             continue
         provider = _provider(event)
-        job_id = _text(event.get("job_id"))
+        job_id = _recorded_job(event)
         if event.get("type") in _RESULT_TYPES and not _text(event.get("tool_call_id")):
             provider = jobs.get(_job_key(event), provider)
             event = {**event, "tool_call_id": provider}
@@ -209,7 +222,7 @@ def _collect_evidence(events, announcements):
             _bind(jobs, provider, _job_key(event))
         if provider not in ids and job_id in ids:
             raise HistoryCompatibilityError(
-                "Selected resume job collides with a snapshot provider id"
+                "Cannot resume: a recorded tool job collides with a saved tool call id"
             )
         matched = provider if provider in ids else ""
         if not matched:
@@ -225,7 +238,7 @@ def _collect_evidence(events, announcements):
             and jobs[_job_key(event)] not in ("", provider)
         ):
             raise HistoryCompatibilityError(
-                "Selected resume identity conflicts with snapshot announcement"
+                "Cannot resume: recorded tool identity conflicts with the saved conversation"
             )
         consumed.append(event_id)
         role = "calls" if event.get("type") in _CALL_TYPES else "results"
@@ -343,8 +356,10 @@ def _check_pair(dispatch, terminal):
     ):
         raise HistoryCompatibilityError("Resume class disagrees across evidence")
     if _provider(dispatch) != _provider(terminal):
-        raise HistoryCompatibilityError("Resume provider disagrees across evidence")
-    if _text(dispatch.get("job_id")) != _text(terminal.get("job_id")):
+        raise HistoryCompatibilityError(
+            "Cannot resume: a tool call and its result use different call ids"
+        )
+    if _recorded_job(dispatch) != _recorded_job(terminal):
         raise HistoryCompatibilityError("Resume job disagrees across evidence")
     if not _usable(dispatch) or not _usable(terminal):
         raise HistoryCompatibilityError("Incomplete resume dispatch evidence")
@@ -363,6 +378,7 @@ def _check_event(event, announcement, *, represented=False):
     if event.get("call_id") is not None and event["call_id"] not in (
         _provider(event),
         event.get("job_id"),
+        _recorded_job(event),
     ):
         raise HistoryCompatibilityError("Resume call aliases disagree")
     expected = _json_object(announcement["arguments"])

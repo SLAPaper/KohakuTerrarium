@@ -504,13 +504,83 @@ def test_direct_real_terminal_without_full_origin_closes_call():
     assert consumed == {1, 2}
 
 
-def test_same_job_different_provider_is_conflict():
+def _legacy_dispatch(*, event_id, provider, name="bash", internal=None):
+    event = _dispatch(
+        event_id=event_id,
+        provider=provider,
+        job=None,
+        name=name,
+        origin=False,
+    )
+    event.pop("job_id")
+    event.pop("execution_class")
+    event.pop("background")
+    event["call_id"] = internal or f"{name}_deadbeef"
+    return event
+
+
+def test_legacy_jobless_snapshot_calls_do_not_share_empty_job():
+    base = [
+        _assistant(
+            [
+                {"id": "call-1", "name": "bash", "arguments": "{}"},
+                {"id": "call-2", "name": "read", "arguments": "{}"},
+            ]
+        ),
+        _tool("call-1", "bash", "a"),
+        _tool("call-2", "read", "b"),
+    ]
+    events = [
+        _legacy_dispatch(
+            event_id=10, provider="call-legacy", name="skill", internal="skill_aaaa"
+        ),
+        _legacy_dispatch(
+            event_id=11, provider="call-1", name="bash", internal="bash_bbbb"
+        ),
+        _legacy_dispatch(
+            event_id=12, provider="call-2", name="read", internal="read_cccc"
+        ),
+    ]
+    copied, consumed = reconcile_snapshot(base, events, None)
+    assert copied == base
+    assert consumed == {11, 12}
+
+
+def test_legacy_jobless_result_pairs_by_internal_call_id():
+    base = [
+        _assistant([{"id": "call-1", "name": "bash", "arguments": "{}"}]),
+        _tool("call-1", "bash", "already"),
+    ]
+    dispatch = _legacy_dispatch(
+        event_id=1, provider="call-1", name="bash", internal="bash_bbbb"
+    )
+    terminal = _terminal(
+        event_id=2,
+        provider="call-1",
+        job=None,
+        origin=False,
+        output="legacy-ok",
+    )
+    terminal.pop("job_id")
+    terminal.pop("execution_class")
+    terminal.pop("background")
+    terminal.pop("tool_call_id")
+    terminal["call_id"] = "bash_bbbb"
+    copied, consumed = reconcile_snapshot(base, [dispatch, terminal], None)
+    assert copied == base
+    assert consumed == {1, 2}
+
+
+def test_same_job_different_tool_call_is_conflict():
     base = [_assistant([{"id": "call-1", "name": "bash", "arguments": "{}"}])]
     events = [
         _dispatch(event_id=1, provider="call-1", job="job-1"),
         _dispatch(event_id=2, provider="call-9", job="job-1", name="bash"),
     ]
-    with pytest.raises(HistoryCompatibilityError):
+    with pytest.raises(
+        HistoryCompatibilityError,
+        match="same tool job was recorded under two different tool calls",
+    ):
         reconcile_snapshot(base, events, None)
 
 
