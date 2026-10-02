@@ -64,6 +64,8 @@ def close_tables(
     explicitly dropped because their public close paths can retain SQLite file
     handles on Windows. The writer lock is released even if cleanup fails.
     """
+    tables = tuple(tables)
+    failure = None
     try:
         for closer in reversed(list(companion_closers)):
             try:
@@ -71,18 +73,34 @@ def close_tables(
             except Exception:
                 logger.warning("Companion closer failed at close", exc_info=True)
         for table in tables:
-            table.close()
-        for table in tables:
             try:
-                del table._inner
+                table.close()
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+                logger.warning("Session table close failed", exc_info=True)
+        try:
+            close_fts = getattr(fts, "close", None)
+            if callable(close_fts):
+                close_fts()
+        except Exception as exc:
+            if failure is None:
+                failure = exc
+            logger.warning("Session FTS close failed", exc_info=True)
+        finally:
+            for table in tables:
+                try:
+                    del table._inner
+                except AttributeError:
+                    pass
+            try:
+                del fts._vault
             except AttributeError:
                 pass
-        try:
-            del fts._vault
-        except AttributeError:
-            pass
     finally:
         release_writer_lock(lock)
+    if failure is not None:
+        raise failure
 
 
 def discard_partial_open(tables: Iterable[tuple[str, Any]], fts, path: str) -> None:

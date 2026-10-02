@@ -274,3 +274,89 @@ class TestOpenAIRetries:
             with pytest.raises(APIStatusError):
                 await provider.chat_complete(MESSAGES)
             assert len(requests) == 2
+
+
+class _DropAfterFirstChunk(httpx.AsyncByteStream):
+    """SSE body that sends one text chunk, then the connection breaks."""
+
+    async def __aiter__(self):
+        chunk = {
+            "id": "reply",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test",
+            "choices": [
+                {"index": 0, "delta": {"content": "Hel"}, "finish_reason": None}
+            ],
+        }
+        yield f"data: {json.dumps(chunk)}\n\n".encode()
+        raise httpx.ReadError("connection dropped mid-stream")
+
+
+def _reply_with(text):
+    chunk = {
+        "id": "reply",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "test",
+        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+    }
+    return httpx.Response(
+        200,
+        text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        headers={"content-type": "text/event-stream"},
+    )
+
+
+class TestMidStreamFailure:
+    async def _received_after_drop(self, retry_reply):
+        requests = []
+
+        async def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return httpx.Response(
+                    200,
+                    stream=_DropAfterFirstChunk(),
+                    headers={"content-type": "text/event-stream"},
+                )
+            return _reply_with(retry_reply)
+
+        received = []
+        async with OpenAIProvider(
+            api_key="test-key",
+            model="test",
+            retry_policy=RetryPolicy(max_retries=2, base_delay=0, jitter=0),
+        ) as provider:
+            await _attach_transport(provider, respond)
+            async for chunk in provider.chat(MESSAGES):
+                received.append(chunk)
+        return "".join(received), len(requests)
+
+    async def test_retry_after_a_dropped_stream_does_not_repeat_delivered_text(self):
+        text, attempts = await self._received_after_drop("Hello")
+        assert text == "Hello"
+        assert attempts == 2
+
+    async def test_retry_that_words_the_reply_differently_is_still_delivered(self):
+        text, attempts = await self._received_after_drop("Sure thing")
+        assert text == "HelSure thing"
+        assert attempts == 2
+
+    async def test_failure_before_any_text_is_still_retried(self):
+        requests = []
+
+        async def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                return _error(503, "temporary outage")
+            return _success(True)
+
+        async with OpenAIProvider(
+            api_key="test-key",
+            model="test",
+            retry_policy=RetryPolicy(max_retries=2, base_delay=0, jitter=0),
+        ) as provider:
+            await _attach_transport(provider, respond)
+            assert await _turn(provider, True) == "ok"
+        assert len(requests) == 2

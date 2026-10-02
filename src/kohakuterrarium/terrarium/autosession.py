@@ -8,7 +8,7 @@ The engine owns session-store creation and metadata initialization:
   per-creature control (exact file / force-default-dir / custom store).
 - ``attach_session(graph, path_or_store)`` → mint-mode: a path mints a
   store with validated meta.
-- ``engine.shutdown()`` closes every store the engine minted.
+- ``engine.shutdown()`` closes every attached store.
 
 Meta is always written BEFORE the store lands in
 ``engine._session_stores`` — the Lab worker installs an observing dict
@@ -87,18 +87,22 @@ def mint_store(
         path.parent.mkdir(parents=True, exist_ok=True)
 
     store = SessionStore(path, writer_lock=True)
-    existing = store.load_meta()
-    if not existing.get("session_id"):
-        store.init_meta(
-            session_id=session_id or graph_id,
-            config_type=config_type,
-            config_path=config_path,
-            pwd=pwd or str(getattr(engine, "_pwd", None) or Path.cwd()),
-            agents=list(agents or []),
-            config_snapshot=config_snapshot,
-        )
-    elif agents:
-        register_agents_in_meta(store, agents)
+    try:
+        existing = store.load_meta()
+        if not existing.get("session_id"):
+            store.init_meta(
+                session_id=session_id or graph_id,
+                config_type=config_type,
+                config_path=config_path,
+                pwd=pwd or str(getattr(engine, "_pwd", None) or Path.cwd()),
+                agents=list(agents or []),
+                config_snapshot=config_snapshot,
+            )
+        elif agents:
+            register_agents_in_meta(store, agents)
+    except BaseException:
+        store.close(update_status=False)
+        raise
     logger.info(
         "Session store minted",
         graph_id=graph_id,
@@ -192,6 +196,16 @@ async def attach_for_new_creature(
                 creature.agent.attach_session_store(existing)
             return existing
 
+    if (
+        existing is not None
+        and not getattr(existing, "_closed", False)
+        and isinstance(session, (str, Path))
+        and recipe_session_reuses_store(existing, session)
+    ):
+        register_agents_in_meta(existing, [creature.name])
+        await engine.attach_session(gid, existing)
+        return existing
+
     path: "str | Path | None"
     if isinstance(session, (str, Path)):
         path = session
@@ -226,7 +240,7 @@ async def attach_for_new_creature(
         agents=[creature.name],
         session_id=creature.creature_id,
     )
-    await _attach_minted(engine, gid, store)
+    await _attach_minted_store(engine, gid, store)
     return store
 
 
@@ -276,12 +290,14 @@ async def attach_for_recipe(
         config_path=str(recipe) if isinstance(recipe, (str, Path)) else "",
         agents=names,
     )
-    await _attach_minted(engine, graph_id, store)
+    await _attach_minted_store(engine, graph_id, store)
     return store
 
 
-async def _attach_minted(engine, graph_id, store):
-    """Retain ownership only after the minted store becomes the graph binding."""
+async def _attach_minted_store(
+    engine: "Terrarium", graph_id: str, store: SessionStore
+) -> None:
+    """Retain ownership after binding; release unbound failed candidates safely."""
     try:
         await engine.attach_session(graph_id, store)
     except BaseException:
@@ -316,18 +332,20 @@ def recipe_session_reuses_store(
         return False
 
 
-def close_owned_stores(engine: "Terrarium") -> None:
-    """Close every store the engine minted.  Called from ``shutdown``."""
-    for gid in list(engine._owned_sessions):
-        store = engine._session_stores.get(gid)
-        if store is None:
-            continue
+def close_attached_stores(engine: "Terrarium") -> None:
+    """Close every store attached to a graph, minted by the engine or not.
+
+    Called from ``shutdown``: a store that stays open keeps its writer lock and
+    its ``running`` status after the engine is gone.
+    """
+    for gid, store in list(engine._session_stores.items()):
         try:
             store.close()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(
-                "owned session store close failed",
+                "session store close failed",
                 graph_id=gid,
+                owned=gid in engine._owned_sessions,
                 error=str(exc),
             )
     close_retained_stores(engine)

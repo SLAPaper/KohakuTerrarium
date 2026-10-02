@@ -25,6 +25,7 @@ side effect (conversation contents, tool output text, engine state).
 
 import asyncio
 import re
+from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
 
@@ -43,6 +44,11 @@ from kohakuterrarium.core.config_types import (
     OutputConfig,
 )
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.controller_recovery import (
+    apply_drop,
+    capture_recovery,
+    owner_recovery,
+)
 from kohakuterrarium.core.events import (
     EventType,
     TriggerEvent,
@@ -61,10 +67,12 @@ from kohakuterrarium.llm.base import (
     OverflowRecoveryState,
 )
 from kohakuterrarium.llm.codex_format import to_responses_input
+from kohakuterrarium.llm.recovery import drop_last_tool_round
 from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.session.compact_coverage import coordinate
-from kohakuterrarium.session.history_replay import replay_selected_events
 from kohakuterrarium.session.history_records import history_page
+from kohakuterrarium.session.history_replay import replay_selected_events
+from kohakuterrarium.session.resume_build import build_conversation
 from kohakuterrarium.terrarium.session_coord import copy_events_into
 from kohakuterrarium.session.reader import SessionReader
 from kohakuterrarium.session.store import SessionStore
@@ -1580,7 +1588,7 @@ class TestCoreIntegration:
         )
         agent = creature.agent
 
-        async with Terrarium() as engine:
+        async with Terrarium(session_dir=agent.config.agent_path / "runs") as engine:
             await engine.add_creature(creature)
             # Compact manager + termination checker were built by start().
             assert agent.compact_manager.config.max_tokens == 100
@@ -1592,6 +1600,54 @@ class TestCoreIntegration:
             # the compact manager to have something to summarize.
             for word in ("one", "two", "three", "four"):
                 await _drain_chat(creature, f"turn {word}")
+            agent._reload_conversation_under_branch_view({1: 1})
+            conversation = agent.controller.conversation
+            before_drop = conversation.snapshot_messages()
+            assert any(msg.get("metadata", {}).get("turn_index") for msg in before_drop)
+            conversation.append(
+                "assistant",
+                "",
+                tool_calls=[
+                    {
+                        "id": "overflow_call",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+                metadata={"turn_index": 4, "branch_id": 1},
+            )
+            conversation.append(
+                "tool",
+                "oversized result",
+                tool_call_id="overflow_call",
+                metadata={"turn_index": 4, "branch_id": 1},
+            )
+            current = conversation.to_messages()
+            _, recovered = drop_last_tool_round(current)
+            capture = await owner_recovery(
+                agent.controller, lambda: capture_recovery(agent.controller)
+            )
+            await owner_recovery(
+                agent.controller, lambda: apply_drop(capture, current, recovered)
+            )
+            assert recovered[-1]["content"].startswith("[tool-result truncated]")
+            assert conversation.to_messages() == recovered
+            assert conversation.snapshot_messages()[:-1] == before_drop
+            assert not {
+                "event_id",
+                "event_origin",
+                "turn_index",
+                "branch_id",
+            }.intersection(conversation.get_messages()[-1].metadata)
+            snapshot_path = agent.config.agent_path / "emergency.kohakutr"
+            with closing(SessionStore(snapshot_path)) as store:
+                store.save_conversation(
+                    agent.config.name, conversation.snapshot_messages()
+                )
+            with closing(SessionStore(snapshot_path)) as store:
+                resumed = build_conversation(store.load_conversation(agent.config.name))
+            assert resumed.snapshot_messages() == conversation.snapshot_messages()
+            assert all("metadata" not in msg for msg in resumed.to_messages())
             msgs_before = len(agent.controller.conversation.get_messages())
             assert msgs_before >= 8
             assert agent.is_running is True

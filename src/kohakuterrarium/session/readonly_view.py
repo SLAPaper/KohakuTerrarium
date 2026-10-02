@@ -1,34 +1,58 @@
 """Selective, read-only session queries without writable source vault handles.
 
-SQLite owns the read transaction, including committed WAL rows. KohakuVault
-only decodes selected values in an isolated in-memory vault, keeping its
-binary-format handling upstream and its initialization writes off the source.
+A file no live store holds open is read through a SQLite read transaction that
+includes committed WAL rows, and KohakuVault only decodes selected values in an
+isolated in-memory vault. A file that a live store in this process holds open is
+read through that store, because a second SQLite library copy on the same file
+crashes the process.
 """
 
 import sqlite3
+import threading
 from collections.abc import Iterator
 from contextlib import closing
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from kohakuvault import KVault
 
+from kohakuterrarium.session.errors import SessionNotReadyError
+from kohakuterrarium.session.open_registry import (
+    release_cold_reader,
+    reserve_read_source,
+)
+from kohakuterrarium.session.store import iter_kv_keys
 from kohakuterrarium.utils.fs_path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-_TABLES = frozenset({"meta", "events", "state"})
+_TABLES = frozenset({"meta", "events", "state", "conversation"})
+
+
+def _text(key: Any) -> str:
+    return key.decode("utf-8", errors="replace") if isinstance(key, bytes) else key
 
 
 class SessionReadView:
-    """One consistent, selectively decoded snapshot of an existing session."""
+    """One selectively decoded view of an existing session."""
 
     def __init__(self, path: str | Path) -> None:
         source = coerce_fs_path(path).expanduser().resolve(strict=True)
-        self._db = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
+        self._source = source
+        self._closed = False
+        self._live = reserve_read_source(source)
+        self._cold_reserved = self._live is None
+        self._db = None
         self._decoder = None
+        if self._live is not None:
+            if not self._live.is_ready:
+                self._live = None
+                raise SessionNotReadyError(f"Session is still opening: {source}")
+            return
         try:
+            self._db = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)
             self._db.execute("BEGIN")
             self._tables = {
                 row[0]
@@ -49,8 +73,12 @@ class SessionReadView:
         return self._decoder[b"value"]
 
     def get(self, table: str, key: str, default: Any = None) -> Any:
+        if self._closed:
+            raise SessionNotReadyError("Session read view is closed")
         if table not in _TABLES:
             raise ValueError(f"unsupported session table: {table}")
+        if self._live is not None:
+            return self._live_get(table, key, default)
         if table not in self._tables:
             return default
         row = self._db.execute(
@@ -66,8 +94,13 @@ class SessionReadView:
         return default
 
     def items(self, table: str, *, prefix: str = "") -> Iterator[tuple[str, Any]]:
+        if self._closed:
+            raise SessionNotReadyError("Session read view is closed")
         if table not in _TABLES:
             raise ValueError(f"unsupported session table: {table}")
+        if self._live is not None:
+            yield from self._live_items(table, prefix)
+            return
         if table not in self._tables:
             return
         lower = prefix.encode()
@@ -94,30 +127,99 @@ class SessionReadView:
     def load_meta(self, *, discover_agents: bool = True) -> dict[str, Any]:
         meta = dict(self.items("meta"))
         known = list(meta.get("agents") or [])
-        if discover_agents and "events" in self._tables:
-            # Namespace discovery reads keys only, never the event payloads.
-            with closing(
-                self._db.execute("SELECT key FROM events ORDER BY key")
-            ) as rows:
-                for (raw_key,) in rows:
-                    parts = raw_key.decode("utf-8", errors="replace").rsplit(":e", 1)
-                    if len(parts) != 2:
-                        continue
-                    agent = parts[0]
-                    if (
-                        agent != "terrarium"
-                        and ":attached:" not in agent
-                        and agent not in known
-                    ):
-                        known.append(agent)
+        if discover_agents:
+            for raw_key in self._event_keys():
+                parts = raw_key.rsplit(":e", 1)
+                if len(parts) != 2:
+                    continue
+                agent = parts[0]
+                if (
+                    agent != "terrarium"
+                    and ":attached:" not in agent
+                    and agent not in known
+                ):
+                    known.append(agent)
         meta["agents"] = known
         return meta
 
+    def _event_keys(self) -> Iterator[str]:
+        """Event keys in order; namespace discovery reads keys, never payloads."""
+        if self._live is not None:
+            yield from self._live_keys("events", "")
+            return
+        if "events" not in self._tables:
+            return
+        with closing(self._db.execute("SELECT key FROM events ORDER BY key")) as rows:
+            for (raw_key,) in rows:
+                yield raw_key.decode("utf-8", errors="replace")
+
+    def _run_live(self, callback):
+        store = self._live
+        if store is None or not store.is_ready:
+            raise SessionNotReadyError(f"Session is opening or closing: {self._source}")
+        if threading.get_ident() == getattr(store, "_affinity_worker_ident", None):
+            return callback()
+        with store._affinity_lock:
+            if not store.is_ready:
+                raise SessionNotReadyError(f"Session is closing: {self._source}")
+            accepted = store.submit(callback)
+        return accepted.result()
+
+    def _live_keys(self, table: str, prefix: str) -> list[str]:
+        def read():
+            vault = getattr(self._live, table)
+            vault.flush_cache()
+            return sorted(_text(key) for key in iter_kv_keys(vault, prefix=prefix))
+
+        return self._run_live(read)
+
+    def _live_get(self, table: str, key: str, default: Any) -> Any:
+        def read():
+            try:
+                return deepcopy(getattr(self._live, table)[key])
+            except KeyError:
+                return default
+            except Exception as exc:
+                logger.warning(
+                    "Unreadable session value", table=table, key=key, error=str(exc)
+                )
+                return default
+
+        return self._run_live(read)
+
+    def _live_items(self, table: str, prefix: str) -> Iterator[tuple[str, Any]]:
+        def read():
+            items = []
+            for name in self._live_keys(table, prefix):
+                try:
+                    items.append((name, deepcopy(getattr(self._live, table)[name])))
+                except Exception as exc:
+                    logger.warning(
+                        "Unreadable session value",
+                        table=table,
+                        key=name,
+                        error=str(exc),
+                    )
+            return items
+
+        yield from self._run_live(read)
+
     def close(self) -> None:
-        self._db.close()
-        if self._decoder is not None:
-            self._decoder.close()
-            self._decoder = None
+        self._closed = True
+        try:
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+        finally:
+            try:
+                if self._decoder is not None:
+                    self._decoder.close()
+                    self._decoder = None
+            finally:
+                self._live = None
+                if self._cold_reserved and self._db is None:
+                    release_cold_reader(self._source)
+                    self._cold_reserved = False
 
     def __enter__(self) -> "SessionReadView":
         return self

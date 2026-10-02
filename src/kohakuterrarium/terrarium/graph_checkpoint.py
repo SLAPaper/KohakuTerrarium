@@ -14,6 +14,7 @@ from kohakuterrarium.errors import (
 
 import kohakuterrarium.terrarium.graph_manifest as _manifest
 import kohakuterrarium.terrarium.topology_snapshot as _topo_snap
+from kohakuterrarium.terrarium.session_successor import publish_successors_async
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -138,6 +139,17 @@ async def checkpoint(engine: "Terrarium", graph_id: str) -> bool:
         if invalid or engine._session_stores.get(graph_id) is not store:
             dirty.add(graph_id)
             return False
+        try:
+            await publish_successors_async(engine, graph_id)
+        except asyncio.CancelledError:
+            dirty.add(graph_id)
+            raise
+        except Exception as exc:
+            dirty.add(graph_id)
+            raise GraphManifestPersistenceError(
+                f"Graph {graph_id!r} checkpointed but successor publication failed: {exc}",
+                applied=True,
+            ) from exc
         dirty.discard(graph_id)
         return not missing
 

@@ -1,6 +1,6 @@
 import { ElMessage } from "element-plus"
 import { getCurrentInstance, markRaw, toRaw } from "vue"
-import { extractReasoning } from "@/utils/chatReasoning"
+import { extractReasoning, mergeReasoningSegments } from "@/utils/chatReasoning"
 import { compactProjection } from "@/stores/compactCoverage"
 import { reduceModelRecovery } from "./chatRecovery"
 
@@ -149,8 +149,9 @@ function normalizeMessageContent(content) {
   }
 }
 
-function _insertReasoningSegments(message, segments, idPrefix = "reasoning_") {
-  if (!message || !Array.isArray(segments) || !segments.length) return
+function _insertReasoningSegments(message, rawSegments, idPrefix = "reasoning_") {
+  if (!message || !Array.isArray(rawSegments) || !rawSegments.length) return
+  const segments = mergeReasoningSegments(rawSegments)
   const parts = Array.isArray(message.parts) ? message.parts : []
   const start = Number.isInteger(message._reasoningCursor) ? message._reasoningCursor : 0
   const out = []
@@ -419,8 +420,7 @@ export function _convertHistory(messages, options = {}) {
       if (Array.isArray(msg._kt_assistant_segments) && msg._kt_assistant_segments.length) {
         const tcById = new Map(tcs.map((tc) => [tc.id, tc]))
         const parts = []
-        for (const segment of msg._kt_assistant_segments) {
-          if (!segment || typeof segment !== "object") continue
+        for (const segment of mergeReasoningSegments(msg._kt_assistant_segments)) {
           if (segment.type === "reasoning") {
             const part = {
               type: "reasoning",
@@ -3429,6 +3429,7 @@ const _chatStoreOptions = {
 
       if (at === "assistant_reasoning") {
         const tab = source || data.agent_name || this.activeTab
+        if (!this._frameMatchesViewedBranch(tab, data)) return
         const list = this.messagesByTab[tab] || []
         const target = [...list].reverse().find((message) => message?.role === "assistant")
         if (target) {

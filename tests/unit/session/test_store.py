@@ -10,6 +10,7 @@ import pytest
 import kohakuterrarium.session.store as store_mod
 from kohakuterrarium.errors import SessionLockedError
 from kohakuterrarium.session.store import SessionStore, iter_kv_keys
+from kohakuterrarium.session.open_registry import live_store_for, unregister_open_store
 
 try:
     import resource
@@ -21,6 +22,71 @@ except ImportError:
 
 def _store(tmp_path, name="s.kohakutr") -> SessionStore:
     return SessionStore(str(tmp_path / name))
+
+
+def test_close_counter_failure_still_disposes_tables_and_writer(tmp_path, monkeypatch):
+    path = tmp_path / "close-counter.kohakutr"
+    store = SessionStore(path, writer_lock=True)
+    store.append_event("a", "text", {"content": "preserved"})
+    try:
+        with monkeypatch.context() as patch:
+
+            def fail_counter(*args):
+                raise OSError("counter write failed")
+
+            patch.setattr(store_mod, "persist_event_counter", fail_counter)
+            with pytest.raises(OSError, match="counter write failed"):
+                store.close()
+        assert store.events._closed
+        assert live_store_for(path) is None
+        store.close()
+        reopened = SessionStore(path, writer_lock=True)
+        try:
+            assert reopened.get_events("a")[0]["content"] == "preserved"
+        finally:
+            reopened.close(update_status=False)
+    finally:
+        if not store.events._closed:
+            store_mod.close_tables(
+                tuple(getattr(store, name) for name in store_mod.TABLE_ATTRS),
+                store.fts,
+                store._writer_lock,
+                store._companion_closers,
+            )
+            unregister_open_store(path, store)
+
+
+def test_one_table_close_failure_still_releases_other_native_handles(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "close-table.kohakutr"
+    store = SessionStore(path, writer_lock=True)
+    store.init_meta("cleanup", "agent", "", str(tmp_path), ["a"])
+    tables = tuple(getattr(store, name) for name in store_mod.TABLE_ATTRS)
+    original = store.events.close
+    try:
+        with monkeypatch.context() as patch:
+
+            def fail_close():
+                original()
+                raise OSError("event table close failed")
+
+            patch.setattr(store.events, "close", fail_close)
+            with pytest.raises(OSError, match="event table close failed"):
+                store.close()
+        assert all(table._closed for table in tables)
+        assert all(not hasattr(table, "_inner") for table in tables)
+        assert not hasattr(store.fts, "_vault")
+        assert live_store_for(path) is None
+        reopened = SessionStore(path, writer_lock=True)
+        try:
+            assert reopened.meta["session_id"] == "cleanup"
+        finally:
+            reopened.close(update_status=False)
+    finally:
+        if any(not table._closed for table in tables):
+            store_mod.close_tables(tables, store.fts, store._writer_lock)
+            unregister_open_store(path, store)
 
 
 def test_get_events_since_event_id_filters(tmp_path):
@@ -1429,3 +1495,51 @@ class TestCompanionCloser:
     def test_no_closers_is_noop(self, tmp_path):
         s = _store(tmp_path)
         s.close()  # empty companion list closes cleanly
+
+
+class _CountedEvents:
+    """Instrument reads while keeping the real native table as the collaborator."""
+
+    def __init__(self, table):
+        self.table = table
+        self.reads = 0
+        self.scans = 0
+
+    def __getattr__(self, name):
+        return getattr(self.table, name)
+
+    def __getitem__(self, key):
+        self.reads += 1
+        return self.table[key]
+
+    def __setitem__(self, key, value):
+        self.table[key] = value
+
+    def keys(self, **kwargs):
+        self.scans += 1
+        return self.table.keys(**kwargs)
+
+
+def test_event_lookup_reuses_keys_and_tracks_appends(tmp_path):
+    store = _store(tmp_path)
+    try:
+        for i in range(100):
+            store.append_event(
+                "alice", "text", {"content": str(i), "event_id": 1000 + i}
+            )
+        table = _CountedEvents(store.events)
+        store.events = table
+        assert store.get_event_by_id("alice", 1099)["content"] == "99"
+        table.reads = table.scans = 0
+        assert store.get_event_by_id("alice", 1098)["content"] == "98"
+        assert store.get_event_by_id("alice", 9999) is None
+        assert (table.reads, table.scans) == (1, 0)
+        store.append_event("alice", "text", {"content": "new", "event_id": 42})
+        store.append_event("alice", "text", {"content": "duplicate", "event_id": 1099})
+        assert store.get_event_by_id("alice", 42)["content"] == "new"
+        assert store.get_event_by_id("alice", 1099)["content"] == "99"
+        assert table.scans == 0
+        store.append_event("bob", "text", {"content": "other", "event_id": 42})
+        assert store.get_event_by_id("bob", 42)["content"] == "other"
+    finally:
+        store.close()

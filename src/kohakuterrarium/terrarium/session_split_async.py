@@ -9,6 +9,7 @@ from kohakuterrarium.terrarium.session_merge_async import (
     prepare_merge,
 )
 from kohakuterrarium.terrarium.session_resources import retain_store
+from kohakuterrarium.terrarium.session_successor import stage_successor_async
 from kohakuterrarium.terrarium.topology_admission import fence_topology_members
 from kohakuterrarium.utils.logging import get_logger
 
@@ -23,9 +24,20 @@ class PreparedSplit:
     owned: bool
     agents: list
     plans: list = field(default_factory=list)
+    retirement_staged: bool = False
 
     async def install(self):
         try:
+            for plan in self.plans:
+                plan.validate()
+            if all(plan.destination is not self.source for plan in self.plans):
+                self.retirement_staged = True
+                await stage_successor_async(
+                    self.engine,
+                    self.source,
+                    [plan.destination for plan in self.plans],
+                    kind="split",
+                )
             for plan in self.plans:
                 await plan.install()
         except BaseException:
@@ -62,7 +74,7 @@ class PreparedSplit:
                 )
 
     async def abort(self):
-        uncertain = any(
+        uncertain = self.retirement_staged or any(
             plan.installed
             or plan.authority_changed
             or (plan.target_changed and not plan.fresh)

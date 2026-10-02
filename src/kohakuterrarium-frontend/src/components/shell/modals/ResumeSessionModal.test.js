@@ -40,6 +40,33 @@ function expectNoRuntimeSideEffects(tabs, openSurface) {
   expect(tabs.tabs).toHaveLength(0)
 }
 
+describe("ResumeSessionModal session rows", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+  })
+
+  it("shows the file size the saved-session list actually sends", async () => {
+    list.mockResolvedValue({
+      sessions: [
+        { name: "one", file_size: 2048 },
+        { name: "two", size_bytes: 4096 },
+        { name: "three" },
+      ],
+    })
+    const wrapper = mount(ResumeSessionModal)
+    await flushPromises()
+
+    const rows = wrapper
+      .findAll('input[type="radio"]')
+      .map((input) => input.element.closest("label").textContent)
+    expect(rows).toHaveLength(3)
+    expect(rows[0]).toContain("2 KB")
+    expect(rows[1]).toContain("4 KB")
+    expect(rows[2]).not.toMatch(/\d\s?(B|KB|MB)\b/)
+  })
+})
+
 describe("ResumeSessionModal workspace preflight choices", () => {
   let uninstall
   let history
@@ -115,4 +142,80 @@ describe("ResumeSessionModal workspace preflight choices", () => {
     expect(wrapper.emitted("close")).toBeUndefined()
     expectNoRuntimeSideEffects(tabs, openSurface)
   })
+})
+
+describe("ResumeSessionModal server discovery", () => {
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+  })
+  afterEach(() => vi.useRealTimers())
+
+  it("pages past the first results and searches all saved sessions using storage keys", async () => {
+    list.mockResolvedValueOnce({
+      sessions: [{ name: "file-1", agents: ["Named agent"] }],
+      total: 80,
+    })
+    const wrapper = mount(ResumeSessionModal)
+    await flushPromises()
+    expect(wrapper.text()).toContain("Named agent")
+    await wrapper.get('input[type="radio"]').setValue(true)
+    list.mockResolvedValueOnce({ sessions: [{ name: "file-21" }], total: 80 })
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text() === "sessions.next")
+      .trigger("click")
+    await flushPromises()
+    expect(list).toHaveBeenLastCalledWith({ limit: 20, offset: 20, search: "" })
+    expect(wrapper.get(".btn-primary").attributes("disabled")).toBeDefined()
+    list.mockResolvedValueOnce({
+      sessions: [{ name: "file-77", agents: ["Distant result"] }],
+      total: 1,
+    })
+    await wrapper.get('input[type="text"]').setValue("Distant")
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+    expect(list).toHaveBeenLastCalledWith({ limit: 20, offset: 0, search: "Distant" })
+    expect(wrapper.get('input[type="radio"]').attributes("value")).toBe("file-77")
+    wrapper.unmount()
+  })
+
+  it("ignores stale results during the debounce and cancels requests on unmount", async () => {
+    let resolveOld
+    list.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveOld = resolve
+      }),
+    )
+    const wrapper = mount(ResumeSessionModal)
+    await wrapper.get('input[type="text"]').setValue("new")
+    resolveOld({ sessions: [{ name: "stale" }], total: 1 })
+    await flushPromises()
+    expect(wrapper.text()).not.toContain("stale")
+    list.mockResolvedValueOnce({ sessions: [{ name: "fresh" }], total: 1 })
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+    expect(wrapper.text()).toContain("fresh")
+    await wrapper.get('input[type="text"]').setValue("abandoned")
+    wrapper.unmount()
+    await vi.advanceTimersByTimeAsync(300)
+    expect(list).toHaveBeenCalledTimes(2)
+  })
+})
+
+it("keeps the resume response name when the detail refresh fails", async () => {
+  setActivePinia(createPinia())
+  preflightResume.mockResolvedValue({ ready: true, gaps: [] })
+  resume.mockResolvedValue({
+    instance_id: "graph_resumed",
+    session_name: "My saved project",
+    type: "agent",
+  })
+  fetchOne.mockRejectedValue(new Error("temporary detail failure"))
+  const tabs = useTabsStore()
+  await tabs.createSession({ kind: "resume", sessionName: "file-key", alsoOpenInspector: true })
+  const surfaces = tabs.tabs.filter((tab) => tab.target === "graph_resumed")
+  expect(surfaces).toHaveLength(2)
+  expect(surfaces.every((tab) => tab.config_name === "My saved project")).toBe(true)
 })

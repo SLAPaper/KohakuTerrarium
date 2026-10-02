@@ -64,6 +64,19 @@ def _local_media_path(url: str) -> Path | None:
     return resolve_artifact_file(artifacts, match.group("path"))
 
 
+def _image_mime(data: bytes) -> str | None:
+    """Identify supported raster formats by signature without decoding pixels."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def resolve_artifact_url(url: str) -> str:
     """Inline a local media reference, preserving the original URL on failure."""
     if not isinstance(url, str):
@@ -84,7 +97,11 @@ def resolve_artifact_url(url: str) -> str:
         )
         return url
     ext = path.suffix.lower()
-    mime = _ARTIFACT_MIME_BY_EXT.get(ext, "application/octet-stream")
+    # Canvas artifacts retain their source filename, which may not match the
+    # encoded format. Describe the bytes we send, leaving stored refs untouched.
+    mime = _image_mime(data) or _ARTIFACT_MIME_BY_EXT.get(
+        ext, "application/octet-stream"
+    )
     b64 = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
@@ -112,10 +129,10 @@ def resolve_message_image_urls(
             if (
                 isinstance(part, dict)
                 and part.get("type") == "image_url"
-                and isinstance(part.get("image_url"), dict)
+                and isinstance(part.get("image_url"), (dict, str))
             ):
                 iu = part["image_url"]
-                url = iu.get("url")
+                url = iu.get("url") if isinstance(iu, dict) else iu
                 resolved = resolve_artifact_url(url) if isinstance(url, str) else url
                 if isinstance(resolved, str) and _is_unresolved_local_media(resolved):
                     logger.warning(
@@ -125,7 +142,10 @@ def resolve_message_image_urls(
                     msg_changed = True
                     continue
                 if resolved is not url and resolved != url:
-                    new_content.append({**part, "image_url": {**iu, "url": resolved}})
+                    image_url = (
+                        {**iu, "url": resolved} if isinstance(iu, dict) else resolved
+                    )
+                    new_content.append({**part, "image_url": image_url})
                     msg_changed = True
                     continue
             new_content.append(part)

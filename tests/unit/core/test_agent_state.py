@@ -216,7 +216,7 @@ async def test_plugin_load_failure_closes_owner_and_consumer(tmp_path):
     owner = agent._session_state_owner
     assert owner is None or owner.task is None or owner.task.done()
     assert agent._running is False
-    assert agent._consumer_task is not None and agent._consumer_task.done()
+    assert agent._consumer_task is None
     assert _owner_tasks() == []
 
 

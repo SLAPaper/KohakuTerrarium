@@ -8,8 +8,10 @@ identity no-op when nothing needs resolving (the common hot path).
 """
 
 import base64
+import io
 
 import pytest
+from PIL import Image
 
 from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm.artifact_resolve import (
@@ -30,6 +32,37 @@ def _lay_artifact(tmp_path, monkeypatch, sid="sid123", rel="pic.png", data=b"PNG
 
 
 class TestResolveArtifactUrl:
+    @pytest.mark.parametrize("reference_kind", ["file", "artifact"])
+    @pytest.mark.parametrize(
+        ("image_format", "mime", "filename"),
+        [
+            ("JPEG", "image/jpeg", "misnamed.png"),
+            ("PNG", "image/png", "misnamed.jpg"),
+            ("GIF", "image/gif", "misnamed.png"),
+            ("WEBP", "image/webp", "misnamed.png"),
+            ("JPEG", "image/jpeg", "no-extension"),
+        ],
+    )
+    def test_actual_image_type_overrides_filename(
+        self, tmp_path, monkeypatch, reference_kind, image_format, mime, filename
+    ):
+        encoded = io.BytesIO()
+        Image.new("RGB", (2, 2), color=(4, 8, 16)).save(encoded, format=image_format)
+        data = encoded.getvalue()
+        if reference_kind == "file":
+            path = tmp_path / filename
+            path.write_bytes(data)
+            url = path.as_uri()
+        else:
+            directory = _lay_artifact(tmp_path, monkeypatch, rel=filename, data=data)
+            path = directory / "sid123.artifacts" / filename
+            url = f"/api/sessions/sid123/artifacts/{filename}"
+
+        assert resolve_artifact_url(url) == (
+            f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+        )
+        assert path.read_bytes() == data
+
     def test_non_artifact_urls_passthrough(self):
         assert resolve_artifact_url("https://example.com/x.png") == (
             "https://example.com/x.png"
@@ -164,14 +197,16 @@ class TestResolveMessageImageUrls:
         # A text part that merely *contains* the path is not rewritten.
         assert resolve_message_image_urls(msgs) is msgs
 
-    def test_missing_file_reference_is_not_sent(self, tmp_path):
+    @pytest.mark.parametrize("as_object", [False, True])
+    def test_missing_file_reference_is_not_sent(self, tmp_path, as_object):
         url = (tmp_path / "gone.png").resolve().as_uri()
+        reference = {"url": url} if as_object else url
         msgs = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "look"},
-                    {"type": "image_url", "image_url": {"url": url}},
+                    {"type": "image_url", "image_url": reference},
                 ],
             }
         ]
@@ -179,7 +214,7 @@ class TestResolveMessageImageUrls:
         assert out is not msgs
         assert [p.get("type") for p in out[0]["content"]] == ["text"]
         assert url not in str(out)
-        assert msgs[0]["content"][1]["image_url"]["url"] == url
+        assert msgs[0]["content"][1]["image_url"] == reference
 
     def test_missing_artifact_url_is_not_sent(self, tmp_path, monkeypatch):
         monkeypatch.setattr(artifact_resolve, "_session_dir", lambda: tmp_path)
@@ -194,18 +229,22 @@ class TestResolveMessageImageUrls:
         assert out[0]["content"] == []
         assert url not in str(out)
 
-    def test_existing_file_reference_still_inlined(self, tmp_path):
+    @pytest.mark.parametrize("as_object", [False, True])
+    def test_existing_file_reference_still_inlined(self, tmp_path, as_object):
         pic = tmp_path / "kept.png"
         pic.write_bytes(b"PNGDATA")
         url = pic.resolve().as_uri()
+        reference = {"url": url, "detail": "high"} if as_object else url
         msgs = [
             {
                 "role": "user",
-                "content": [{"type": "image_url", "image_url": {"url": url}}],
+                "content": [{"type": "image_url", "image_url": reference}],
             }
         ]
         out = resolve_message_image_urls(msgs)
-        assert out[0]["content"][0]["image_url"]["url"].startswith(
-            "data:image/png;base64,"
-        )
-        assert msgs[0]["content"][0]["image_url"]["url"] == url
+        result = out[0]["content"][0]["image_url"]
+        if as_object:
+            assert result["detail"] == "high"
+            result = result["url"]
+        assert result.startswith("data:image/png;base64,")
+        assert msgs[0]["content"][0]["image_url"] == reference

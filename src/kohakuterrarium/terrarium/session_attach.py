@@ -31,14 +31,31 @@ def _bind(agent, store):
 
 
 async def attach_reserved(engine, gid, store):
-    """Keep the prior store open until binding and checkpointing succeed."""
+    """Keep the prior writer live and re-arm settled graph deliveries."""
+    try:
+        await _attach_reserved(engine, gid, store)
+    finally:
+        runtime = engine._drive_runtime
+        if runtime is not None:
+            for creature in engine._creatures.values():
+                if (
+                    creature.graph_id == gid
+                    and creature.is_running
+                    and not getattr(creature.agent, "_session_attach_uncertain", False)
+                ):
+                    runtime.schedule_reconcile(creature)
+
+
+async def _attach_reserved(engine, gid, store):
+    """Prepare, bind, checkpoint, and retire one reserved store replacement."""
     previous = engine._session_stores.get(gid)
     was_owned = gid in engine._owned_sessions
     minted = False
     if isinstance(store, (str, Path)):
         if (
             previous is not None
-            and Path(store).resolve() == Path(previous.path).resolve()
+            and not getattr(previous, "_closed", False)
+            and autosession.recipe_session_reuses_store(previous, store)
         ):
             store = previous
         else:

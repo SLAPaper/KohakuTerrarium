@@ -16,6 +16,7 @@ from kohakuterrarium.core.session_attachment import (
     attach_topology_member,
     topology_source_names,
 )
+from kohakuterrarium.terrarium.session_successor import stage_successor
 from kohakuterrarium.errors import SessionNotResumableError
 from kohakuterrarium.session.event_origin import capture_events, import_events
 from kohakuterrarium.session.identity import new_conversation_id
@@ -66,13 +67,15 @@ def _copy_session_into(src: SessionStore, dst: SessionStore, *, snapshots=True) 
         ).result()
         receipts = dst.submit(install_runtime_transfer, dst, captured).result()
         record_topology_transfer(src, dst, captured[0][0], receipts)
-        return len(receipts)
+        return sum(receipt["inserted"] for receipt in receipts)
     captured = src.submit(capture_events, src).result()
-    return len(dst.submit(import_events, dst, captured).result())
+    receipts = dst.submit(import_events, dst, captured).result()
+    return sum(receipt["inserted"] for receipt in receipts)
 
 
 # Configuration and environment metadata inherited by split/merge destinations.
 _RESUMABLE_META_KEYS: tuple[str, ...] = (
+    "format_version",
     "config_type",
     "config_path",
     "config_snapshot",
@@ -88,11 +91,7 @@ _RESUMABLE_META_KEYS: tuple[str, ...] = (
 
 
 def _inherit_resumable_meta(src_meta: dict, dst_store: SessionStore) -> None:
-    """Copy the resumable-config subset of ``src_meta`` into ``dst_store``.
-
-    Best-effort: per-key writes that fail are logged at debug and the
-    rest still propagate.
-    """
+    """Copy resumable configuration metadata, logging individual write failures."""
     for key in _RESUMABLE_META_KEYS:
         if key not in src_meta:
             continue
@@ -382,6 +381,9 @@ def apply_merge(
     engine._session_stores[keep_gid] = kept
     for gid in drop_gids:
         engine._session_stores.pop(gid, None)
+    for store in source_stores.values():
+        if store is not kept:
+            stage_successor(engine, store, [kept])
     if owned is not None:
         for gid in source_gids:
             owned.discard(gid)
@@ -468,11 +470,11 @@ def apply_split(
         # The parent's graph_id is not among the children (defensive — the
         # largest child normally keeps it); drop its stale map entry.
         engine._session_stores.pop(parent_gid, None)
-    # The parent is superseded ONLY when no child reused its live store; the
-    # fresh children each got their own duplicate. Hand ownership to the
-    # children (the reused store keeps the parent's ownership state).
-    if reuse_gid is None and parent_owned:
-        _close_superseded(parent)
+    # A parent without a retained child has ambiguous split successors.
+    if reuse_gid is None:
+        stage_successor(engine, parent, new_stores, kind="split")
+        if parent_owned:
+            _close_superseded(parent)
     if owned is not None:
         for gid in delta.old_graph_ids:
             owned.discard(gid)

@@ -32,7 +32,9 @@ observable state at every milestone. The call sequence mirrors
   ``sessionAPI.delete``.
 """
 
+import os
 from collections.abc import Iterator
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -42,6 +44,7 @@ from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import set_service
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
@@ -188,6 +191,22 @@ def _stream_turn(ws, message: str, *, branch_view=None) -> tuple[str, list[dict]
         elif ftype == "error":
             raise AssertionError(f"WS chat error frame: {frame!r}")
     return "".join(chunks), activities
+
+
+def _snapshot_messages(
+    client: TestClient, session_id: str, creature: str, limit: int = 400
+) -> list:
+    """Conversation messages via the paged history's ``snapshot`` stream.
+
+    The default ``events`` stream carries the event log only; the frontend reads
+    messages from the snapshot stream (``historyPageByTab``).
+    """
+    resp = client.get(
+        f"/api/sessions/{session_id}/creatures/{creature}/history",
+        params={"stream": "snapshot", "limit": limit},
+    )
+    assert resp.status_code == 200
+    return resp.json()["messages"]
 
 
 # ── journeys ──────────────────────────────────────────────────────────
@@ -456,12 +475,9 @@ class TestApiCreatureJourney:
                 },
             )
             assert edited.status_code == 200, edited.text
-            replayed = client.get(
-                f"/api/sessions/{session_id}/creatures/{creature_id}/history",
-                params={"stream": "snapshot", "limit": 400},
-            ).json()
-            assert replayed["messages"][-1]["content"] == "Edited turn completed."
-            for message in replayed["messages"]:
+            replayed = _snapshot_messages(client, session_id, creature_id)
+            assert replayed[-1]["content"] == "Edited turn completed."
+            for message in replayed:
                 for call in message.get("tool_calls") or []:
                     assert call["function"]["name"] == "scratchpad"
 
@@ -511,10 +527,7 @@ class TestApiCreatureJourney:
         resp = client.get(f"/api/sessions/{session_id}/creatures/{creature_id}/history")
         assert resp.status_code == 200
         history = resp.json()
-        messages = client.get(
-            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
-            params={"stream": "snapshot", "limit": 400},
-        ).json()["messages"]
+        messages = _snapshot_messages(client, session_id, creature_id)
         roles = [m.get("role") for m in messages]
         assert roles.count("user") >= 3
         joined = " ".join(
@@ -534,10 +547,8 @@ class TestApiCreatureJourney:
         resp = client.get(f"/api/sessions/{session_id}/creatures/warm-ember/history")
         assert resp.status_code == 200
         by_name = resp.json()
-        by_name_messages = client.get(
-            f"/api/sessions/{session_id}/creatures/warm-ember/history",
-            params={"stream": "snapshot", "limit": 400},
-        ).json()["messages"]
+        by_name_messages = _snapshot_messages(client, session_id, "warm-ember")
+        assert len(by_name_messages) == len(messages)
         assert by_name_messages == messages
         event_types = {e.get("type") for e in by_name["events"]}
         for required in (
@@ -608,10 +619,7 @@ class TestApiCreatureJourney:
             if e.get("turn_index") == 1 and e.get("branch_id") is not None
         }
         assert turn1_branches == {1, 2, 3}
-        edited_messages = client.get(
-            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
-            params={"stream": "snapshot", "limit": 400},
-        ).json()["messages"]
+        edited_messages = _snapshot_messages(client, session_id, creature_id)
         live_user = [m for m in edited_messages if m.get("role") == "user"]
         assert any(
             "edited hello creature" in (m.get("content") or "") for m in live_user
@@ -626,10 +634,7 @@ class TestApiCreatureJourney:
         assert "edited hello creature" not in str(selected_request)
         assert "hello creature" in str(selected_request)
         assert selected_request[-1]["content"] == "continue viewed original"
-        selected_snapshot = client.get(
-            f"/api/sessions/{session_id}/creatures/{creature_id}/history",
-            params={"stream": "snapshot", "limit": 400},
-        ).json()["messages"]
+        selected_snapshot = _snapshot_messages(client, session_id, creature_id)
         assert "edited hello creature" not in str(selected_snapshot)
         assert "continue viewed original" in str(selected_snapshot)
 
@@ -649,10 +654,7 @@ class TestApiCreatureJourney:
         resp = client.get(f"/api/sessions/{session_id}/creatures/calm-river/history")
         assert resp.status_code == 200
         renamed_history = resp.json()
-        renamed_messages = client.get(
-            f"/api/sessions/{session_id}/creatures/calm-river/history",
-            params={"stream": "snapshot", "limit": 400},
-        ).json()["messages"]
+        renamed_messages = _snapshot_messages(client, session_id, "calm-river")
         renamed_msgs = " ".join(
             m.get("content", "") if isinstance(m.get("content"), str) else ""
             for m in renamed_messages
@@ -811,6 +813,16 @@ class TestApiCreatureJourney:
         assert resp.status_code == 200
         assert client.get("/api/sessions/active").json() == []
 
+        # Another writer (for example a CLI) holds the session file: resume
+        # answers 409 Conflict, leaves no half-started session, and works
+        # again once the other writer lets go.
+        saved_path = Path(os.environ["KT_SESSION_DIR"]) / saved["filename"]
+        with closing(SessionStore(saved_path, writer_lock=True)):
+            resp = client.post(f"/api/sessions/{saved_name}/resume")
+            assert resp.status_code == 409, resp.text
+            assert "already open for writing" in resp.json()["detail"]
+            assert client.get("/api/sessions/active").json() == []
+
         # Resume from disk (frontend: sessionAPI.resume).
         resp = client.post(f"/api/sessions/{saved_name}/resume")
         assert resp.status_code == 200
@@ -828,12 +840,7 @@ class TestApiCreatureJourney:
         resp = client.get(f"/api/sessions/{resumed_id}/creatures/alice/history")
         assert resp.status_code == 200
         resumed_history = resp.json()
-        snapshot = client.get(
-            f"/api/sessions/{resumed_id}/creatures/alice/history",
-            params={"stream": "snapshot", "limit": 400},
-        )
-        assert snapshot.status_code == 200
-        resumed_blob = str(snapshot.json()["messages"])
+        resumed_blob = str(_snapshot_messages(client, resumed_id, "alice"))
         assert "persist this turn" in resumed_blob
         assert _REPLY_GREET in resumed_blob
         # The restored turn/branch counters carried over: the recorded

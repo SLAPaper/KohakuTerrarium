@@ -12,7 +12,7 @@ from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.terrarium import autosession, session_attach, session_merge_async
-from kohakuterrarium.terrarium.autosession import close_owned_stores
+from kohakuterrarium.terrarium.autosession import close_attached_stores
 from kohakuterrarium.terrarium.session_resources import (
     track_opened_store,
     transition_stores,
@@ -59,13 +59,14 @@ async def test_failed_merge_keeps_retirement_responsibility_for_old_source(
             assert all(store in engine._session_stores.values() for store in sources)
             assert all(not store._closed for store in sources)
             assert all(
-                (store in getattr(engine, "_retained_session_stores", ())) == owned
+                (store in getattr(engine, "_retained_session_stores", ()))
+                == (owned or store.meta.get("resume_successor") is not None)
                 for store in sources
             )
             assert (
                 a.agent._session_attach_uncertain and b.agent._session_attach_uncertain
             )
-        assert all(store._closed == owned for store in sources)
+        assert all(store._closed for store in sources)
     finally:
         for store in sources:
             store.close(update_status=False)
@@ -102,7 +103,7 @@ def test_failed_transition_closes_or_retains_every_opened_handle(
         else:
             assert not store._closed
             assert store in engine._retained_session_stores
-        close_owned_stores(engine)
+        close_attached_stores(engine)
         assert store._closed
         assert not getattr(engine, "_retained_session_stores", set())
     finally:
@@ -175,7 +176,9 @@ async def test_attach_double_fault_retains_handle_and_primary_error(
                         path=tmp_path / "replacement.kohakutr",
                         agents=["alice"],
                     )
-                    await autosession._attach_minted(engine, creature.graph_id, target)
+                    await autosession._attach_minted_store(
+                        engine, creature.graph_id, target
+                    )
         assert len(captured) == 1
         assert captured[0] in getattr(engine, "_retained_session_stores", set())
         assert not captured[0]._closed
@@ -244,7 +247,7 @@ async def test_drive_rollback_failure_keeps_referenced_store_open(
                         agents=["alice"],
                     )
                     if route == "autosession":
-                        await autosession._attach_minted(engine, gid, target)
+                        await autosession._attach_minted_store(engine, gid, target)
                     else:
                         await engine.attach_session(gid, target)
         if primary_error is RuntimeError:

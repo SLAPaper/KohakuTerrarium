@@ -12,7 +12,7 @@ from kohakuterrarium.core.config_types import AgentConfig
 
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium import session_coord as sc
-from kohakuterrarium.terrarium.autosession import close_owned_stores
+from kohakuterrarium.terrarium.autosession import close_attached_stores
 from kohakuterrarium.terrarium.topology import TopologyDelta
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
@@ -291,14 +291,35 @@ class TestCopyEventsInto:
         dst = SessionStore(str(tmp_path / "dst.kohakutr"))
         try:
             src.init_meta("s1", "agent", "/p", "/w", ["alice"])
-            src.append_event("alice", "user_input", {"content": "hi"})
-            src.append_event("alice", "user_input", {"content": "bye"})
+            src.append_event("alice", "user_input", {"content": "hi", "ts": 10})
+            src.append_event("alice", "user_input", {"content": "bye", "ts": 20})
+            dst.append_event("other", "text_chunk", {"content": "unrelated"})
             src.flush()
 
             n = sc.copy_events_into(src, dst)
             assert n == 2
             events = dst.get_events("alice")
             assert len(events) == 2
+            assert events[0]["event_id"] != src.get_events("alice")[0]["event_id"]
+            dst.append_event("alice", "user_input", {"content": "new", "ts": 30})
+            retained = dst.get_events("alice")
+            assert sc.copy_events_into(src, dst) == 0
+            assert dst.get_events("alice") == retained
+            src.append_event("alice", "user_input", {"content": "new", "ts": 30})
+            src.append_event("alice", "user_input", {"content": "bye", "ts": 40})
+            assert sc.copy_events_into(src, dst) == 2
+            combined = dst.get_events("alice")
+            assert combined[:3] == retained
+            assert [event["content"] for event in combined] == [
+                "hi",
+                "bye",
+                "new",
+                "new",
+                "bye",
+            ]
+            assert combined[2]["event_id"] != combined[3]["event_id"]
+            assert sc.copy_events_into(src, dst) == 0
+            assert dst.get_events("alice") == combined
         finally:
             src.close()
             dst.close()
@@ -308,15 +329,24 @@ class TestCopyEventsInto:
         dst = SessionStore(str(tmp_path / "dst.kohakutr"))
         try:
             src.init_meta("s1", "agent", "/p", "/w", ["alice"])
+            dst.append_event(
+                "alice",
+                "user_input",
+                {"content": "hi", "ts": 10},
+                turn_index=2,
+                branch_id=1,
+            )
             src.append_event(
                 "alice",
                 "user_input",
-                {"content": "hi"},
+                {"content": "hi", "ts": 10},
                 turn_index=2,
+                branch_id=2,
             )
             src.flush()
             n = sc.copy_events_into(src, dst)
             assert n == 1
+            assert [event["branch_id"] for event in dst.get_events("alice")] == [1, 2]
         finally:
             src.close()
             dst.close()
@@ -550,11 +580,28 @@ class TestApplyMerge:
             # Ownership followed the merge to the surviving id only.
             assert eng._owned_sessions == {"g1"}
             # Shutdown-time closure can now find + close the survivor.
-            close_owned_stores(eng)
+            close_attached_stores(eng)
             assert getattr(s1, "_closed", False) is True
         finally:
             s1.close()
             s2.close()
+
+    def test_shutdown_closes_stores_the_engine_did_not_mint(self, tmp_path):
+        eng = _make_engine(tmp_path)
+        minted = SessionStore(tmp_path / "minted.kohakutr")
+        attached = SessionStore(tmp_path / "attached.kohakutr")
+        eng._session_stores.update({"minted": minted, "attached": attached})
+        eng._owned_sessions.add("minted")
+        try:
+            close_attached_stores(eng)
+
+            assert getattr(minted, "_closed", False) is True
+            assert getattr(attached, "_closed", False) is True
+            assert eng._session_stores == {}
+            assert eng._owned_sessions == set()
+        finally:
+            minted.close()
+            attached.close()
 
     def test_merge_carries_replay_leftovers_to_survivor(self, tmp_path):
         # An unresolved replay remnant keyed under the dropped graph
@@ -705,7 +752,7 @@ class TestApplySplit:
             assert getattr(sa, "_closed", False) is False
             assert getattr(sb, "_closed", False) is False
             # Shutdown-time closure reaches the children (not the parent).
-            close_owned_stores(eng)
+            close_attached_stores(eng)
             assert getattr(sa, "_closed", False) is True
             assert getattr(sb, "_closed", False) is True
         finally:

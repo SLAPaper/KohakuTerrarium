@@ -8,8 +8,9 @@
       <span class="i-carbon-recently-viewed text-warm-400 shrink-0" />
       <span class="text-warm-500 text-xs shrink-0 w-20">{{ formatDate }}</span>
       <span class="shrink-0 max-w-48 truncate font-medium text-warm-800 dark:text-warm-200">
-        {{ sessionId }}
+        {{ savedSessionLabel(session) }}
       </span>
+      <span v-if="savedSessionLabel(session) !== sessionId" class="text-xs text-warm-400 truncate max-w-32" :title="sessionId">{{ sessionId }}</span>
       <span v-if="preview" class="text-warm-500 truncate flex-1 text-xs italic"> — {{ preview }} </span>
       <span v-else class="flex-1" />
       <span v-if="turnCount" class="text-xs text-warm-500 shrink-0">{{ turnCount }} turns</span>
@@ -27,6 +28,7 @@
 </template>
 
 <script setup>
+import { savedSessionLabel } from "@/utils/sessionLabels"
 import { computed, ref } from "vue"
 import { ElMessage } from "element-plus"
 
@@ -34,6 +36,7 @@ import { useInstancesStore } from "@/stores/instances"
 import { useTabsStore } from "@/stores/tabs"
 import { sessionAPI } from "@/utils/api"
 import { useI18n } from "@/utils/i18n"
+import { resumedTabMeta } from "@/utils/resumedTab"
 import { openSavedSessionHistory, prepareWorkspaceResume } from "@/utils/workdirPrompt"
 import { extractTextPreview } from "@/utils/multimodal"
 
@@ -58,7 +61,7 @@ const formatDate = computed(() => {
 const turnCount = computed(() => props.session.turn_count ?? props.session.turns ?? null)
 
 const size = computed(() => {
-  const bytes = props.session.size_bytes ?? props.session.size
+  const bytes = props.session.file_size ?? props.session.size_bytes ?? props.session.size
   if (!bytes) return ""
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
@@ -71,6 +74,7 @@ function onView() {
     kind: "session-viewer",
     id: `session:${sessionId.value}`,
     name: sessionId.value,
+    config_name: savedSessionLabel(props.session),
   })
 }
 
@@ -100,8 +104,7 @@ async function onResume() {
         kind: "attach",
         id: `attach:${id}`,
         target: id,
-        config_name: result?.config_name || sessionId.value,
-        type: result?.type || result?.kind || "creature",
+        ...resumedTabMeta(result, sessionId.value),
       })
     }
     ElMessage.success(t("sessions.resumed", { name: sessionId.value }))

@@ -323,7 +323,7 @@ def perform_fork(
     try:
         # Child identity and lineage replace parent-local metadata after copying.
         for key, value in parent_meta.items():
-            if key in ("forked_children", STORE_UUID):
+            if key in ("forked_children", STORE_UUID, "resume_successor"):
                 # Child discovery records belong only to the parent.
                 continue
             try:

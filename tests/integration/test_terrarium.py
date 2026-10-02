@@ -43,6 +43,7 @@ from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.session.history_replay import replay_selected_events
 from kohakuterrarium.session.migrations import ensure_latest_version
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.resume_target import resolve_resume_path
 import kohakuterrarium.terrarium.session_coord as _session_coord
 from kohakuterrarium.terrarium.drive.store import (
     DriveRepositoryClosedError,
@@ -825,6 +826,11 @@ class TestTerrariumIntegration:
         await carol_state.set_state_async("count", 7)
 
         # --- AUTO-SPLIT: remove the bridge creature -------------------
+        for name in ("alice", "carol"):
+            store.append_event(
+                name, "user_message", {"content": f"before {name}"}, turn_index=1
+            )
+        store.flush()
         events: list = []
         collector = await _events(service, events)
         await service.remove_creature("bob")
@@ -868,6 +874,12 @@ class TestTerrariumIntegration:
         assert await alice_state.get_state_async("count") == 3
         assert carol_state.get_state("count") == 7
         await alice_state.set_state_async("count", 4)
+        store_alice.append_event(
+            "alice", "user_message", {"content": "after alice"}, turn_index=2
+        )
+        store_carol.append_event(
+            "carol", "user_message", {"content": "after carol"}, turn_index=2
+        )
 
         # --- AUTO-MERGE: connect across the two graphs ----------------
         merge_res = await service.connect("alice", "carol", channel="reunite")
@@ -898,6 +910,13 @@ class TestTerrariumIntegration:
         assert alice_state.get_state("count") == 4
         assert await carol_state.get_state_async("count") == 7
         carol_state.set_state("count", 8)
+        for name in ("alice", "carol"):
+            assert [
+                event["content"]
+                for event in merged_store.get_events(name)
+                if event["type"] == "user_message"
+            ] == [f"before {name}", f"after {name}"]
+        assert merged_store.meta["format_version"] == 2
 
         # --- AUTO-SPLIT via disconnect (the other split trigger) -------
         # The merged graph has exactly one channel (``reunite``) joining
@@ -934,6 +953,42 @@ class TestTerrariumIntegration:
         for path in saved_paths:
             assert ensure_latest_version(path) == path
         assert len(snap["graphs"]) == 2
+
+        # A cold restart through either pre-merge file must restore the newest
+        # complete graph, not resurrect a standalone creature's stale snapshot.
+        restart_dir = tmp_path / "cold-restart"
+        original_paths = []
+        async with Terrarium(session_dir=restart_dir) as before_restart:
+            workers = []
+            for name in ("reader", "writer"):
+                worker = await before_restart.add_creature(
+                    _agent_config(name, tmp_path), start=True, io="headless"
+                )
+                workers.append(worker)
+                original_paths.append(
+                    before_restart._session_stores[worker.graph_id].path
+                )
+                await worker.run("before merging", timeout=5)
+            connected = await before_restart.connect(*workers, channel="team")
+            current_path = before_restart._session_stores[connected.graph_id].path
+            for worker in workers:
+                await worker.run("latest after merging", timeout=5)
+            expected_ids = {worker.creature_id for worker in workers}
+        for old_path in original_paths:
+            assert resolve_resume_path(old_path) == Path(current_path)
+            restored = await Terrarium.resume(old_path)
+            async with restored:
+                assert {
+                    c.creature_id for c in restored.list_creatures()
+                } == expected_ids
+                for worker in restored.list_creatures():
+                    assert "latest after merging" in str(
+                        worker.agent.controller.conversation.to_messages()
+                    )
+                    assert worker.agent._turn_index == 2
+                # Repeated resume attaches to the existing canonical graph.
+                assert await restored.adopt_session(old_path) == connected.graph_id
+                assert len(restored.list_creatures()) == 2
 
     async def test_split_drive_lifecycle_no_repo_race(
         self, make_service, tmp_path, monkeypatch
@@ -1159,6 +1214,20 @@ class TestTerrariumIntegration:
             == 1
         )
 
+        # Failed replacement must leave the live session writable. Reattaching
+        # the same path must retain its writer before another creature joins.
+        session_path = tmp_path / "hotplug.kohakutr"
+        await engine.attach_session(gid, session_path)
+        original_store = engine._session_stores[gid]
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("block", encoding="utf-8")
+        with pytest.raises(OSError):
+            await engine.attach_session(gid, blocker / "session.kohakutr")
+        assert engine._session_stores[gid] is original_store
+        assert not original_store._closed
+        await engine.attach_session(gid, session_path.resolve().as_uri())
+        assert engine._session_stores[gid] is original_store
+
         # Hot-plug a second creature into the live graph — it joins the
         # existing graph rather than minting a new one.
         helper = await service.add_creature(
@@ -1171,6 +1240,16 @@ class TestTerrariumIntegration:
         graphs = await service.list_graphs()
         assert len(graphs) == 1  # still ONE graph, now two creatures
         assert graphs[0].creature_ids == {"host", "helper"}
+
+        assert engine.get_creature("helper").agent.session_store is original_store
+        assert engine.get_creature("host").agent.session_store is original_store
+        replacement_path = tmp_path / "hotplug-replaced.kohakutr"
+        await engine.attach_session(gid, replacement_path)
+        replacement = engine._session_stores[gid]
+        assert replacement is not original_store and original_store._closed
+        assert gid in engine._owned_sessions
+        assert engine.get_creature("helper").agent.session_store is replacement
+        assert engine.get_creature("host").agent.session_store is replacement
 
         # Wire a channel and broadcast — the hot-plugged creature is a
         # first-class graph member, its listen wiring works at once.
@@ -2469,3 +2548,17 @@ class TestTerrariumIntegration:
             assert (
                 await manager.get_drive(record.drive_id)
             ).status is DriveStatus.PAUSED
+            before_completion = await manager.list_deliveries(record.drive_id)
+            completed = await LocalTerrariumService(engine).propose_drive_transition(
+                record.drive_id,
+                DriveStatus.COMPLETED,
+                actor=actor,
+                expected_revision=paused.revision,
+                evidence={"confirmed_by": actor.format()},
+            )
+            assert completed.record.status is DriveStatus.COMPLETED
+            assert completed.record.revision == paused.revision + 1
+            await manager._scan_ready()
+            await manager.dispatcher.dispatch_once()
+            await manager.dispatcher.drain()
+            assert await manager.list_deliveries(record.drive_id) == before_completion

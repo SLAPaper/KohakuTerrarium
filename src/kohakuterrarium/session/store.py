@@ -12,11 +12,16 @@ from kohakuvault import KVault, TextVault
 
 from kohakuterrarium.session.artifacts import artifacts_dir_for, write_artifact_bytes
 from kohakuterrarium.session import event_origin
+from kohakuterrarium.session.event_key_index import EventKeyIndex
 from kohakuterrarium.session.history import (
     dedupe_adjacent_duplicate_events,
     normalize_resumable_events,
 )
 from kohakuterrarium.session.identity import legacy_conversation_id, new_conversation_id
+from kohakuterrarium.session.open_registry import (
+    register_open_store,
+    unregister_open_store,
+)
 from kohakuterrarium.session.rollup import (
     get_turn_rollup,
     list_turn_rollups,
@@ -36,6 +41,10 @@ from kohakuterrarium.session.store_counters import (
     restore_suffix_counters,
 )
 from kohakuterrarium.session.store_control import append_control_event
+from kohakuterrarium.session.store_discovery import (
+    discover_agents,
+    discover_attached_agents,
+)
 from kohakuterrarium.session.store_fork import perform_fork
 from kohakuterrarium.session.store_lock import (
     TABLE_ATTRS,
@@ -70,6 +79,10 @@ def iter_kv_keys(
     return table.keys(prefix=prefix, limit=limit)
 
 
+def _key_text(key: Any) -> str:
+    return key.decode("utf-8", errors="replace") if isinstance(key, bytes) else key
+
+
 class SessionStore(StoreAffinityMixin):
     """Persistent session storage backed by KohakuVault.
 
@@ -99,6 +112,13 @@ class SessionStore(StoreAffinityMixin):
 
         # The optional cross-process writer lock is released during close.
         self._writer_lock = acquire_writer_lock(self._path) if writer_lock else None
+        self._ready = False
+        try:
+            register_open_store(self._path, self)
+        except BaseException:
+            release_writer_lock(self._writer_lock)
+            self._writer_lock = None
+            raise
 
         self._flush_every_n_events: int = (
             flush_every_n_events
@@ -114,6 +134,7 @@ class SessionStore(StoreAffinityMixin):
         self._last_flush_at: float = time.monotonic()
 
         # Per-namespace sequences coexist with one session-wide event identifier.
+        self._event_keys = EventKeyIndex()
         self._event_seq: dict[str, int] = {}
         self._channel_seq: dict[str, int] = {}
         self._subagent_runs: dict[str, int] = {}
@@ -137,9 +158,15 @@ class SessionStore(StoreAffinityMixin):
             )
             release_writer_lock(self._writer_lock)
             self._writer_lock = None
+            unregister_open_store(self._path, self)
             raise
-
+        self._ready = True
         logger.debug("SessionStore opened", path=self._path)
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether the store accepts live readers."""
+        return self._ready and not self._closed
 
     def _open_tables(self) -> None:
         """Open every KVault / TextVault table backing this store."""
@@ -190,7 +217,8 @@ class SessionStore(StoreAffinityMixin):
             self._companion_closers.append(closer)
 
     def _restore_counters(self) -> None:
-        """Restore counters, verifying row maxima for identity-enabled stores."""
+        """Restore verified counters and invalidate derived event locators."""
+        self._event_keys.clear()
         self._global_event_id = restore_event_counters(
             self.events,
             self._event_seq,
@@ -260,6 +288,7 @@ class SessionStore(StoreAffinityMixin):
         if not imported and "ts" not in data:
             data["ts"] = time.time()
         self.events[key] = data
+        self._event_keys.record(key, event_id)
 
         text = data.get("content") or data.get("output") or data.get("text") or ""
         if isinstance(text, str) and len(text) > 10:
@@ -366,22 +395,18 @@ class SessionStore(StoreAffinityMixin):
         return self._global_event_id
 
     def get_event_by_id(self, agent: str, event_id: int) -> dict | None:
-        """Fetch a single event by its session-global ``event_id``.
+        """Fetch a current event using a lazily built, per-agent key index.
 
-        Scans the agent's keys but reads only values until the id matches —
-        the lazy companion to ``output_preview``-bounded history payloads
-        (frontend expands fetch the full output on demand).
+        The first lookup scans historical values; subsequent lookups read only
+        the matching payload. Appends update locators, including mirrored ids.
         """
         self._flush_events_cache()
-        for key_bytes in iter_kv_keys(self.events, prefix=f"{agent}:e"):
-            try:
-                evt = self.events[key_bytes]
-            except Exception as e:
-                logger.warning("Failed to read event", error=str(e), exc_info=True)
-                continue
-            if isinstance(evt, dict) and evt.get("event_id") == event_id:
-                return event_origin.annotate_coordinate(self, agent, evt)
-        return None
+        event = self._event_keys.get(self.events, agent, event_id)
+        return (
+            event_origin.annotate_coordinate(self, agent, event)
+            if event is not None
+            else None
+        )
 
     def get_resumable_events(
         self,
@@ -797,65 +822,16 @@ class SessionStore(StoreAffinityMixin):
         Framework namespaces and attached-agent namespaces are excluded so
         resume does not rebuild them as standalone creatures.
         """
-        # Buffered event keys must be flushed before namespace discovery.
-        self.events.flush_cache()
-        seen: list[str] = []
-        excluded = {"terrarium"}
-        for key_bytes in iter_kv_keys(self.events):
-            key = (
-                key_bytes.decode("utf-8", errors="replace")
-                if isinstance(key_bytes, bytes)
-                else key_bytes
-            )
-            parts = key.rsplit(":e", 1)
-            if len(parts) != 2:
-                continue
-            agent = parts[0]
-            # Attached namespaces are reported by the dedicated discovery API.
-            if ":attached:" in agent:
-                continue
-            if agent not in excluded and agent not in seen:
-                seen.append(agent)
-        return seen
+        return discover_agents(self._event_key_names())
 
     def discover_attached_agents(self) -> list[dict[str, Any]]:
         """Return attached-agent namespaces from events in first-seen order."""
-        # Buffered event keys must be visible before discovery.
+        return discover_attached_agents(self._event_key_names())
+
+    def _event_key_names(self) -> list[str]:
+        """Event keys as text; buffered keys are flushed so they are visible."""
         self.events.flush_cache()
-        seen: dict[str, dict[str, Any]] = {}
-        for key_bytes in iter_kv_keys(self.events):
-            key = (
-                key_bytes.decode("utf-8", errors="replace")
-                if isinstance(key_bytes, bytes)
-                else key_bytes
-            )
-            parts = key.rsplit(":e", 1)
-            if len(parts) != 2:
-                continue
-            ns = parts[0]
-            # Roles may contain colons, so split the sequence from the right.
-            segments = ns.split(":attached:", 1)
-            if len(segments) != 2:
-                continue
-            host = segments[0]
-            remainder = segments[1]
-            role_and_seq = remainder.rsplit(":", 1)
-            if len(role_and_seq) != 2:
-                continue
-            role, seq_str = role_and_seq
-            try:
-                attach_seq = int(seq_str)
-            except ValueError:
-                continue
-            if ns in seen:
-                continue
-            seen[ns] = {
-                "host": host,
-                "role": role,
-                "attach_seq": attach_seq,
-                "namespace": ns,
-            }
-        return list(seen.values())
+        return [_key_text(key) for key in iter_kv_keys(self.events)]
 
     def search(self, query: str, k: int = 10) -> list[dict]:
         """Search session content via FTS5 (BM25 keyword search).
@@ -881,11 +857,12 @@ class SessionStore(StoreAffinityMixin):
         self._unflushed_event_count = 0
         self._last_flush_at = time.monotonic()
 
-    def checkpoint(self) -> None:
+    def checkpoint(self, *, strict: bool = False) -> None:
         """Flush every table cache and checkpoint the WAL — without closing.
 
         Raw file copies omit cached and WAL-only rows. Call this before copying
         bytes from an open store so metadata and recent events are complete.
+        ``strict=True`` propagates table failures to durability-sensitive callers.
         """
         for table in (
             self.events,
@@ -900,10 +877,14 @@ class SessionStore(StoreAffinityMixin):
             try:
                 table.flush_cache()
             except Exception:  # pragma: no cover - checkpoint continues per table
+                if strict:
+                    raise
                 logger.warning("checkpoint: flush_cache failed", exc_info=True)
             try:
                 table.checkpoint()
             except Exception:  # pragma: no cover - checkpoint continues per table
+                if strict:
+                    raise
                 logger.warning("checkpoint: WAL checkpoint failed", exc_info=True)
         self._unflushed_event_count = 0
         self._last_flush_at = time.monotonic()
@@ -926,23 +907,29 @@ class SessionStore(StoreAffinityMixin):
         """
         if not self._begin_close():
             return
-        if self._readonly:
-            update_status = False
-        if not self._readonly:
-            persist_event_counter(self.state, self._global_event_id)
-        if update_status:
+        try:
+            if self._readonly:
+                update_status = False
+            else:
+                persist_event_counter(self.state, self._global_event_id)
+            if update_status:
+                try:
+                    self.update_status("paused")
+                except Exception as e:
+                    logger.warning(
+                        "Failed to update session status on close",
+                        error=str(e),
+                        exc_info=True,
+                    )
+        finally:
+            tables = tuple(getattr(self, name) for name in TABLE_ATTRS)
             try:
-                self.update_status("paused")
-            except Exception as e:
-                logger.warning(
-                    "Failed to update session status on close",
-                    error=str(e),
-                    exc_info=True,
+                close_tables(
+                    tables, self.fts, self._writer_lock, self._companion_closers
                 )
-        tables = tuple(getattr(self, name) for name in TABLE_ATTRS)
-        # Close helpers release the writer lock even if a companion closer fails.
-        close_tables(tables, self.fts, self._writer_lock, self._companion_closers)
-        self._writer_lock = None
+            finally:
+                self._writer_lock = None
+                unregister_open_store(self._path, self)
         logger.debug("SessionStore closed", path=self._path)
 
     def fork(

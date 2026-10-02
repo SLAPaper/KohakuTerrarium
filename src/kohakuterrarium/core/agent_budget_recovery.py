@@ -5,6 +5,7 @@ from typing import Any
 
 from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.llm.recovery import drop_last_tool_round
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -25,11 +26,21 @@ def sync_emergency_drop_conversation(
             "Live emergency recovery requires a request-scoped owner commit"
         )
     try:
+        serialized = [_message_to_conversation_json(msg) for msg in messages]
+        _, retained = drop_last_tool_round(
+            agent.controller.conversation.snapshot_messages()
+        )
+        identities = [msg.pop("metadata", {}) for msg in retained]
+        if retained == messages:
+            for msg, metadata in zip(serialized, identities):
+                msg["metadata"] = metadata
         data = {
-            "messages": [_message_to_conversation_json(msg) for msg in messages],
+            "messages": serialized,
             "metadata": _metadata_for_messages(agent, messages),
         }
-        agent.controller.conversation = Conversation.from_json(json.dumps(data))
+        agent.controller.conversation.adopt_contents(
+            Conversation.from_json(json.dumps(data))
+        )
     except Exception as exc:
         logger.debug(
             "Failed to sync emergency-drop conversation",

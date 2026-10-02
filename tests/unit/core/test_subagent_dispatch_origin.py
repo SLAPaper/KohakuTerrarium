@@ -44,8 +44,8 @@ class ParentProvider(ScriptedLLM):
 
 
 @pytest.mark.parametrize("background", [False, True])
-@pytest.mark.parametrize("rejection", ["depth", "unknown", "invalid_flag"])
-async def test_depth_rejection_has_native_terminal(tmp_path, background, rejection):
+@pytest.mark.parametrize("rejection", ["unknown", "invalid_flag"])
+async def test_rejected_dispatch_has_native_terminal(tmp_path, background, rejection):
     async with Terrarium(session_dir=tmp_path / "sessions") as engine:
         creature = await engine.add_creature(
             AgentConfig(name="alice", tool_format="native"),
@@ -59,13 +59,9 @@ async def test_depth_rejection_has_native_terminal(tmp_path, background, rejecti
         cfg = SubAgentConfig(name="child", description="child", tools=[])
         agent.subagent_manager.register(cfg)
         agent.registry.register_subagent("child", cfg)
-        if rejection == "depth":
-            agent.subagent_manager._max_depth = 1
-            agent.subagent_manager._current_depth = 1
-        elif rejection == "unknown":
+        if rejection == "unknown":
             agent.subagent_manager._configs.pop("child")
         expected_error = {
-            "depth": "depth limit",
             "unknown": "not registered",
             "invalid_flag": "boolean",
         }[rejection]

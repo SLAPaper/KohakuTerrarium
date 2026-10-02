@@ -19,6 +19,10 @@ the agent from the ``config_path`` in meta and re-injects state;
 
 import asyncio
 from copy import deepcopy
+import hashlib
+import os
+import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,6 +59,7 @@ from kohakuterrarium.session.history import (
     replay_conversation,
 )
 from kohakuterrarium.session.memory import SessionMemory
+from kohakuterrarium.session.memory_async import live_memory_for_store
 from kohakuterrarium.session.migrations import (
     discover_versions,
     ensure_latest_version,
@@ -91,7 +96,7 @@ class _HashEmbedder(BaseEmbedder):
         out = np.zeros((len(texts), self.dimensions), dtype=np.float32)
         for row, text in enumerate(texts):
             for token in text.lower().split():
-                idx = hash(token) % self.dimensions
+                idx = hashlib.sha256(token.encode()).digest()[0] % self.dimensions
                 out[row, idx] += 1.0
             norm = float(np.linalg.norm(out[row]))
             if norm > 0:
@@ -140,6 +145,9 @@ def patched_llm(monkeypatch):
     monkeypatch.setattr(_bootstrap_llm, "create_llm_provider", _fake_create)
     monkeypatch.setattr(_agent_init, "create_llm_provider", _fake_create)
     return holder
+
+
+CHILD = "tests.helpers.live_store_stress_child"
 
 
 def _write_agent_config(config_dir, name: str = "scribe") -> str:
@@ -1402,6 +1410,19 @@ class TestSessionIntegration:
             assert reopened_stats["vec_blocks"] > 0
         finally:
             reopened_mem.close()
+        live_memory = await store.run(live_memory_for_store, store)
+        for mode in ("fts", "semantic", "hybrid"):
+            hits, warning = await live_memory.search(
+                "plan the database migration carefully",
+                names=["seeker"],
+                config={},
+                create_embedder=lambda _: _HashEmbedder(),
+                mode=mode,
+            )
+            assert warning is None
+            assert any(
+                h.content == "plan the database migration carefully" for h in hits
+            )
         store.close()
 
     async def test_fork_at_event_copies_lineage(self, patched_llm, tmp_path):
@@ -1456,6 +1477,7 @@ class TestSessionIntegration:
             if e["type"] == "user_input" and e.get("content") == "turn two"
         )
         fork_point_id = turn_two_evt["event_id"]
+        assert store.get_event_by_id("brancher", fork_point_id) == turn_two_evt
         events_at_or_before = [e for e in all_events if e["event_id"] <= fork_point_id]
 
         fork_path = tmp_path / "brancher-fork.kohakutr.v2"
@@ -1470,6 +1492,9 @@ class TestSessionIntegration:
             assert [e["event_id"] for e in child_events] == [
                 e["event_id"] for e in events_at_or_before
             ]
+            for event in child_events:
+                assert child.get_event_by_id("brancher", event["event_id"]) == event
+            assert child.get_event_by_id("brancher", all_events[-1]["event_id"]) is None
             child_max = max(e["event_id"] for e in child_events)
             assert child_max == fork_point_id
             parent_max = max(e["event_id"] for e in all_events)
@@ -1984,3 +2009,23 @@ class TestSessionIntegration:
         # A target version with no registered migrator chain is rejected.
         with pytest.raises((ValueError, RuntimeError)):
             migrate(v1_path, 99)
+
+    def test_live_store_is_readable_while_it_writes_without_crashing(self, tmp_path):
+        """Read a session file through the read view while a live store writes it.
+
+        Runs in a child process: two SQLite library copies on one file used to
+        end in a native bus error, which would kill the test run itself. The
+        child must finish and must have read the events the store wrote.
+        """
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+        done = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-m", CHILD, str(tmp_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert done.returncode == 0, done.stderr[-1500:]
+        marker, _, seen = done.stdout.strip().rpartition(" ")
+        assert marker == "LIVE-STORE-OK"
+        assert int(seen) > 0

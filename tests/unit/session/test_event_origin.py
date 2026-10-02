@@ -258,7 +258,9 @@ def test_direct_preset_id_collision_cannot_corrupt_activated_store(stores):
             "message",
             {"event_id": eid, "content": "collision"},
         ).result()
-    assert copy_events_into(a, b) == 1
+    before = b.submit(b.get_events, "alice").result()
+    assert copy_events_into(a, b) == 0
+    assert b.submit(b.get_events, "alice").result() == before
 
 
 def test_multihop_receipts_and_return_to_source(stores):
@@ -271,7 +273,7 @@ def test_multihop_receipts_and_return_to_source(stores):
         first[0]["origin"] == second[0]["origin"] == (captured[0], "alice", original_id)
     )
     assert second[0]["source"][0] != captured[0]
-    assert copy_events_into(c, a) == 1
+    assert copy_events_into(c, a) == 0
     assert len(a.submit(a.get_events, "alice").result()) == 1
     repeat = c.submit(import_events, c, captured).result()
     assert not repeat[0]["inserted"]
@@ -413,7 +415,9 @@ def test_all_namespaces_and_stale_counter_reopen(stores, monkeypatch, persisted_
     try:
         _, eid = append(reopened, text="next")
         assert eid > max(3, persisted_max)
-        assert copy_events_into(a, reopened) == 3
+        before = reopened.submit(capture_events, reopened).result()
+        assert copy_events_into(a, reopened) == 0
+        assert reopened.submit(capture_events, reopened).result() == before
         assert len(reopened.submit(reopened.get_events, "alice").result()) == 2
     finally:
         reopened.close(update_status=False)

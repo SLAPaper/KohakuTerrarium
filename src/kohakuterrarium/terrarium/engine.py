@@ -329,8 +329,7 @@ class Terrarium:
             store = self._session_stores.get(c.graph_id)
             if isinstance(store, SessionStore):
                 await store.run(validate_legacy_state, store)
-            if c.is_running:
-                await c.stop(requested=False)
+            await c.stop(requested=False)
 
         async def operation():
             await self._remove_creature_reserved(cid)
@@ -811,9 +810,9 @@ class Terrarium:
                         graph_id=graph_id,
                         error=str(e),
                     )
-            # Close every store this engine minted — without this, files
-            # stay status="running" forever (the HW4 case: 61 stuck files).
-            _autosession.close_owned_stores(self)
+            # Close every attached store — without this, files stay
+            # status="running" forever (the HW4 case: 61 stuck files).
+            _autosession.close_attached_stores(self)
             # Terminate live subscribers — ``async for ev in t.subscribe()``
             # used to hang forever after shutdown.
             for sub in list(self._subscribers):

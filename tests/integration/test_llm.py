@@ -122,7 +122,16 @@ from kohakuterrarium.modules.tool.base import (
     ToolContext,
     ToolResult,
 )
+from kohakuterrarium.llm.turn_segments import KT_ASSISTANT_SEGMENTS
 from kohakuterrarium.session.store import SessionStore
+from tests.helpers.anthropic_stream import ANSWER as ANTHROPIC_ANSWER
+from tests.helpers.anthropic_stream import anthropic_provider
+from tests.helpers.reasoning_stream import (
+    ANSWER,
+    REASONING_PIECES,
+    dual_form_provider,
+    reasoning_segments,
+)
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -1103,6 +1112,249 @@ class TestLlmIntegration:
         #    stable, which is what makes session resume safe.
         assert [m.to_dict() for m in rebuilt] == wire
 
+        jpeg_buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), "blue").save(jpeg_buffer, format="JPEG")
+        expected_jpeg = jpeg_buffer.getvalue()
+        mime_sessions = tmp_path / "mime-sessions"
+        mime_artifacts = mime_sessions / "synthetic-mime.artifacts"
+        mime_artifacts.mkdir(parents=True)
+        mislabeled = mime_artifacts / "synthetic-jpeg.png"
+        mislabeled.write_bytes(expected_jpeg)
+        jpeg_result = await ReadTool().execute(
+            {"path": str(mislabeled)},
+            context=ToolContext(
+                agent_name="reader", session=None, working_dir=tmp_path
+            ),
+        )
+        assert jpeg_result.success
+        assert jpeg_result.output[1].url == mislabeled.resolve().as_uri()
+        mime_wire = messages_to_dicts(
+            [
+                UserMessage(
+                    [
+                        jpeg_result.output[0],
+                        ImagePart(
+                            url="/api/sessions/synthetic-mime/artifacts/synthetic-jpeg.png"
+                        ),
+                    ]
+                )
+            ]
+        )
+        saved_mime_wire = json.dumps(mime_wire)
+        replayed_mime_wire = json.loads(saved_mime_wire)
+        mime_requests = []
+        mime_provider = anthropic_provider(
+            "claude-opus-5-5",
+            requests=mime_requests,
+            extra_body={"disable_prompt_caching": True},
+        )
+        try:
+            with monkeypatch.context() as mime_patch:
+                mime_patch.setattr(
+                    artifact_resolve, "_session_dir", lambda: mime_sessions
+                )
+                assert (
+                    await mime_provider.chat_complete(replayed_mime_wire)
+                ).content == ANTHROPIC_ANSWER
+        finally:
+            await mime_provider.close()
+        assert json.dumps(replayed_mime_wire) == saved_mime_wire
+        mime_content = mime_requests[0]["messages"][0]["content"]
+        assert "image/jpeg" in mime_content[0]["text"]
+        assert mime_content[1]["source"]["media_type"] == "image/jpeg"
+        assert base64.b64decode(mime_content[1]["source"]["data"]) == expected_jpeg
+        assert mislabeled.read_bytes() == expected_jpeg
+
+        switched = [
+            SystemMessage("\n\n"),
+            UserMessage([TextPart("\n\n"), image]),
+            AssistantMessage(
+                "\n\n",
+                tool_calls=[
+                    {
+                        "id": "blank-call",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            ),
+            ToolMessage("", tool_call_id="blank-call"),
+            AssistantMessage("\n\n"),
+            UserMessage("  Continue.\n"),
+        ]
+        switched_wire = messages_to_dicts(switched)
+        saved_switched = json.dumps(switched_wire)
+        blank_requests = []
+        blank_provider = anthropic_provider(
+            "claude-opus-5-5",
+            requests=blank_requests,
+            extra_body={"disable_prompt_caching": True},
+        )
+        try:
+            assert (
+                await blank_provider.chat_complete(switched_wire)
+            ).content == ANTHROPIC_ANSWER
+        finally:
+            await blank_provider.close()
+        assert json.dumps(switched_wire) == saved_switched
+        assert messages_to_dicts(dicts_to_messages(switched_wire)) == switched_wire
+        assert "system" not in blank_requests[0]
+        assert blank_requests[0]["messages"] == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "AAAA",
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "blank-call",
+                        "name": "read",
+                        "input": {},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "blank-call",
+                        "content": "",
+                    }
+                ],
+            },
+            {"role": "user", "content": "  Continue.\n"},
+        ]
+
+        tool_history = [
+            UserMessage("Read the image."),
+            AssistantMessage(
+                "",
+                tool_calls=[
+                    {
+                        "id": "image-call",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            ),
+            ToolMessage(
+                [
+                    TextPart(""),
+                    TextPart("Image: synthetic.png"),
+                    TextPart(" \t\n"),
+                    image,
+                ],
+                tool_call_id="image-call",
+            ),
+            UserMessage("Continue."),
+        ]
+        tool_wire = messages_to_dicts(tool_history)
+        saved_tool_wire = json.dumps(tool_wire)
+        tool_requests = []
+        tool_provider = anthropic_provider(
+            "claude-opus-5-5",
+            requests=tool_requests,
+            extra_body={"disable_prompt_caching": True},
+        )
+        try:
+            assert (
+                await tool_provider.chat_complete(tool_wire)
+            ).content == ANTHROPIC_ANSWER
+        finally:
+            await tool_provider.close()
+        assert json.dumps(tool_wire) == saved_tool_wire
+        assert tool_requests[0]["messages"][2]["content"] == [
+            {
+                "type": "tool_result",
+                "tool_use_id": "image-call",
+                "content": [
+                    {"type": "text", "text": "Image: synthetic.png"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "AAAA",
+                        },
+                    },
+                ],
+            }
+        ]
+
+        small_png = io.BytesIO()
+        Image.new("RGB", (2, 2), "green").save(small_png, format="PNG")
+        small_png_base64 = base64.b64encode(small_png.getvalue()).decode("ascii")
+        large_png = io.BytesIO()
+        Image.new("RGBA", (2500, 1000), (10, 20, 30, 100)).save(large_png, format="PNG")
+        large_path = tmp_path / "large-screenshot.png"
+        large_path.write_bytes(large_png.getvalue())
+        size_wire = messages_to_dicts(
+            [
+                UserMessage(
+                    [
+                        ImagePart(url=f"data:image/png;base64,{small_png_base64}")
+                        for _ in range(20)
+                    ]
+                ),
+                AssistantMessage("Send the next image."),
+                UserMessage(
+                    [TextPart("Large screenshot"), ImagePart(url=large_path.as_uri())]
+                ),
+            ]
+        )
+        saved_size_wire = json.dumps(size_wire)
+        size_requests = []
+        size_provider = anthropic_provider(
+            "claude-opus-5-5",
+            requests=size_requests,
+            extra_body={"disable_prompt_caching": True},
+        )
+        try:
+            assert (
+                await size_provider.chat_complete(size_wire)
+            ).content == ANTHROPIC_ANSWER
+            assert (
+                "".join(
+                    [
+                        chunk
+                        async for chunk in size_provider.chat(size_wire, stream=True)
+                    ]
+                )
+                == ANTHROPIC_ANSWER
+            )
+        finally:
+            await size_provider.close()
+        assert len(size_requests) == 2
+        for size_request in size_requests:
+            sent = size_request["messages"]
+            assert len(sent) == 3
+            assert len(sent[0]["content"]) == 20
+            assert all(
+                block["source"]["data"] == small_png_base64
+                for block in sent[0]["content"]
+            )
+            assert sent[2]["content"][0]["text"] == "Large screenshot"
+            resized = sent[2]["content"][1]["source"]
+            assert resized["media_type"] == "image/png"
+            with Image.open(
+                io.BytesIO(base64.b64decode(resized["data"]))
+            ) as resized_image:
+                assert resized_image.size == (2000, 800)
+        assert json.dumps(size_wire) == saved_size_wire
+        assert large_path.read_bytes() == large_png.getvalue()
+
         # Text-only content stays a plain string, never a list.
         assert make_multimodal_content("just text", images=None) == "just text"
         assert UserMessage("plain").to_dict() == {
@@ -1599,6 +1851,60 @@ class TestLlmIntegration:
                 assert reply.content == "A red square."
                 assert responses_requests[-1]["input"][1] == reasoning_item
             assert restored.to_messages() == saved_history
+
+            budget_requests = []
+
+            def budget_response(request):
+                body = json.loads(request.content)
+                budget_requests.append(body)
+                count = sum(
+                    part["type"] == "input_image"
+                    for part in body["input"][0]["content"]
+                )
+                if count > 50:
+                    return httpx.Response(
+                        400,
+                        json={
+                            "error": {
+                                "message": "Exceeded maximum number of images (50) allowed in the request"
+                            }
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    content='data: {"type":"response.output_text.delta","delta":"bounded"}\n\n',
+                )
+
+            previous_client = responses_provider._client
+            responses_provider._client = previous_client.with_options(
+                http_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(budget_response)
+                )
+            )
+            await previous_client.close()
+            budget_history = [
+                UserMessage(
+                    [
+                        ImagePart(url=f"https://example.invalid/synthetic/{index}")
+                        for index in range(56)
+                    ]
+                )
+            ]
+            saved_budget_history = messages_to_dicts(budget_history)
+            bounded = await responses_provider.chat_complete(budget_history)
+            assert bounded.content == "bounded" and len(budget_requests) == 2
+            assert len(budget_requests[0]["input"][0]["content"]) == 56
+            parts = budget_requests[1]["input"][0]["content"]
+            assert "6 image(s) omitted" in parts[0]["text"]
+            assert [part["image_url"] for part in parts[1:]] == [
+                f"https://example.invalid/synthetic/{index}" for index in range(6, 56)
+            ]
+            assert messages_to_dicts(budget_history) == saved_budget_history
+            assert (
+                await responses_provider.chat_complete(budget_history)
+            ).content == "bounded"
+            assert budget_requests[2]["input"] == budget_requests[1]["input"]
         finally:
             await responses_provider.close()
 
@@ -1606,7 +1912,7 @@ class TestLlmIntegration:
         ws_submissions = []
 
         async def ws_response(socket):
-            while len(ws_submissions) < 5:
+            while len(ws_submissions) < 6:
                 turn = len(ws_submissions)
                 ws_submissions.append(json.loads(await socket.recv()))
                 if turn == 1:
@@ -1691,6 +1997,7 @@ class TestLlmIntegration:
             port = server.sockets[0].getsockname()[1]
             for provider_type in (OpenAIProvider, CodexOAuthProvider):
                 ws_submissions.clear()
+                source.write_bytes(image_bytes)
                 ws_provider = provider_type(
                     api_key="test",
                     model="vision",
@@ -1780,8 +2087,30 @@ class TestLlmIntegration:
                             ],
                         }
                     ]
+                    # Deleting a previously sent file changes the request prefix.
+                    # Neither WS provider may replay the stale local URL or use
+                    # the previous response's image-bearing cached context.
+                    source.unlink()
+                    ws_history.extend(
+                        [
+                            {"role": "assistant", "content": "continued"},
+                            {"role": "user", "content": "Continue without the file"},
+                        ]
+                    )
+                    saved_history = json.dumps(ws_history)
+                    assert [chunk async for chunk in ws_provider.chat(ws_history)] == [
+                        "continued"
+                    ]
+                    assert len(ws_submissions) == 6
+                    assert "previous_response_id" not in ws_submissions[5]
+                    assert ws_submissions[5]["input"][0]["content"] == [
+                        {"type": "input_text", "text": "Inspect"}
+                    ]
+                    assert file_reference not in json.dumps(ws_submissions[5])
+                    assert json.dumps(ws_history) == saved_history
                 finally:
                     await ws_provider.close()
+                    source.write_bytes(image_bytes)
 
         # Real controller/tool boundary: discard uncommitted native calls, but
         # never replay text that the parser could already have dispatched.
@@ -2104,6 +2433,95 @@ class TestLlmIntegration:
                 finally:
                     await compacted.__aexit__(None, None, None)
                 assert len(submissions) == 5
+
+    @pytest.mark.timeout(60)
+    async def test_dual_form_reasoning_stream_workflow(self):
+        """A provider streaming reasoning in two forms per delta, end to end.
+
+        Real ``OpenAIProvider`` over an in-memory HTTP stream: the displayed
+        segments come out as one per form (not one per delta), and the next
+        request still echoes the full reasoning back to the endpoint without
+        leaking the internal segment list onto the wire.
+        """
+        requests: list[dict[str, Any]] = []
+        provider = dual_form_provider(requests=requests)
+        history = [SystemMessage("You think."), UserMessage("what is the answer?")]
+
+        reply = "".join([chunk async for chunk in provider.chat(history)])
+        assert reply == ANSWER
+
+        fields = provider.last_assistant_extra_fields
+        full_text = "".join(REASONING_PIECES)
+        assert [
+            (s["source"], s["text"])
+            for s in reasoning_segments(fields[KT_ASSISTANT_SEGMENTS])
+        ] == [("reasoning_content", full_text), ("reasoning_details", full_text)]
+        assert fields[KT_ASSISTANT_SEGMENTS][-1] == {"type": "text", "text": ANSWER}
+
+        history += [AssistantMessage(reply, extra_fields=fields), UserMessage("more")]
+        "".join([chunk async for chunk in provider.chat(history)])
+
+        echoed = requests[1]["messages"][2]
+        assert echoed["reasoning_content"] == full_text
+        assert echoed["reasoning_details"] == [
+            {"type": "reasoning.text", "index": 0, "text": full_text}
+        ]
+        assert KT_ASSISTANT_SEGMENTS not in echoed
+
+    @pytest.mark.timeout(60)
+    async def test_anthropic_sampling_parameters_workflow(self):
+        """Sampling settings reach the Anthropic wire only for models that accept them.
+
+        Real ``AnthropicProvider`` and SDK 1.x client over an in-memory ``httpx2``
+        transport. The SDK no longer takes ``temperature``/``top_p``/``top_k`` as
+        keyword arguments, so they must travel in ``extra_body``; models that
+        reject them must not receive them at all.
+        """
+        history = [SystemMessage("s"), UserMessage("q")]
+        sampling = {"top_p": 0.9, "top_k": 5, "custom_flag": True}
+
+        async def send(model, *, stream, **kwargs):
+            wire: list[dict[str, Any]] = []
+            provider = anthropic_provider(
+                model, wire, temperature=0.7, extra_body=dict(sampling)
+            )
+            if stream:
+                reply = "".join([c async for c in provider.chat(history, **kwargs)])
+            else:
+                reply = (await provider.chat_complete(history, **kwargs)).content
+            assert reply == ANTHROPIC_ANSWER
+            return wire[0]
+
+        for stream in (True, False):
+            accepting = await send("claude-sonnet-4-6", stream=stream)
+            assert (
+                accepting["temperature"],
+                accepting["top_p"],
+                accepting["top_k"],
+            ) == (
+                0.7,
+                0.9,
+                5,
+            )
+            assert accepting["custom_flag"] is True
+
+            overridden = await send("claude-haiku-4-5", stream=stream, temperature=0.2)
+            assert overridden["temperature"] == 0.2
+
+            for rejecting in (
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-opus-5-5",
+                "claude-sonnet-5",
+                "claude-sonnet-5-5",
+                "claude-fable-5-1",
+            ):
+                body = await send(rejecting, stream=stream)
+                assert not {"temperature", "top_p", "top_k"} & set(body), rejecting
+                assert body["custom_flag"] is True
+
+            other_vendor = await send("kimi-for-coding", stream=stream)
+            assert (other_vendor["temperature"], other_vendor["top_p"]) == (0.7, 0.9)
 
     def test_api_key_storage_and_resolution_workflow(self):
         """Store + retrieve an API key, then assert the resolver override.

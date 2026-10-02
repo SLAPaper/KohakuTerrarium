@@ -40,6 +40,7 @@ from kohakuterrarium.llm.openai_sanitize import (
     strip_kt_extras,
     strip_surrogates,
 )
+from kohakuterrarium.llm.stream_replay import ReplayFilter
 from kohakuterrarium.llm.turn_segments import TurnSegmentsBuilder
 from kohakuterrarium.llm.openai_ws import stream_ws_turn
 from kohakuterrarium.llm.recovery import (
@@ -285,8 +286,10 @@ class OpenAIProvider(BaseLLMProvider):
         recovery = kwargs.get("_ws_recovery")
         attempt = 0
         overflow_state = OverflowRecoveryState()
+        replay = ReplayFilter()
         try:
             while True:
+                replay.begin_attempt()
                 try:
                     async with aclosing(
                         self._raw_stream_chat(current, tools=tools, **kwargs)
@@ -294,7 +297,8 @@ class OpenAIProvider(BaseLLMProvider):
                         async for chunk in stream:
                             if recovery is not None and chunk:
                                 recovery.delivered = True
-                            yield chunk
+                            if text := replay.feed(chunk):
+                                yield text
                     return
                 except Exception as exc:
                     if recovery is not None and (

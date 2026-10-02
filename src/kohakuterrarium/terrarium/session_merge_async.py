@@ -22,6 +22,7 @@ from kohakuterrarium.terrarium.session_resources import (
     archive_unpublished_store,
     retain_store,
 )
+from kohakuterrarium.terrarium.session_successor import stage_successor_async
 from kohakuterrarium.terrarium.topology_admission import (
     fence_topology_members,
     record_topology_install,
@@ -153,6 +154,10 @@ class PreparedMerge:
         for graph, store in self.sources.items():
             if graph in self.owned:
                 retain_store(self.engine, store)
+        if self.delta.kind == "merge":
+            for store in dict.fromkeys(self.sources.values()):
+                if store is not self.destination:
+                    await stage_successor_async(self.engine, store, [self.destination])
         for agent, capture, sink, mapping in self.members:
             await submit_internal_session_state(
                 agent,
