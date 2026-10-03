@@ -116,10 +116,11 @@ def capture_events(store):
     captured = []
     for name, key, row in rows:
         origin = row_origin(uid, name, row)
-        if origin in seen or row["event_id"] in event_ids:
-            raise ValueError("Duplicate stored event origin or event ID")
+        coordinate = (name, row["event_id"])
+        if origin in seen or coordinate in event_ids:
+            raise ValueError("Duplicate stored event origin or namespace event ID")
         seen.add(origin)
-        event_ids.add(row["event_id"])
+        event_ids.add(coordinate)
         captured.append((name, key, row, origin))
     if not getattr(store, "_readonly", False):
         for name, key, row, _ in captured:
@@ -165,14 +166,21 @@ def append_mirrored(store, namespace, event_type, data):
     data.pop(EVENT_COORDINATE, None)
     event_id = data.get("event_id")
     if type(event_id) is int and 0 < event_id <= store._global_event_id:
-        for name, key, row in strict_rows(store):
-            if row["event_id"] != event_id:
-                continue
+        matches = [
+            (name, key, row)
+            for name, key, row in strict_rows(store)
+            if row["event_id"] == event_id
+        ]
+        local = [(key, row) for name, key, row in matches if name == namespace]
+        if len(local) > 1 or (matches and not local):
+            raise ValueError("Conflicting mirrored event ID")
+        if local:
+            key, row = local[0]
             expected = {**data, "type": event_type}
             recorded = dict(row)
             if "ts" not in expected:
                 recorded.pop("ts", None)
-            if name != namespace or recorded != expected:
+            if recorded != expected:
                 raise ValueError("Conflicting mirrored event ID")
             return key, event_id
     if EVENT_ORIGIN in data:
@@ -188,11 +196,8 @@ def import_events(store, batch):
     uid, existing = capture_events(store)
     if source_uid == uid:
         raise ValueError("Event copy requires distinct store UUIDs")
-    index, ids = {}, set()
+    index = {}
     for name, key, row, origin in existing:
-        if row["event_id"] in ids:
-            raise ValueError("Duplicate destination event ID")
-        ids.add(row["event_id"])
         index[origin] = (key, row)
         store._global_event_id = max(store._global_event_id, row["event_id"])
         store._event_seq[name] = max(

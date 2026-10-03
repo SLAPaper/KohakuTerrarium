@@ -32,6 +32,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from kohakuterrarium import Terrarium
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.builtins.plugins.budget.plugin import BudgetPlugin
@@ -52,6 +53,7 @@ from kohakuterrarium.core.config_types import (
     OutputConfigItem,
 )
 from kohakuterrarium.core.events import EventType, create_user_input_event
+from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.llm.message import ImagePart, TextPart
 from kohakuterrarium.modules.output.event import OutputEvent, UIReply
 from kohakuterrarium.modules.output.router import OutputRouter
@@ -958,6 +960,13 @@ class TestModulesIntegration:
             str(tmp_path),
             ["modules_agent"],
         )
+        for namespace in ("legacy_parent", "legacy_child"):
+            await store.run(
+                store.append_event,
+                namespace,
+                "user_message",
+                {"event_id": 1, "content": namespace},
+            )
         agent.attach_session_store(store)
         assert "worker" in agent.subagent_manager.list_subagents()
         # The registered config is retrievable + projects a SubAgentInfo.
@@ -996,6 +1005,25 @@ class TestModulesIntegration:
             last = agent.controller.conversation.get_last_assistant_message()
             assert last is not None
             assert "worker finished" in last.get_text_content()
+            rows = await store.run(store.get_events, "modules_agent")
+            first_terminals = [row for row in rows if row["type"] == "subagent_result"]
+            assert len(first_terminals) == 1
+            first_origin = first_terminals[0]["origin"]
+            admitted = [
+                row
+                for row in rows
+                if row["type"] == "tool_feedback_admitted"
+                and any(
+                    proof.get("origin", {}).get("delivery_id")
+                    == first_origin["delivery_id"]
+                    for proof in row["deliveries"]
+                )
+            ]
+            assert len(admitted) == 1
+            assert admitted[0]["source_event_origins"]
+            assert all(
+                ref[1] == "modules_agent" for ref in admitted[0]["source_event_origins"]
+            )
             first_job_id = next(iter(agent.subagent_manager._results))
             persisted = store.list_subagent_runs(parent="modules_agent", name="worker")
             assert [(row["run"], row["job_id"]) for row in persisted] == [
@@ -1136,6 +1164,119 @@ class TestModulesIntegration:
         finally:
             await agent.stop()
             store.close()
+        reopened = SessionStore(store.path)
+        try:
+            rows = await reopened.run(reopened.get_events, "modules_agent")
+            assert (
+                len(
+                    [
+                        row
+                        for row in rows
+                        if row["type"] == "subagent_result"
+                        and row["job_id"] == first_job_id
+                    ]
+                )
+                == 1
+            )
+            assert any(
+                row["type"] == "tool_feedback_admitted"
+                and "logs look healthy" in str(row["content"])
+                for row in rows
+            )
+            for namespace in ("legacy_parent", "legacy_child"):
+                assert [
+                    row["event_id"]
+                    for row in await reopened.run(reopened.get_events, namespace)
+                ] == [1]
+        finally:
+            await asyncio.to_thread(reopened.close, update_status=False)
+
+        class NativeParent(ScriptedLLM):
+            def __init__(self):
+                super().__init__(["unused", "native parent continued", "after reopen"])
+                self.last_tool_calls = []
+
+            async def chat(self, messages, **kwargs):
+                self.last_tool_calls = []
+                if self.call_count == 0:
+                    self.call_log.append(self._normalize_messages(messages))
+                    self.call_count += 1
+                    self.last_tool_calls = [
+                        NativeToolCall(
+                            "native-worker",
+                            "worker",
+                            '{"task":"native work","run_in_background":false}',
+                        )
+                    ]
+                    yield ""
+                else:
+                    async for chunk in super().chat(messages, **kwargs):
+                        yield chunk
+
+        native_path = tmp_path / "native-collision.kohakutr"
+        seed = SessionStore(native_path)
+        try:
+            for namespace in ("legacy_parent", "legacy_child"):
+                await seed.run(
+                    seed.append_event,
+                    namespace,
+                    "user_message",
+                    {"event_id": 1, "content": namespace},
+                )
+        finally:
+            await asyncio.to_thread(seed.close, update_status=False)
+        parent = NativeParent()
+        async with Terrarium() as engine:
+            creature = await engine.add_creature(
+                AgentConfig(name="native_parent", tool_format="native"),
+                llm=parent,
+                session=native_path,
+                io="headless",
+                start=True,
+            )
+            native_config = SubAgentConfig(name="worker", tools=[])
+            creature.agent.add_subagent(native_config)
+            creature.agent.registry.register_subagent("worker", native_config)
+            creature.agent.subagent_manager.llm = ScriptedLLM(
+                ["native child completed"]
+            )
+            assert (
+                await creature.run("dispatch", timeout=10)
+            ).text == "native parent continued"
+            tool_results = [
+                m
+                for m in parent.last_messages
+                if m.get("tool_call_id") == "native-worker"
+            ]
+            assert len(tool_results) == 1
+            assert tool_results[0]["content"] == "native child completed"
+            store = creature.agent.session_store
+            rows = await store.run(store.get_events, "native_parent")
+            assert len([row for row in rows if row["type"] == "subagent_result"]) == 1
+        resumed_parent = ScriptedLLM(["native history continued"])
+        async with Terrarium() as restored:
+            await restored.adopt_session(
+                native_path, llm=resumed_parent, pwd=str(tmp_path), io="headless"
+            )
+            creature = restored.list_creatures()[0]
+            await creature.wait_restoration_ready()
+            assert (
+                await creature.run("continue", timeout=10)
+            ).text == "native history continued"
+            assert (
+                len(
+                    [
+                        m
+                        for m in resumed_parent.last_messages
+                        if m.get("tool_call_id") == "native-worker"
+                    ]
+                )
+                == 1
+            )
+            rows = await creature.agent.session_store.run(
+                creature.agent.session_store.get_events, "native_parent"
+            )
+            assert len([row for row in rows if row["type"] == "subagent_result"]) == 1
 
     async def test_interactive_subagent_stays_alive(self, make_agent, tmp_path):
         """subagent protocol — an interactive sub-agent (``interactive:

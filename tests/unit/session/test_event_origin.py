@@ -15,6 +15,12 @@ from kohakuterrarium.session.event_origin import (
     import_events,
     store_uuid,
 )
+from kohakuterrarium.session.feedback_admission import persist_feedback
+from kohakuterrarium.session.native_ack import persist_ack
+from kohakuterrarium.session.output_delivery import (
+    persist_output_delivery,
+    validate_output_source,
+)
 from kohakuterrarium.session.history_replay import replay_selected_events
 from kohakuterrarium.session.history_support import dedupe_adjacent_duplicate_events
 from kohakuterrarium.session.store import SessionStore
@@ -33,6 +39,251 @@ def append(store, name="alice", text="same"):
     return store.submit(
         store.append_event, name, "user_message", {"content": text}
     ).result()
+
+
+def _legacy_collision(store):
+    for name in ("legacy_parent", "legacy_child"):
+        store.submit(
+            store.append_event,
+            name,
+            "user_message",
+            {"content": name, "event_id": 1, "ts": 10},
+        ).result()
+
+
+def test_cross_namespace_capture_import_retry_and_new_global_cursor(stores):
+    source, target, _ = stores
+    _legacy_collision(source)
+    _legacy_collision(target)
+    uid, captured = source.submit(capture_events, source).result()
+    assert {row[3] for row in captured} == {
+        (uid, "legacy_parent", 1),
+        (uid, "legacy_child", 1),
+    }
+    first = target.submit(import_events, target, (uid, captured)).result()
+    assert all(receipt["inserted"] for receipt in first)
+    assert {receipt["destination"][3] for receipt in first} == {2, 3}
+    before = target.submit(capture_events, target).result()
+    repeat = target.submit(import_events, target, (uid, captured)).result()
+    assert not any(receipt["inserted"] for receipt in repeat)
+    assert [r["destination"] for r in repeat] == [r["destination"] for r in first]
+    assert target.submit(capture_events, target).result() == before
+    assert target.submit(target.max_event_id, "legacy_parent").result() == 3
+    assert [
+        r["event_id"]
+        for r in target.submit(target.get_events, "legacy_parent", 1).result()
+    ] == [3]
+    _, new_id = append(target, text="after import")
+    assert new_id == 4
+
+
+@pytest.mark.parametrize("duplicate_origin", [False, True])
+def test_capture_rejects_same_namespace_id_even_with_distinct_origins(
+    stores, duplicate_origin
+):
+    source, destination, _ = stores
+    append(source)
+    uid = source.submit(store_uuid, source).result()
+    origin = uid if duplicate_origin else str(uuid4())
+    source.submit(
+        lambda: source.events.__setitem__(
+            "alice:e000001",
+            {
+                "type": "user_message",
+                "event_id": 1,
+                "content": "corrupt duplicate",
+                EVENT_ORIGIN: [origin, "alice", 1],
+            },
+        )
+    ).result()
+    for operation in (
+        lambda: source.submit(capture_events, source).result(),
+        lambda: copy_events_into(source, destination),
+    ):
+        with pytest.raises(ValueError, match="Duplicate stored"):
+            operation()
+    assert destination.submit(destination.get_events, "alice").result() == []
+
+
+@pytest.mark.parametrize("activated", [False, True])
+def test_mirror_does_not_introduce_new_cross_namespace_id_collision(stores, activated):
+    store, _, _ = stores
+    store.submit(
+        store.append_event, "alice", "message", {"event_id": 4, "content": "parent"}
+    ).result()
+    if activated:
+        store.submit(store_uuid, store).result()
+    before = store.submit(store.get_all_events).result()
+    with pytest.raises(ValueError, match="Conflicting mirrored"):
+        store.submit(
+            append_mirrored,
+            store,
+            "other",
+            "message",
+            {"event_id": 4, "content": "new collision"},
+        ).result()
+    assert store.submit(store.get_all_events).result() == before
+
+
+def test_mirror_retry_in_legacy_collision_selects_its_own_namespace(stores):
+    store, _, _ = stores
+    _legacy_collision(store)
+    before = store.submit(store.get_all_events).result()
+    for name in ("legacy_parent", "legacy_child"):
+        row = deepcopy(store.submit(store.get_events, name).result()[0])
+        result = store.submit(
+            append_mirrored, store, name, row.pop("type"), row
+        ).result()
+        assert result[1] == 1
+    assert store.submit(store.get_all_events).result() == before
+    with pytest.raises(ValueError, match="Conflicting mirrored"):
+        store.submit(
+            append_mirrored,
+            store,
+            "legacy_parent",
+            "user_message",
+            {"event_id": 1, "content": "changed", "ts": 10},
+        ).result()
+    assert store.submit(store.get_all_events).result() == before
+
+
+def test_legacy_collision_does_not_block_child_feedback_or_native_ack(stores):
+    store, _, _ = stores
+    _legacy_collision(store)
+    origin = {
+        "runtime_scope_id": "scope",
+        "delivery_id": "child-delivery",
+        "execution_class": "direct",
+        "turn_index": 1,
+        "branch_id": 1,
+        "parent_branch_path": [],
+        "generation_id": "generation",
+    }
+    declaration = {
+        "generation_id": "generation",
+        "veto_group_id": "scope:generation",
+        "tool_calls": [
+            {"id": "native-child", "function": {"name": "child", "arguments": "{}"}}
+        ],
+    }
+    _, declaration_id = store.submit(
+        store.append_event,
+        "alice",
+        "assistant_tool_calls",
+        declaration,
+        turn_index=1,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    dispatch = {"job_id": "child", "origin": origin, "tool_call_id": "native-child"}
+    store.submit(
+        store.append_event,
+        "alice",
+        "subagent_call",
+        dispatch,
+        turn_index=1,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    uid = store.submit(store_uuid, store).result()
+    ack = {
+        "job_id": "child",
+        "origin": origin,
+        "tool_call_id": "native-child",
+        "phase": "ack",
+        "declaration_origin": [uid, "alice", declaration_id],
+    }
+    first = store.submit(persist_ack, store, "alice", ack).result()
+    before = store.submit(store.get_events, "alice").result()
+    repeated = store.submit(persist_ack, store, "alice", ack).result()
+    assert repeated[0] == first[0]
+    assert repeated[1]["dispatch_origin"] == first[1]["dispatch_origin"]
+    assert repeated[1]["declaration_origin"] == first[1]["declaration_origin"]
+    assert store.submit(store.get_events, "alice").result() == before
+    with pytest.raises(HistoryCompatibilityError, match="conflicts"):
+        store.submit(
+            persist_ack, store, "alice", {**ack, "content": "changed retry"}
+        ).result()
+    direct = {
+        "job_id": "direct-child",
+        "origin": {**origin, "delivery_id": "direct-return"},
+    }
+    for kind in ("subagent_call", "subagent_result"):
+        store.submit(
+            store.append_event,
+            "alice",
+            kind,
+            deepcopy(direct),
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        ).result()
+    proof = {**direct, "mode": "direct_child"}
+    receipt = store.submit(
+        persist_feedback, store, "alice", "child completed", [proof], 1, 1, []
+    ).result()
+    row = store.submit(store.get_events, "alice").result()[-1]
+    assert row["event_id"] == receipt[2] and row["type"] == "tool_feedback_admitted"
+    assert len(row["source_event_origins"]) == 2
+    assert {tuple(ref) for ref in row["source_event_origins"]} <= {
+        ref
+        for name, _, _, ref in store.submit(capture_events, store).result()[1]
+        if name == "alice"
+    }
+    before = store.submit(store.get_events, "alice").result()
+    with pytest.raises(HistoryCompatibilityError, match="missing or ambiguous"):
+        store.submit(
+            persist_feedback,
+            store,
+            "alice",
+            "foreign",
+            [{**proof, "origin": {**proof["origin"], "runtime_scope_id": "foreign"}}],
+            1,
+            1,
+            [],
+        ).result()
+    assert store.submit(store.get_events, "alice").result() == before
+
+
+def test_legacy_collision_preserves_output_generation_receipt(stores):
+    store, _, _ = stores
+    _legacy_collision(store)
+    generation = {
+        "schema": 1,
+        "generation_id": "generation-one",
+        "source": {"model": "scripted"},
+    }
+    store.submit(
+        store.append_event,
+        "alice",
+        "assistant_generation_start",
+        deepcopy(generation),
+        turn_index=1,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    payload = {
+        "output_id": "one",
+        "target": "notice",
+        "content": "body",
+        "success": True,
+        "error": None,
+        "completed_at": "2026-10-03",
+        "feedback_line": "notice: body",
+    }
+    proof = store.submit(
+        persist_output_delivery, store, "alice", generation, payload
+    ).result()
+    captured = store.submit(capture_events, store).result()[1]
+    index = {ref: row for name, _, row, ref in captured if name == "alice"}
+    assert validate_output_source(proof, index) == tuple(proof["event_origin"])
+    receipt = store.submit(
+        persist_feedback, store, "alice", "notice: body", [proof], 1, 1, []
+    ).result()
+    assert store.submit(store.get_events, "alice").result()[-1][
+        "source_event_origins"
+    ] == [proof["event_origin"]]
+    assert receipt[2] > proof["event_origin"][2]
 
 
 def test_capture_and_replay_keep_numeric_physical_order_past_six_digits(stores):
