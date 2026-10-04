@@ -17,21 +17,17 @@ from kohakuterrarium.core.tool_origin import (
     promote_tool_context,
     tool_completion_context,
 )
-from kohakuterrarium.core.branch_rerun import drain_history_reruns
-from kohakuterrarium.core.branch_selection import (
-    drain_history_selections,
-    mark_history_selection_stopping,
-)
+from kohakuterrarium.core.agent_turn_control import settle_turn_for_stop
+from kohakuterrarium.core.agent_shutdown import stop_agent
 from kohakuterrarium.core.agent_state import (
-    close_owner_admission,
     close_session_state_owner,
     submit_internal_session_state,
 )
 from kohakuterrarium.core.model_switch_runtime import (
     close_retired_model_providers,
-    drain_model_switches,
-    mark_model_switch_closing,
 )
+from kohakuterrarium.core.operation_admission import reject_own_turn
+from kohakuterrarium.core.shutdown_callbacks import shutdown_callback_scope
 from kohakuterrarium.errors import ConflictError, InvalidRequestError
 from kohakuterrarium.utils.logging import get_logger
 
@@ -46,12 +42,13 @@ async def wait_for_turn_completion(
         return
     if getattr(agent, "_turn_lock_holder", None) is asyncio.current_task():
         raise ConflictError("Cannot wait for the current turn from its own callback")
-    try:
-        await asyncio.wait_for(asyncio.shield(completion), timeout=timeout)
-    except asyncio.TimeoutError as exc:
+    done, _ = await asyncio.wait({completion}, timeout=timeout)
+    if not done:
         raise ConflictError(
             "The previous turn is still finishing; retry after it stops"
-        ) from exc
+        )
+    if not completion.cancelled():
+        completion.result()
 
 
 class AgentLifecycleMixin:
@@ -80,7 +77,10 @@ class AgentLifecycleMixin:
 
     async def interrupt_and_wait(self, *, timeout: float = 10.0) -> None:
         """Interrupt the captured turn and wait until its finalization releases it."""
-        completion = getattr(self, "_turn_completion", None)
+        reject_own_turn(self, "interrupt and wait")
+        completion = getattr(self, "_active_turn_task", None) or getattr(
+            self, "_turn_completion", None
+        )
         self.interrupt()
         await wait_for_turn_completion(self, completion, timeout=timeout)
 
@@ -110,31 +110,16 @@ class AgentLifecycleMixin:
 
     async def stop(self) -> None:
         """Stop all agent modules once, serializing concurrent callers."""
-        if getattr(self, "_starting", False):
-            raise ConflictError(
-                "Cannot stop while the agent is starting; cancel or await start first"
-            )
-        mark_model_switch_closing(self)
-        mark_history_selection_stopping(self)
-        close_owner_admission(self)
-        stop_lock = getattr(self, "_stop_lock", None)
-        if stop_lock is None:
-            stop_lock = self._stop_lock = asyncio.Lock()
-        async with stop_lock:
-            if getattr(self, "_stopped", False):
-                return
-            await drain_model_switches(self)
-            await drain_history_selections(self)
-            await drain_history_reruns(self)
-            await self._stop_inner()
-            self._stopped = True
+        await stop_agent(self)
 
     async def _stop_inner(self) -> None:
         logger.info("Stopping agent", agent_name=self.config.name)
+        await settle_turn_for_stop(self)
 
         if self.plugins:
-            await self.plugins.notify("on_agent_stop")
-            await self.plugins.unload_all()
+            with shutdown_callback_scope(self):
+                await self.plugins.notify("on_agent_stop")
+                await self.plugins.unload_all()
 
         drain_terminals = getattr(
             self.output_router, "drain_terminal_publications", None
@@ -168,11 +153,10 @@ class AgentLifecycleMixin:
             try:
                 await asyncio.wait_for(turn_lock.acquire(), timeout=10)
                 turn_lock.release()
-            except asyncio.TimeoutError:  # pragma: no cover - defensive
-                logger.warning(
-                    "Timed out waiting for turn finalization during stop",
-                    agent_name=self.config.name,
-                )
+            except asyncio.TimeoutError as exc:
+                raise ConflictError(
+                    "Turn finalization is unresolved; shutdown requires retry"
+                ) from exc
 
         consumer = getattr(self, "_consumer_task", None)
         if (

@@ -15,6 +15,7 @@ from kohakuterrarium.terrarium import (
 )
 from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.session_attachment import relocate_topology_selectors
+from kohakuterrarium.core.session_generation_handoff import prepare_generation_handoff
 from kohakuterrarium.session.output import SessionOutput
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.version import FORMAT_VERSION
@@ -369,8 +370,9 @@ async def prepare_merge(engine, projected, delta):
                 destination,
                 agent,
                 capture_activity=getattr(capture[3], "_capture_activity", True),
-                prepared_recovery=("", None, None, None),
+                prepared_recovery="",
             )
+            await prepare_generation_handoff(agent, capture[3], sink)
             plan.members.append((agent, capture, sink, mappings.get(capture[0])))
         for source, captured in captures.items():
             current = await source.run(

@@ -1,5 +1,6 @@
+import { createPinia, setActivePinia } from "pinia"
 import { beforeEach, describe, expect, it, vi } from "vitest"
-
+import { terrariumAPI } from "@/utils/api"
 import { useChatStore } from "./chat.js"
 
 describe("chat branch operation state", () => {
@@ -189,6 +190,159 @@ describe("chat branch operation state", () => {
       expect(gammaPayload.target).toBe("gamma")
       expect(gammaPayload.branch_view).toBeUndefined()
       expect("branch_view" in gammaPayload).toBe(false)
+    })
+  })
+
+  describe("ancestor branch switching and descendant overrides (F5)", () => {
+    it("prunes descendant overrides when changing an ancestor branch", () => {
+      const chat = useChatStore()
+      chat.activeTab = "main"
+      chat.tabs = ["main"]
+      chat.messagesByTab = { main: [] }
+      chat.eventsByTab = {
+        main: [
+          { event_id: 1, turn_index: 1, branch_id: 1 },
+          { event_id: 2, turn_index: 1, branch_id: 2 },
+          { event_id: 3, turn_index: 2, branch_id: 1 },
+          { event_id: 4, turn_index: 3, branch_id: 1 },
+        ],
+      }
+      chat.branchViewByTab = {
+        main: { 1: 1, 2: 3, 3: 5 },
+      }
+
+      // Switching ancestor turn 1 from 1 to 2 prunes later descendant overrides (turns 2 and 3)
+      chat.selectBranch(1, 2)
+      expect(chat.branchViewByTab.main).toEqual({ 1: 2 })
+
+      // Switching intermediate ancestor turn 2 prunes turn 3 but preserves turn 1
+      chat.branchViewByTab.main = { 1: 1, 2: 2, 3: 4 }
+      chat.selectBranch(2, 5)
+      expect(chat.branchViewByTab.main).toEqual({ 1: 1, 2: 5 })
+    })
+
+    it("preserves descendant overrides when re-selecting the same effective ancestor (explicit and implicit)", () => {
+      const chat = useChatStore()
+      chat.activeTab = "main"
+      chat.tabs = ["main"]
+      chat.messagesByTab = { main: [] }
+      chat.eventsByTab = {
+        main: [
+          { event_id: 1, turn_index: 1, branch_id: 1 },
+          { event_id: 2, turn_index: 1, branch_id: 2 },
+          { event_id: 3, turn_index: 2, branch_id: 1 },
+        ],
+      }
+
+      // Explicit same ancestor: turn 1 explicitly 1 in view
+      chat.branchViewByTab = {
+        main: { 1: 1, 2: 3 },
+      }
+      chat.selectBranch(1, 1)
+      expect(chat.branchViewByTab.main).toEqual({ 1: 1, 2: 3 })
+
+      // Implicit same ancestor: view has no turn 1 key, but effective branch is 2 (highest candidate)
+      chat.branchViewByTab = {
+        main: { 2: 3 },
+      }
+      chat.selectBranch(1, 2)
+      expect(chat.branchViewByTab.main).toEqual({ 1: 2, 2: 3 })
+
+      // Implicit ancestor changed: selecting branch 1 (differs from effective branch 2) prunes turn 2
+      chat.branchViewByTab = {
+        main: { 2: 3 },
+      }
+      chat.selectBranch(1, 1)
+      expect(chat.branchViewByTab.main).toEqual({ 1: 1 })
+    })
+
+    it("sends correct branch_view payload across ancestor roundtrip", async () => {
+      const chat = useChatStore()
+      chat.activeTab = "main"
+      chat.tabs = ["main"]
+      chat.messagesByTab = { main: [] }
+      chat.eventsByTab = {
+        main: [
+          { event_id: 1, turn_index: 1, branch_id: 1 },
+          { event_id: 2, turn_index: 1, branch_id: 2 },
+          { event_id: 3, turn_index: 2, branch_id: 1 },
+        ],
+      }
+      const wsSend = vi.fn()
+      chat._ws = { readyState: WebSocket.OPEN, send: wsSend }
+
+      chat.branchViewByTab = { main: { 1: 1, 2: 2 } }
+
+      // Switch ancestor to branch 2 -> prunes turn 2 descendant
+      chat.selectBranch(1, 2)
+      expect(chat.branchViewByTab.main).toEqual({ 1: 2 })
+
+      await chat.send("message on branch 2")
+      expect(wsSend).toHaveBeenCalledTimes(1)
+      const payload1 = JSON.parse(wsSend.mock.calls[0][0])
+      expect(payload1.branch_view).toEqual({ 1: 2 })
+
+      // Switch ancestor back to branch 1
+      chat.selectBranch(1, 1)
+      expect(chat.branchViewByTab.main).toEqual({ 1: 1 })
+
+      await chat.send("message back on branch 1")
+      expect(wsSend).toHaveBeenCalledTimes(2)
+      const payload2 = JSON.parse(wsSend.mock.calls[1][0])
+      expect(payload2.branch_view).toEqual({ 1: 1 })
+    })
+  })
+
+  describe("pending branch operation send guard", () => {
+    it("rejects send before any optimistic or WS side effects when branch operation is pending, while other tabs and channel tabs remain unaffected", async () => {
+      const chat = useChatStore()
+      chat.tabs = ["main", "secondary", "ch:general"]
+      chat.messagesByTab = { main: [], secondary: [], "ch:general": [] }
+      const wsSend = vi.fn()
+      chat._ws = { readyState: WebSocket.OPEN, send: wsSend }
+
+      // Set pending branch operation on 'main'
+      chat.branchOperationByTab.main = {
+        type: "edit",
+        phase: "starting",
+        turnIndex: 1,
+        predictedBranch: 3,
+        requestId: "req-pending-1",
+      }
+      chat.activeTab = "main"
+
+      // Attempt send on 'main' with pending operation: must reject with identifiable pending error
+      await expect(chat.send("blocked msg")).rejects.toThrow(/pending|branch operation/i)
+
+      // Guarded: no WS send, no optimistic messages, no queued messages, no recent user inputs, not processing
+      expect(wsSend).not.toHaveBeenCalled()
+      expect(chat.messagesByTab.main).toEqual([])
+      expect(chat.queuedMessagesByTab.main).toBeUndefined()
+      expect(Object.keys(chat._recentUserInputs)).toHaveLength(0)
+      expect(chat.processingByTab.main).toBeFalsy()
+
+      // Slash command goal RPC is also rejected before any command execution
+      const commandSpy = vi.spyOn(terrariumAPI, "executeCreatureCommand")
+      await expect(chat.send("/goal test")).rejects.toThrow(/pending|branch operation/i)
+      expect(commandSpy).not.toHaveBeenCalled()
+      commandSpy.mockRestore()
+
+      // Other tab 'secondary' has no pending operation and sends normally
+      chat.activeTab = "secondary"
+      await chat.send("msg from secondary")
+      expect(wsSend).toHaveBeenCalledTimes(1)
+      const secPayload = JSON.parse(wsSend.mock.calls[0][0])
+      expect(secPayload.target).toBe("secondary")
+      expect(secPayload.content).toEqual([{ type: "text", text: "msg from secondary" }])
+      expect(chat.messagesByTab.secondary).toHaveLength(1)
+
+      // Channel tab allows original path and does not get blocked by creature branch operation guard
+      chat.activeTab = "ch:general"
+      chat.branchOperationByTab["ch:general"] = { type: "edit", phase: "starting" }
+      const channelSpy = vi.spyOn(terrariumAPI, "sendToChannel").mockResolvedValue({})
+      await chat.send("channel msg")
+      expect(channelSpy).toHaveBeenCalledTimes(1)
+      channelSpy.mockRestore()
     })
   })
 })

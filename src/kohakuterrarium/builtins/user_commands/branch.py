@@ -2,6 +2,7 @@
 
 from kohakuterrarium.builtins.user_commands.registry import register_user_command
 from kohakuterrarium.core.branch_selection import select_branch
+from kohakuterrarium.core.compact_branch import snapshot_branch_view
 from kohakuterrarium.modules.user_command.base import (
     BaseUserCommand,
     CommandLayer,
@@ -103,7 +104,9 @@ class BranchCommand(BaseUserCommand):
                 )
             )
 
-        view = dict(getattr(agent, "_branch_view", {}) or {})
+        view = dict(snapshot_branch_view(agent) or {})
+        if view.get(turn_index) != branch_id:
+            view = {turn: branch for turn, branch in view.items() if turn < turn_index}
         view[turn_index] = branch_id
         count = await select_branch(agent, view)
         return UserCommandResult(

@@ -20,6 +20,12 @@ from kohakuterrarium.core.branch_rerun import request_rerun
 from kohakuterrarium.core.branch_rewind import rewind
 from kohakuterrarium.core.branch_selection import select_branch as _select_branch
 from kohakuterrarium.core.events import EventType, TriggerEvent
+from kohakuterrarium.core.interrupt_regeneration import (
+    completed_regeneration_result,
+    get_regeneration_status as _get_regeneration_status,
+    interrupt_and_regenerate as _interrupt_and_regenerate,
+    request_regeneration as _request_regeneration,
+)
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.llm.message import normalize_content_parts
@@ -35,6 +41,48 @@ logger = get_logger(__name__)
 
 class AgentMessagesMixin:
     """Message edit / regenerate / rewind operations."""
+
+    async def interrupt_and_regenerate(
+        self,
+        *,
+        timeout: float = 10.0,
+        turn_index: int | None = None,
+        branch_view: dict[int, int] | None = None,
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> dict:
+        """Return the admitted branch receipt after a source-pinned rerun succeeds."""
+        return await _interrupt_and_regenerate(
+            self,
+            timeout=timeout,
+            turn_index=turn_index,
+            branch_view=branch_view,
+            request_id=request_id,
+            target=target,
+        )
+
+    def request_regeneration(
+        self,
+        *,
+        timeout: float = 10.0,
+        turn_index: int | None = None,
+        branch_view: dict[int, int] | None = None,
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> str:
+        """Submit a non-blocking regeneration request and return its token."""
+        return _request_regeneration(
+            self,
+            timeout=timeout,
+            turn_index=turn_index,
+            branch_view=branch_view,
+            request_id=request_id,
+            target=target,
+        )
+
+    def get_regeneration_status(self, request_id: str) -> dict:
+        """Query the latest retained request without treating acceptance as success."""
+        return _get_regeneration_status(self, request_id)
 
     async def select_branch(self, branch_view: dict[int, int] | None = None) -> int:
         """Select a persisted branch without regenerating. Local idle only."""
@@ -109,6 +157,29 @@ class AgentMessagesMixin:
                 message_idx, new_content, turn_index, user_position, branch_view, target
             ),
         )
+
+    async def _edit_and_rerun_result(
+        self,
+        message_idx,
+        new_content,
+        *,
+        turn_index=None,
+        user_position=None,
+        branch_view=None,
+        request_id=None,
+        target=None,
+    ) -> dict | None:
+        """Return immutable edit coordinates only after successful rerun settlement."""
+        outcome, receipt = await request_rerun(
+            self,
+            append_user_event_pair,
+            request_id=request_id,
+            edit=EditRequest(
+                message_idx, new_content, turn_index, user_position, branch_view, target
+            ),
+            return_receipt=True,
+        )
+        return completed_regeneration_result(outcome, receipt) if receipt else None
 
     async def rewind_to(self, message_idx: int) -> None:
         """Drop messages from ``message_idx`` onward without re-running."""

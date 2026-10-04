@@ -90,19 +90,6 @@ from kohakuterrarium.terrarium.topology import (
 _normalize_command_args = normalize_command_args
 
 
-def _completed_branch_result(
-    agent: Any, request_id: str | None
-) -> BranchMutationResult:
-    parent_path = getattr(agent, "_parent_branch_path", ()) or ()
-    return {
-        "status": "completed",
-        "request_id": request_id or uuid.uuid4().hex,
-        "turn_index": int(getattr(agent, "_turn_index", 0)),
-        "branch_id": int(getattr(agent, "_branch_id", 0)),
-        "parent_branch_path": [list(pair) for pair in parent_path],
-    }
-
-
 @runtime_checkable
 class TerrariumService(HistoryServiceProtocol, DriveServiceProtocol, Protocol):
     """Operations Studio needs from a terrarium runtime.
@@ -757,8 +744,8 @@ class LocalTerrariumService(
         }
         if target is not None:
             kwargs["target"] = target
-        await agent.regenerate_last_response(**kwargs)
-        return _completed_branch_result(agent, request_id)
+        kwargs["request_id"] = request_id or uuid.uuid4().hex
+        return await agent.interrupt_and_regenerate(**kwargs)
 
     async def edit_message(
         self,
@@ -781,10 +768,11 @@ class LocalTerrariumService(
         }
         if target is not None:
             kwargs["target"] = target
-        ok = await agent.edit_and_rerun(msg_idx, content, **kwargs)
-        if not ok:
+        kwargs["request_id"] = request_id or uuid.uuid4().hex
+        receipt = await agent._edit_and_rerun_result(msg_idx, content, **kwargs)
+        if receipt is None:
             raise ValueError(f"message {msg_idx} cannot be edited")
-        return _completed_branch_result(agent, request_id)
+        return receipt
 
     async def rewind(self, creature_id: str, msg_idx: int) -> None:
         await self._agent(creature_id).rewind_to(msg_idx)

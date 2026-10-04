@@ -1,5 +1,4 @@
-"""Per-creature + wiring + identity dispatch tests for
-:class:`TerrariumRuntimeAdapter`.
+"""Adapter unit ops — companion suite for :class:`TerrariumRuntimeAdapter`.
 
 Companion to `test_terrarium_runtime_adapter.py` (topology / lifecycle /
 channel ops); split out to keep each file under the 600-line cap. Same
@@ -11,11 +10,11 @@ test-builder's `_FakeAgent` lacks the production agent surface.
 from types import SimpleNamespace
 
 from kohakuterrarium.errors import ConflictError
-
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.adapters.terrarium_runtime import (
     TerrariumRuntimeAdapter,
 )
+from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
 
 
@@ -276,12 +275,27 @@ class TestChatOps:
         try:
             creature = adapter._engine.get_creature("alice")
             calls = []
+            receipt = {
+                "status": "completed",
+                "request_id": "receipt-req-1",
+                "turn_index": 3,
+                "branch_id": 1,
+                "parent_branch_path": [],
+            }
 
-            async def _regen(*, turn_index, branch_view, request_id=None):
-                calls.append((turn_index, branch_view, request_id))
+            async def _regen(**kwargs):
+                calls.append(kwargs)
+                return receipt
+
+            legacy_calls = []
+
+            async def _legacy_regen(*a, **kw):
+                legacy_calls.append((a, kw))
 
             creature.agent = SimpleNamespace(
-                is_running=False, regenerate_last_response=_regen
+                is_running=False,
+                interrupt_and_regenerate=_regen,
+                regenerate_last_response=_legacy_regen,
             )
             out = await adapter._dispatch(
                 _msg(
@@ -293,34 +307,52 @@ class TestChatOps:
                     },
                 )
             )
+            assert out == receipt
             assert out["status"] == "completed"
-            assert out["turn_index"] == 0
-            assert out["branch_id"] == 0
-            assert out["request_id"]
-            # The turn/branch selectors are passed through verbatim.
-            assert calls == [(3, "v", None)]
+            assert out["turn_index"] == 3
+            assert out["branch_id"] == 1
+            assert out["request_id"] == "receipt-req-1"
+            # The turn/branch selectors are passed through; service generates request_id when omitted.
+            assert len(calls) == 1
+            assert calls[0]["turn_index"] == 3
+            assert calls[0]["branch_view"] == "v"
+            assert isinstance(calls[0]["request_id"], str) and calls[0]["request_id"]
+            assert legacy_calls == []
         finally:
             await adapter._engine.shutdown()
 
     async def test_regenerate_returns_opened_branch_for_navigator_promotion(self):
         # The frontend's chevron navigator <N/M> needs to promote
         # immediately on Retry / Save&Rerun — it can't wait for the
-        # post-turn history resync. The dispatcher therefore surfaces
-        # the agent's freshly-opened branch_id (and the turn_index it
-        # belongs to) so the worker -> remote_service hop carries it
-        # back to the frontend.
+        # post-turn history resync. The dispatcher surfaces the receipt
+        # from interrupt_and_regenerate with its opened branch_id and turn_index.
+        # Stub agent sets sentinel mutable attributes to prove they do not drive the DTO.
         adapter = await _make_adapter()
         try:
             creature = adapter._engine.get_creature("alice")
+            calls = []
 
-            async def _regen(*, turn_index, branch_view, request_id=None):
-                pass
+            async def _regen(**kwargs):
+                calls.append(kwargs)
+                return {
+                    "status": "completed",
+                    "request_id": kwargs["request_id"],
+                    "turn_index": 3,
+                    "branch_id": 2,
+                    "parent_branch_path": [],
+                }
+
+            legacy_calls = []
+
+            async def _legacy_regen(*a, **kw):
+                legacy_calls.append((a, kw))
 
             creature.agent = SimpleNamespace(
                 is_running=False,
-                regenerate_last_response=_regen,
-                _turn_index=3,
-                _branch_id=2,
+                interrupt_and_regenerate=_regen,
+                regenerate_last_response=_legacy_regen,
+                _turn_index=999,
+                _branch_id=999,
             )
             out = await adapter._dispatch(
                 _msg(
@@ -335,7 +367,57 @@ class TestChatOps:
             assert out["status"] == "completed"
             assert out["turn_index"] == 3
             assert out["branch_id"] == 2
-            assert out["request_id"]
+            assert out["request_id"] == calls[0]["request_id"]
+            assert isinstance(out["request_id"], str) and out["request_id"]
+            assert len(calls) == 1
+            assert calls[0]["turn_index"] == 3
+            assert calls[0]["branch_view"] is None
+            assert legacy_calls == []
+        finally:
+            await adapter._engine.shutdown()
+
+    async def test_regenerate_forwards_target_selector_to_agent(self):
+        adapter = await _make_adapter()
+        try:
+            creature = adapter._engine.get_creature("alice")
+            calls = []
+            receipt = {
+                "status": "completed",
+                "request_id": "target-tok",
+                "turn_index": 3,
+                "branch_id": 1,
+                "parent_branch_path": [],
+            }
+
+            async def _regen(**kwargs):
+                calls.append(kwargs)
+                return receipt
+
+            creature.agent = SimpleNamespace(
+                is_running=False,
+                interrupt_and_regenerate=_regen,
+                regenerate_last_response=lambda *a, **kw: None,
+            )
+            out = await adapter._dispatch(
+                _msg(
+                    "regenerate",
+                    {
+                        "creature_id": "alice",
+                        "turn_index": 3,
+                        "branch_view": {"1": 1},
+                        "target": {
+                            "event_id": 42,
+                            "turn_index": 3,
+                            "branch_id": 0,
+                        },
+                    },
+                )
+            )
+            assert out == receipt
+            assert len(calls) == 1
+            assert calls[0]["target"] == UserMessageSelector(
+                event_id=42, turn_index=3, branch_id=0
+            )
         finally:
             await adapter._engine.shutdown()
 
@@ -343,12 +425,30 @@ class TestChatOps:
         adapter = await _make_adapter()
         try:
             creature = adapter._engine.get_creature("alice")
+            calls = []
 
             async def _edit(msg_idx, content, **kw):
-                # Echo back a truthy result only for the expected index.
-                return msg_idx == 2
+                calls.append((msg_idx, content, kw))
+                if msg_idx == 2:
+                    return {
+                        "status": "completed",
+                        "request_id": kw["request_id"],
+                        "turn_index": 1,
+                        "branch_id": 2,
+                        "parent_branch_path": [],
+                    }
+                return None
 
-            creature.agent = SimpleNamespace(is_running=False, edit_and_rerun=_edit)
+            legacy_calls = []
+
+            async def _legacy_edit(*a, **kw):
+                legacy_calls.append((a, kw))
+
+            creature.agent = SimpleNamespace(
+                is_running=False,
+                _edit_and_rerun_result=_edit,
+                edit_and_rerun=_legacy_edit,
+            )
             out = await adapter._dispatch(
                 _msg(
                     "edit_message",
@@ -359,13 +459,16 @@ class TestChatOps:
                     },
                 )
             )
-            # Successful edit echoes the canonical ``edited`` flag plus
-            # the ``status: edited`` marker the remote_service shim
-            # uses to detect "new-style" replies. Stub agent has no
-            # ``_turn_index`` / ``_branch_id`` attributes, so those
-            # keys are absent.
             assert out["status"] == "completed"
-            assert out["request_id"]
+            assert out["request_id"] == calls[0][2]["request_id"]
+            assert isinstance(out["request_id"], str) and out["request_id"]
+            assert len(calls) == 1
+            assert calls[0][0] == 2
+            assert calls[0][1] == "fixed"
+            assert calls[0][2]["turn_index"] is None
+            assert calls[0][2]["user_position"] is None
+            assert calls[0][2]["branch_view"] is None
+            assert legacy_calls == []
         finally:
             await adapter._engine.shutdown()
 
@@ -373,18 +476,33 @@ class TestChatOps:
         # Same rationale as the regenerate case above — the navigator
         # promotion is gated on receiving the new branch_id back from
         # the worker, so the dispatcher must surface it.
+        # Sentinel mutable coordinates on agent prove they do not drive the DTO.
         adapter = await _make_adapter()
         try:
             creature = adapter._engine.get_creature("alice")
+            calls = []
 
             async def _edit(msg_idx, content, **kw):
-                return True
+                calls.append((msg_idx, content, kw))
+                return {
+                    "status": "completed",
+                    "request_id": kw["request_id"],
+                    "turn_index": 4,
+                    "branch_id": 3,
+                    "parent_branch_path": [],
+                }
+
+            legacy_calls = []
+
+            async def _legacy_edit(*a, **kw):
+                legacy_calls.append((a, kw))
 
             creature.agent = SimpleNamespace(
                 is_running=False,
-                edit_and_rerun=_edit,
-                _turn_index=4,
-                _branch_id=3,
+                _edit_and_rerun_result=_edit,
+                edit_and_rerun=_legacy_edit,
+                _turn_index=999,
+                _branch_id=999,
             )
             out = await adapter._dispatch(
                 _msg(
@@ -399,27 +517,82 @@ class TestChatOps:
             assert out["status"] == "completed"
             assert out["turn_index"] == 4
             assert out["branch_id"] == 3
-            assert out["request_id"]
+            assert out["request_id"] == calls[0][2]["request_id"]
+            assert len(calls) == 1
+            assert calls[0][0] == 2
+            assert calls[0][1] == "fixed"
+            assert legacy_calls == []
+        finally:
+            await adapter._engine.shutdown()
+
+    async def test_edit_message_forwards_target_selector_to_agent(self):
+        adapter = await _make_adapter()
+        try:
+            creature = adapter._engine.get_creature("alice")
+            calls = []
+            receipt = {
+                "status": "completed",
+                "request_id": "edit-target-tok",
+                "turn_index": 2,
+                "branch_id": 1,
+                "parent_branch_path": [],
+            }
+
+            async def _edit(msg_idx, content, **kw):
+                calls.append((msg_idx, content, kw))
+                return receipt
+
+            creature.agent = SimpleNamespace(
+                is_running=False,
+                _edit_and_rerun_result=_edit,
+                edit_and_rerun=lambda *a, **kw: None,
+            )
+            out = await adapter._dispatch(
+                _msg(
+                    "edit_message",
+                    {
+                        "creature_id": "alice",
+                        "msg_idx": 2,
+                        "content": "fixed",
+                        "target": {
+                            "event_id": 99,
+                            "turn_index": 2,
+                            "branch_id": 0,
+                        },
+                    },
+                )
+            )
+            assert out == receipt
+            assert len(calls) == 1
+            assert calls[0][2]["target"] == UserMessageSelector(
+                event_id=99, turn_index=2, branch_id=0
+            )
         finally:
             await adapter._engine.shutdown()
 
     async def test_edit_message_failure_does_not_leak_branch_metadata(self):
-        # When the agent refuses the edit (wrong target, etc.) the
-        # ``edited: False`` reply must NOT carry a stale branch_id —
-        # the frontend uses the truthiness of ``edited`` to decide
-        # whether to promote the navigator, and a sticky branch_id
-        # from a previous successful call would flip <1/1> to <2/2>
-        # on a bona fide failure.
+        # When the agent refuses the edit (wrong target, etc.),
+        # _edit_and_rerun_result returns None which service maps to ValueError.
+        # The invalid error reply must NOT carry stale turn_index or branch_id —
+        # the caller receives kind="invalid" without leaking branch metadata.
         adapter = await _make_adapter()
         try:
             creature = adapter._engine.get_creature("alice")
+            calls = []
 
             async def _edit(msg_idx, content, **kw):
-                return False
+                calls.append((msg_idx, content, kw))
+                return None
+
+            legacy_calls = []
+
+            async def _legacy_edit(*a, **kw):
+                legacy_calls.append((a, kw))
 
             creature.agent = SimpleNamespace(
                 is_running=False,
-                edit_and_rerun=_edit,
+                _edit_and_rerun_result=_edit,
+                edit_and_rerun=_legacy_edit,
                 _turn_index=7,
                 _branch_id=9,
             )
@@ -434,6 +607,14 @@ class TestChatOps:
                 )
             )
             assert out["error"]["kind"] == "invalid"
+            assert "cannot be edited" in out["error"]["message"]
+            assert "status" not in out
+            assert "turn_index" not in out
+            assert "branch_id" not in out
+            assert len(calls) == 1
+            assert calls[0][0] == 2
+            assert calls[0][1] == "fixed"
+            assert legacy_calls == []
         finally:
             await adapter._engine.shutdown()
 

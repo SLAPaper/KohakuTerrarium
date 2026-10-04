@@ -6,15 +6,17 @@ from typing import Any, Callable
 
 from kohakuterrarium.core.branch_edit_prepare import EditRequest, prepare_edit
 from kohakuterrarium.core.branch_selection import _join_accepted, _scope_id
-from kohakuterrarium.core.event_inbox import EventEnvelope
+from kohakuterrarium.core.event_inbox import EventEnvelope, TurnOutcome
 from kohakuterrarium.core.events import EventType, TriggerEvent
 from kohakuterrarium.core.history_compatibility import validate_history_compatibility
 from kohakuterrarium.core.message_locator import is_turn_user_message
+from kohakuterrarium.core.operation_admission import reject_own_turn
 from kohakuterrarium.core.runtime_context import (
     RuntimeContextAllocator,
     RuntimeContextPreparation,
     RuntimeContextPreparationMode,
 )
+from kohakuterrarium.core.regeneration_reservation import bind_regeneration_completion
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.llm.generation import provider_source
 from kohakuterrarium.session.compact_coverage import coverage_metadata, exact_origins
@@ -57,20 +59,39 @@ async def request_rerun(
     *,
     request_id: str | None,
     edit: EditRequest | None = None,
-) -> bool:
+    validate: Callable | None = None,
+    return_outcome: bool = False,
+    return_receipt: bool = False,
+) -> bool | TurnOutcome | tuple[TurnOutcome, dict]:
     """Admit a history mutation, then await its turn outside mutation ownership."""
     edit = deepcopy(edit)
-    completion = await run_history_mutation(
-        agent, lambda: _admit(agent, append_pair, request_id, edit)
+    admitted = await run_history_mutation(
+        agent, lambda: _admit(agent, append_pair, request_id, edit, validate)
     )
-    if completion is not None:
-        await asyncio.shield(completion)
+    if admitted is not None:
+        completion, receipt = admitted
+        outcome = (
+            await _join_accepted(completion)
+            if return_receipt
+            else await asyncio.shield(completion)
+        )
+        if return_outcome or return_receipt:
+            outcome = (
+                outcome
+                if isinstance(outcome, TurnOutcome)
+                else TurnOutcome(status="error")
+            )
+            return (outcome, receipt) if return_receipt else outcome
         return True
-    return False
+    outcome = TurnOutcome(status="rejected", was_primary=False)
+    if return_receipt:
+        return outcome, {}
+    return outcome if return_outcome else False
 
 
 async def run_history_mutation(agent: Any, operation: Callable, *, rerun: bool = True):
     """Reserve local history until an accepted mutation and persistence finish."""
+    reject_own_turn(agent, "mutate history")
     previous = getattr(agent, "_branch_rerun_completion", None)
     if previous is not None and not previous.done():
         await asyncio.shield(previous)
@@ -100,7 +121,9 @@ async def run_history_mutation(agent: Any, operation: Callable, *, rerun: bool =
         return await _join_accepted(task)
 
 
-def _capture(agent: Any, *, editing: bool = False) -> dict | None:
+def _capture(agent: Any, *, editing: bool = False, validate=None) -> dict | None:
+    if validate is not None:
+        validate()
     conversation = agent.controller.conversation
     messages = tuple(conversation.get_messages())
     last_user = next(
@@ -136,6 +159,7 @@ def _capture(agent: Any, *, editing: bool = False) -> dict | None:
         "store": agent.session_store,
         "prefix": prefix,
         "source": source,
+        "validate": validate,
     }
 
 
@@ -155,6 +179,9 @@ def _prepare(store, prefix, retained, coordinates, source) -> tuple[int, Any]:
 
 
 def _check_capture(agent, capture) -> None:
+    validate = capture.get("validate")
+    if validate is not None:
+        validate()
     conv = agent.controller.conversation
     if (
         conv is not capture["conversation"]
@@ -225,6 +252,7 @@ def _commit(agent, capture, branch, request_id, bundle, user_event_id):
     user.metadata = metadata
     agent._branch_id = branch
     agent._branch_view = dict((*capture["coordinates"][2], (agent._turn_index, branch)))
+    bind_regeneration_completion(agent, completion)
     agent._event_inbox.put_front([EventEnvelope(event, future=completion)])
     agent._branch_rerun_completion = completion
     agent._runtime_context_bundle = bundle
@@ -260,6 +288,7 @@ def _commit_edit(agent, capture, edit, request_id, bundle, user_event_id):
     agent._parent_branch_path = list(edit["path"])
     agent._branch_view = dict((*edit["path"], (edit["turn"], edit["branch"])))
     completion = asyncio.get_running_loop().create_future()
+    bind_regeneration_completion(agent, completion)
     agent._event_inbox.put_front([EventEnvelope(event, future=completion)])
     agent._branch_rerun_completion = completion
     agent._runtime_context_bundle = bundle
@@ -349,10 +378,10 @@ def _persist_rerun(
     return user_event_id
 
 
-async def _admit(agent, append_pair, request_id, edit=None):
+async def _admit(agent, append_pair, request_id, edit=None, validate=None):
     owner = agent._session_state_owner
     capture = await owner.submit_internal(
-        lambda: _capture(agent, editing=edit is not None)
+        lambda: _capture(agent, editing=edit is not None, validate=validate)
     )
     if capture is None:
         return None
@@ -427,7 +456,16 @@ async def _admit(agent, append_pair, request_id, edit=None):
                     agent, capture, branch, request_id, bundle, user_event_id
                 )
             )
-        return receipt[0]
+        turn, _, path = capture["coordinates"]
+        if prepared_edit is not None:
+            turn, path = prepared_edit["turn"], prepared_edit["path"]
+        return receipt[0], {
+            "request_id": request_id,
+            "turn_index": turn,
+            "branch_id": branch,
+            "parent_branch_path": [list(pair) for pair in path],
+            "branch_view": {str(t): b for t, b in (*path, (turn, branch))},
+        }
     except BaseException:
         agent._history_rerun_uncertain = True
         raise

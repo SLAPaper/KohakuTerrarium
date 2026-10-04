@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
+from kohakuterrarium.core.session_generation_handoff import validate_generation_handoff
 from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.session.event_origin import validate_origin
 
@@ -80,7 +81,13 @@ def relocate_topology_selectors(
     if source_output is not None and target_output is not source_output:
         if target_output is None or target_output._store is not destination:
             raise ConflictError("Output binding changed before generation handoff")
-        for name in ("_generation_id", "_generation_coordinates", "_chunk_seq"):
+        validate_generation_handoff(source_output, target_output)
+        for name in (
+            "_generation_id",
+            "_generation_coordinates",
+            "_generation_payload",
+            "_chunk_seq",
+        ):
             setattr(target_output, name, deepcopy(getattr(source_output, name)))
         source_output._handoff_successor = target_output
     for metadata, event_id in updates:

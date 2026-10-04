@@ -27,11 +27,13 @@ from kohakuterrarium.core.config import (
 from kohakuterrarium.core.config_serde import pack_agent_config
 from kohakuterrarium.core.environment import Environment
 from kohakuterrarium.core.events import TriggerEvent
+from kohakuterrarium.core.operation_admission import require_stop_available
 from kohakuterrarium.core.turn import AgentEventStream, TurnResult
 from kohakuterrarium.llm.profiles import _login_provider_for
 from kohakuterrarium.packages.walk import package_snapshot
 from kohakuterrarium.terrarium.config import CreatureConfig
 from kohakuterrarium.terrarium.creature_ids import _safe_creature_id
+from kohakuterrarium.terrarium.creature_stop import settle_host_stop
 from kohakuterrarium.terrarium.output_log import LogEntry, OutputLogCapture
 from kohakuterrarium.utils.logging import get_logger
 
@@ -259,21 +261,26 @@ class Creature:
 
     async def stop(self, *, requested: bool = True) -> None:
         """Stop the underlying agent and close the chat pipe."""
-        if requested:
-            self._stop_requested = True
+        require_stop_available(self.agent)
         async with self._lifecycle_lock:
+            require_stop_available(self.agent)
+            if requested:
+                self._stop_requested = True
             if not self._running and self._input_task is None:
                 return
             self._running = False
             self._restoration_state = RESTORATION_ADDED
+            restoration = self._restoration_task
             self._teardown_restoration_barrier()
             if self._output_queue is not None:
                 self._output_queue.put_nowait(None)
             # Stopping the agent flips ``Agent._running`` and stops the
             # input module, which unblocks ``get_input`` and lets the
             # background loop exit on its own.
-            await self.agent.stop()
-            await self._reap_input_task()
+            try:
+                await self.agent.stop()
+            finally:
+                await settle_host_stop(self, restoration)
             logger.info(
                 "Creature stopped",
                 creature_id=self.creature_id,

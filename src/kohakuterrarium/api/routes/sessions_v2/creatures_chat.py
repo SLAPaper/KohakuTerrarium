@@ -15,6 +15,7 @@ from kohakuterrarium.api.schemas import (
     MessageEdit,
     RegenerateRequest,
 )
+from kohakuterrarium.core.interrupt_regeneration import RegenerationTurnError
 from kohakuterrarium.errors import ConflictError, NotFoundError
 from kohakuterrarium.session.history_paging import (
     HistoryPagingError,
@@ -76,6 +77,15 @@ async def regenerate_creature(
         return await service.regenerate(cid, **kwargs)
     except (NotFoundError, KeyError) as exc:
         raise HTTPException(404, str(exc)) from exc
+    except RegenerationTurnError as exc:
+        raise HTTPException(
+            409,
+            {
+                "message": str(exc),
+                "applied": exc.may_have_run,
+                "operation": exc.receipt,
+            },
+        ) from exc
     except (ConflictError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -115,6 +125,15 @@ async def edit_creature_message(
         return edited
     except (NotFoundError, KeyError) as exc:
         raise HTTPException(404, str(exc)) from exc
+    except RegenerationTurnError as exc:
+        raise HTTPException(
+            409,
+            {
+                "message": str(exc),
+                "applied": exc.may_have_run,
+                "operation": exc.receipt,
+            },
+        ) from exc
     except (ConflictError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -132,6 +151,15 @@ async def rewind_creature(
         return {"status": "rewound"}
     except (NotFoundError, KeyError) as exc:
         raise HTTPException(404, str(exc)) from exc
+    except RegenerationTurnError as exc:
+        raise HTTPException(
+            409,
+            {
+                "message": str(exc),
+                "applied": exc.may_have_run,
+                "operation": exc.receipt,
+            },
+        ) from exc
     except (ConflictError, ValueError) as exc:
         raise HTTPException(409, str(exc)) from exc
 

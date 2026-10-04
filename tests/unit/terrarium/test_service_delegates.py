@@ -267,28 +267,50 @@ class TestPerCreatureOps:
 
     async def test_regenerate(self):
         svc, c = _build_service()
-        out = await svc.regenerate("cid", turn_index=1)
-        assert out["status"] == "completed"
-        assert out["request_id"]
-        c.agent.regenerate_last_response.assert_awaited()
+        receipt = {
+            "status": "completed",
+            "request_id": "rerun-token",
+            "turn_index": 1,
+            "branch_id": 2,
+            "parent_branch_path": [],
+            "branch_view": {"1": 2},
+        }
+        c.agent.interrupt_and_regenerate = AsyncMock(return_value=receipt)
+        out = await svc.regenerate("cid", turn_index=1, request_id="rerun-token")
+        assert out == receipt
+        c.agent.interrupt_and_regenerate.assert_awaited_once_with(
+            turn_index=1,
+            branch_view=None,
+            request_id="rerun-token",
+        )
+        c.agent.regenerate_last_response.assert_not_awaited()
 
     async def test_edit_message(self):
-        # Successful edits return a dict carrying the freshly-opened
-        # branch — the frontend reads ``branch_id`` to promote its
-        # <N/M> navigator without waiting for the post-turn resync.
         svc, c = _build_service()
-        out = await svc.edit_message("cid", 2, "new content")
-        assert isinstance(out, dict)
-        assert out["status"] == "completed"
-        assert out["request_id"]
-        c.agent.edit_and_rerun.assert_awaited()
+        receipt = {
+            "status": "completed",
+            "request_id": "edit-token",
+            "turn_index": 1,
+            "branch_id": 2,
+            "parent_branch_path": [],
+            "branch_view": {"1": 2},
+        }
+        c.agent._edit_and_rerun_result = AsyncMock(return_value=receipt)
+        out = await svc.edit_message("cid", 2, "new content", request_id="edit-token")
+        assert out == receipt
+        c.agent._edit_and_rerun_result.assert_awaited_once_with(
+            2,
+            "new content",
+            turn_index=None,
+            user_position=None,
+            branch_view=None,
+            request_id="edit-token",
+        )
+        c.agent.edit_and_rerun.assert_not_awaited()
 
     async def test_edit_message_rejected_target_returns_false(self):
-        # Edits that name a non-user message must surface as a plain
-        # ``False`` so the route hands the client a 400. Returning the
-        # dict shape here would mask the failure.
         svc, c = _build_service()
-        c.agent.edit_and_rerun.return_value = False
+        c.agent._edit_and_rerun_result = AsyncMock(return_value=None)
         with pytest.raises(ValueError, match="cannot be edited"):
             await svc.edit_message("cid", 2, "new content")
 

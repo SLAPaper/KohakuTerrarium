@@ -32,6 +32,7 @@ from kohakuterrarium.core.feedback_dispatch import (
     arm_dispatch_feedback,
     queue_dispatch_ack,
 )
+from kohakuterrarium.core.regeneration_reservation import defer_regeneration_compact
 from kohakuterrarium.core.pending_input import stamp_pending_id
 from kohakuterrarium.core.output_feedback import route_output_feedback
 from kohakuterrarium.core.tool_origin import tool_completion_context
@@ -814,4 +815,6 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
         last_usage = getattr(controller, "_last_usage", {}) or {}
         prompt_tokens = last_usage.get("prompt_tokens", 0)
         if self.compact_manager.should_compact(prompt_tokens):
+            if defer_regeneration_compact(self, controller):
+                return
             self.compact_manager.trigger_compact()

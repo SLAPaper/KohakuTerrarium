@@ -19,6 +19,7 @@ from kohakuterrarium.core.model_switch_guard import require_model_mutation_avail
 from kohakuterrarium.core.session_attachment import attach_explicit
 from kohakuterrarium.modules.subagent.persistence import bind_children
 from kohakuterrarium.core.agent_turn import AgentTurnMixin
+from kohakuterrarium.core.agent_turn_control import cancel_active_execution
 from kohakuterrarium.core.agent_handlers import AgentHandlersMixin
 from kohakuterrarium.core.agent_lifecycle import AgentLifecycleMixin
 from kohakuterrarium.core.agent_state import (
@@ -64,6 +65,7 @@ from kohakuterrarium.session.agent_attach import (
     detach_from_session as _detach_from_session,
 )
 from kohakuterrarium.session.output import SessionOutput
+from kohakuterrarium.core.shutdown_callbacks import stop_wait_ineligible
 from kohakuterrarium.utils.logging import get_logger
 from kohakuterrarium.utils.mobile_sandbox import default_workdir
 
@@ -594,7 +596,9 @@ class Agent(
         fresh turn (no explicit re-fire needed). Queued Drive deliveries
         are dropped WITHOUT running and settle as user-interrupted, so the
         dispatcher pauses their drive instead of redelivering."""
-        active = getattr(self, "_active_event_run", None)
+        active = getattr(self, "_active_event_run", None) or getattr(
+            self, "_active_turn_run", None
+        )
         if active:
             active[0].event.context["interrupted_by_user"] = True
         self._interrupt_active_turn()
@@ -625,9 +629,7 @@ class Agent(
         already_requested = self._interrupt_requested
         self._interrupt_requested = True
         self.controller._interrupted = True
-        processing = getattr(self, "_processing_task", None)
-        if processing and not processing.done() and not already_requested:
-            processing.cancel()
+        cancel_active_execution(self, already_requested=already_requested)
         for job_id in list(self._active_handles.keys()):
             self._interrupt_direct_job(job_id)
 
@@ -712,15 +714,11 @@ class Agent(
         finally:
             await self.stop()
 
+    @stop_wait_ineligible
     async def _drive_input(self) -> None:
-        """Replay resume state, fire the startup trigger, then poll input.
-
-        Extracted from :meth:`run` so engine-managed creatures can spawn
-        this as a background task in ``Creature.start`` — that's the
-        path headless configured-IO agents (Discord bot, webhook
-        listener, custom polling input) depend on. ``run`` keeps the
-        non-engine standalone path; both routes share this body.
-        """
+        """Restore input-side state and drive the configured input module."""
+        driver = asyncio.current_task()
+        self._input_driver_task = driver
         try:
             # Replay session history to output if resuming
             if self._pending_resume_events:
@@ -803,6 +801,9 @@ class Agent(
                     exc_info=True,
                 )
             raise
+        finally:
+            if getattr(self, "_input_driver_task", None) is driver:
+                self._input_driver_task = None
 
     @property
     def is_running(self) -> bool:

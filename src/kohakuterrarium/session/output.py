@@ -33,21 +33,19 @@ from kohakuterrarium.session.output_generation import (
     stamp_generation,
 )
 from kohakuterrarium.session.output_snapshot import capture_turn_snapshot
+from kohakuterrarium.session.output_text import SessionTextMixin
 from kohakuterrarium.session.snapshot_coverage import (
     capture_snapshot_boundary,
     require_snapshot_boundary,
     save_bound_snapshot,
 )
-from kohakuterrarium.session.text_buffer import (
-    OpenTextSegment,
-    last_persisted_turn_branch,
-)
+from kohakuterrarium.session.text_buffer import OpenTextSegment
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-class SessionOutput(SessionActivityMixin, OutputModule):
+class SessionOutput(SessionActivityMixin, SessionTextMixin, OutputModule):
     """Output module that records events to a SessionStore.
 
     Streamed text is coalesced into one durable segment and flushed at the
@@ -67,7 +65,7 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         *,
         capture_activity: bool = True,
         event_key_prefix: str | None = None,
-        prepared_recovery: tuple | None = None,
+        prepared_recovery: dict | str | None = None,
     ):
         self._agent_name = agent_name
         self._store = store
@@ -75,12 +73,16 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         self._capture_activity = capture_activity
         self._generation_id: str | None = None
         self._generation_coordinates = None
+        self._generation_payload = None
         # Attached agents require a host-scoped namespace to avoid collisions.
         self._event_key_prefix = event_key_prefix or agent_name
         # Durable buffering preserves partial text across process interruption.
         # Sequence numbers restart for each assistant response.
         self._open_text = OpenTextSegment(
-            store, self._event_key_prefix, submit=self._submit_store_write
+            store,
+            self._event_key_prefix,
+            submit=self._submit_store_write,
+            require_binding=True,
         )
         self._prepared_recovery = prepared_recovery
         self._recovered_open_text: bool = False
@@ -96,6 +98,8 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         # turn boundaries. Populated before recovery so the constructor can
         # queue without an event loop.
         self._pending_writes: list[Future] = []
+        self._critical_writes: set[Future] = set()
+        self._text_durability_error = None
         # Recover immediately so read-only resumes expose interrupted text.
         self._recover_open_text()
 
@@ -212,7 +216,14 @@ class SessionOutput(SessionActivityMixin, OutputModule):
                 self._pending_writes[:0] = [f for f in pending[idx:] if not f.done()]
                 raise
             except Exception as e:
+                if fut in self._critical_writes:
+                    self._text_durability_error = e
+                    self._pending_writes[:0] = pending[idx + 1 :]
+                    raise
                 logger.warning("Session record failed", error=str(e), exc_info=True)
+            finally:
+                if fut.done() and not fut.cancelled() and fut.exception() is None:
+                    self._critical_writes.discard(fut)
 
     def _ensure_token_totals_restored(self) -> None:
         """Seed cumulative totals from the persisted slot, exactly once.
@@ -240,7 +251,9 @@ class SessionOutput(SessionActivityMixin, OutputModule):
 
     async def stop(self) -> None:
         await self.flush()
-        self._generation_id = self._generation_coordinates = None
+        self._generation_id = self._generation_coordinates = (
+            self._generation_payload
+        ) = None
 
     @admit_output
     async def write(self, text: str) -> None:
@@ -249,69 +262,6 @@ class SessionOutput(SessionActivityMixin, OutputModule):
     @admit_output
     async def write_stream(self, chunk: str) -> None:
         self._ingest_text(chunk)
-
-    def _ingest_text(self, chunk: str) -> None:
-        """Buffer a streamed text chunk into the open segment.
-
-        Chunks accumulate in durable state and flush as one ``text_chunk`` at
-        the next non-text event or processing boundary.
-        """
-        self._recover_open_text()
-        if chunk:
-            self._open_text.append(chunk)
-
-    def _recover_open_text(self) -> None:
-        """Flush a segment orphaned by a crashed process, exactly once.
-
-        Recovery is idempotent and runs during construction so view-only resumes
-        surface partial text. The recovered event uses the interrupted turn's
-        stamps rather than the resumed agent's current turn.
-        """
-        if self._recovered_open_text:
-            return
-        self._recovered_open_text = True
-        if self._prepared_recovery is None:
-            recovered = self._open_text.recover()
-            if not recovered:
-                return
-            ti, bi, ppath = last_persisted_turn_branch(
-                self._store, self._event_key_prefix
-            )
-        else:
-            recovered, ti, bi, ppath = self._prepared_recovery
-            self._prepared_recovery = None
-            if not recovered:
-                return
-            self._open_text._slot_active = True
-        recorded = self._append_event_at(
-            "text_chunk",
-            {
-                "content": recovered,
-                "chunk_seq": self._chunk_seq,
-                "finalize": "recovered",
-            },
-            ti,
-            bi,
-            ppath,
-        )
-        self._chunk_seq += 1
-        self._open_text.clear(after=recorded)
-
-    def _flush_text_segment(self, *, finalize: str | None = None) -> None:
-        """Write the open segment as one ``text_chunk`` event and clear it."""
-        text = self._open_text.take()
-        if text:
-            recorded = self._append_text_chunk(text, finalize=finalize)
-            self._open_text.clear(after=recorded)
-
-    def _append_text_chunk(
-        self, content: str, *, finalize: str | None = None
-    ) -> Future:
-        data: dict[str, Any] = {"content": content, "chunk_seq": self._chunk_seq}
-        if finalize:
-            data["finalize"] = finalize
-        self._chunk_seq += 1
-        return self._append_event("text_chunk", data)
 
     async def flush(self) -> None:
         await drain_deferred_output(self)
@@ -322,16 +272,24 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         """Finalize output before a synchronous store handoff (requires blocking)."""
         self._flush_text_segment()
         pending, self._pending_writes = self._pending_writes, []
-        for future in pending:
+        for index, future in enumerate(pending):
             try:
                 future.result()
             except Exception as exc:
+                if future in self._critical_writes:
+                    self._text_durability_error = exc
+                    self._pending_writes[:0] = pending[index + 1 :]
+                    raise
                 logger.warning("Session record failed", error=str(exc), exc_info=True)
+            else:
+                self._critical_writes.discard(future)
 
     @admit_output
     async def on_processing_start(self, *, request_id: str | None = None) -> None:
         self._flush_text_segment()
-        self._generation_id = self._generation_coordinates = None
+        self._generation_id = self._generation_coordinates = (
+            self._generation_payload
+        ) = None
         # Sequence numbers are local to one assistant response.
         self._chunk_seq = 0
         payload = {"request_id": request_id} if request_id is not None else {}
@@ -343,7 +301,9 @@ class SessionOutput(SessionActivityMixin, OutputModule):
         # turn, so drain before reading the store.
         await self.drain()
         self._record("processing_end", {})
-        self._generation_id = self._generation_coordinates = None
+        self._generation_id = self._generation_coordinates = (
+            self._generation_payload
+        ) = None
         # _record flushed the open text segment and queued processing_end
         # itself; drain again so the turn's final events are durable and
         # the snapshot watermark below cannot run ahead of the log.
@@ -548,7 +508,9 @@ class SessionOutput(SessionActivityMixin, OutputModule):
             case "user_input":
                 # The agent writes the canonical user-input event directly.
                 self._flush_text_segment()
-                self._generation_id = self._generation_coordinates = None
+                self._generation_id = self._generation_coordinates = (
+                    self._generation_payload
+                ) = None
             case "assistant_image":
                 payload = event.payload
                 self.on_assistant_image(

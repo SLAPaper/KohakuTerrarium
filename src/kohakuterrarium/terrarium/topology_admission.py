@@ -8,6 +8,7 @@ from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.core.agent_state import submit_internal_session_state
 from kohakuterrarium.core.branch_selection import _join_accepted
 from kohakuterrarium.core.session_attachment import relocate_topology_selectors
+from kohakuterrarium.core.session_generation_handoff import prepare_generation_handoff
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.terrarium.drive.handoff import drive_handoff
 from kohakuterrarium.utils.logging import get_logger
@@ -66,6 +67,7 @@ async def _relocate_selectors(sources, outputs, transfers, installed, coordinato
         transfer = transfers.get((source, destination))
         if transfer is None:
             raise ConflictError("Live selector handoff has no confirmed transfer")
+        await prepare_generation_handoff(agent, output, agent._session_output)
         await submit_internal_session_state(
             agent,
             lambda: relocate_topology_selectors(

@@ -22,6 +22,7 @@ from kohakuterrarium.terrarium.creature_host import (
     build_creature,
 )
 from kohakuterrarium.terrarium.events import EngineEvent, EventKind
+from kohakuterrarium.terrarium.topology_admission import require_topology_available
 
 if TYPE_CHECKING:
     from kohakuterrarium.terrarium.engine import Terrarium
@@ -109,6 +110,7 @@ async def add_creature(
     _channels.bind_creature_to_environment(creature, graph_env)
     _channels.register_engine_handle(graph_env, engine)
     engine._creatures[creature.creature_id] = creature
+    creature.agent._stop_admission = lambda: require_topology_available(engine)
     _wiring.install_output_wiring_resolver(engine)
 
     if register_basic is not None:

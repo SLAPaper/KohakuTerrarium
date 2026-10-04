@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 import time
+from uuid import uuid4
 
 import pytest
 
@@ -63,6 +64,15 @@ class _FakeAgent:
         self._turn_index = turn
         self._branch_id = branch
         self._parent_branch_path = path or []
+
+
+async def _begin_text_generation(out):
+    payload = {
+        "schema": 1,
+        "generation_id": str(uuid4()),
+        "source": {"provider_name": "scripted", "model": "test"},
+    }
+    await out._begin_generation(payload)
 
 
 def _make(tmp_path, agent=None, *, capture_activity=True, prefix=None) -> tuple:
@@ -284,8 +294,10 @@ class TestStreaming:
         crashed = "partial " + "x" * 600  # exceeds the slot flush gate
         path = str(tmp_path / "x.kohakutr")
         store = SessionStore(path)
-        out = SessionOutput("alice", store, None)
+        out = SessionOutput("alice", store, _FakeAgent(turn=1, branch=1))
+        await _begin_text_generation(out)
         await out.write_stream(crashed)
+        await out.drain()
         store.close()  # simulate shutdown mid-stream
 
         store2 = SessionStore(path)
@@ -306,8 +318,10 @@ class TestStreaming:
         orphaned = "orphaned " + "y" * 600  # exceeds the slot flush gate
         path = str(tmp_path / "x.kohakutr")
         store = SessionStore(path)
-        out = SessionOutput("alice", store, None)
+        out = SessionOutput("alice", store, _FakeAgent(turn=1, branch=1))
+        await _begin_text_generation(out)
         await out.write_stream(orphaned)
+        await out.drain()
         store.close()
 
         store2 = SessionStore(path)
@@ -340,15 +354,18 @@ class TestStreaming:
         store = SessionStore(path)
         out = SessionOutput("alice", store, agent1)
         await out.on_processing_start()  # processing_start at turn 2
+        await _begin_text_generation(out)
         await out.write_stream("crashed " + "x" * 600)  # past the slot gate
+        await out.drain()
         store.close()  # crash mid-stream
 
         # Resume: the agent has advanced to a new turn (3).
         agent2 = _FakeAgent(turn=3, branch=1)
         store2 = SessionStore(path)
         # Constructing the sink is what triggers recovery (no start needed).
-        SessionOutput("alice", store2, agent2)
+        resumed = SessionOutput("alice", store2, agent2)
         try:
+            await resumed.drain()
             store2.flush()
             events = store2.get_events("alice")
             tcs = [e for e in events if e["type"] == "text_chunk"]
@@ -385,6 +402,7 @@ class TestProcessingLifecycle:
         store, out = _make(tmp_path)
         try:
             await out.on_processing_start()
+            await out.drain()
             store.flush()
             evts = store.get_events("alice")
             assert any(e["type"] == "processing_start" for e in evts)
@@ -602,6 +620,7 @@ class TestActivityHandlers:
                     "args": {},
                 },
             )
+            await out.drain()
             event = next(
                 e for e in store.get_events("alice") if e["type"] == "tool_call"
             )
@@ -1232,6 +1251,7 @@ class TestEmitMatch:
                     payload={"url": "u"},
                 )
             )
+            await out.drain()
             store.flush()
             evts = [
                 e for e in store.get_events("alice") if e["type"] == "assistant_image"
@@ -1276,6 +1296,7 @@ class TestEmitMatch:
                     payload={"job_id": "j1"},
                 )
             )
+            await out.drain()
             store.flush()
             evts = [e for e in store.get_events("alice") if e["type"] == "tool_call"]
             assert len(evts) == 1
@@ -1485,11 +1506,10 @@ class TestActivityMethods:
 
 
 class TestStoreFailureBranches:
-    async def test_write_stream_record_failure_swallowed(self, tmp_path):
-        # If the durable open_text slot write raises while buffering a
-        # chunk, write_stream logs + swallows it (output keeps streaming).
-        store, out = _make(tmp_path)
+    async def test_bound_stream_record_failure_surfaces_at_drain(self, tmp_path):
+        store, out = _make(tmp_path, _FakeAgent(turn=1, branch=1))
         try:
+            await _begin_text_generation(out)
             original_setitem = type(store.state).__setitem__
 
             def _flaky_setitem(self_state, key, value):
@@ -1499,9 +1519,10 @@ class TestStoreFailureBranches:
 
             store.state.__class__.__setitem__ = _flaky_setitem
             try:
-                # A chunk past the flush gate forces the slot write, which
-                # raises — write_stream must swallow it.
                 await out.write_stream("z" * 600)
+                with pytest.raises(RuntimeError, match="slot write exploded"):
+                    await out.drain()
+                assert not store.state.get("alice:open_text")
             finally:
                 store.state.__class__.__setitem__ = original_setitem
         finally:
@@ -1694,35 +1715,43 @@ class TestOpenTextAffinity:
     async def test_stream_slot_writes_use_store_worker_and_clear_after_durable_event(
         self, tmp_path, monkeypatch
     ):
-        store, out = _make(tmp_path)
+        store, out = _make(tmp_path, _FakeAgent(turn=1, branch=1))
         writes = []
         durable_on_clear = []
         vault_type = type(store.state)
         original_set = vault_type.__setitem__
 
+        original_delete = vault_type.__delitem__
+
         def observe(vault, key, value):
             if vault is store.state and key == "alice:open_text":
                 writes.append(threading.get_ident())
-                if value == "":
-                    with SessionReadView(store.path) as reader:
-                        durable_on_clear.extend(
-                            event["content"]
-                            for _, event in reader.items("events", prefix="alice:e")
-                            if event.get("type") == "text_chunk"
-                        )
             return original_set(vault, key, value)
 
+        def observe_clear(vault, key):
+            if vault is store.state and key == "alice:open_text":
+                writes.append(threading.get_ident())
+                with SessionReadView(store.path) as reader:
+                    durable_on_clear.extend(
+                        event["content"]
+                        for _, event in reader.items("events", prefix="alice:e")
+                        if event.get("type") == "text_chunk"
+                    )
+            return original_delete(vault, key)
+
         monkeypatch.setattr(vault_type, "__setitem__", observe)
+        monkeypatch.setattr(vault_type, "__delitem__", observe_clear)
         try:
             worker = await store.run(threading.get_ident)
+            await _begin_text_generation(out)
             await out.write_stream("x" * 512)
             await out.drain()
-            assert store.state.get("alice:open_text") == "x" * 512
+            assert store.state.get("alice:open_text")["text"] == "x" * 512
             out._record("boundary", {})
             await out.drain()
             assert writes and set(writes) == {worker}
             assert durable_on_clear == ["x" * 512]
-            assert store.state.get("alice:open_text") == ""
+            assert store.state.get("alice:open_text") in (None, "")
         finally:
             await out.drain()
             store.close()
@@ -1730,7 +1759,7 @@ class TestOpenTextAffinity:
     async def test_failed_text_event_keeps_durable_recovery_slot(
         self, tmp_path, monkeypatch
     ):
-        store, out = _make(tmp_path)
+        store, out = _make(tmp_path, _FakeAgent(turn=1, branch=1))
         original_append = store.append_event
 
         def fail_text(prefix, event_type, data, **kwargs):
@@ -1739,13 +1768,17 @@ class TestOpenTextAffinity:
             return original_append(prefix, event_type, data, **kwargs)
 
         try:
+            await _begin_text_generation(out)
             await out.write_stream("recover me" * 64)
             await out.drain()
             monkeypatch.setattr(store, "append_event", fail_text)
             out._record("boundary", {})
-            await out.drain()
+            with pytest.raises(OSError, match="injected event write failure"):
+                await out.drain()
             with SessionReadView(store.path) as reader:
-                assert reader.get("state", "alice:open_text") == "recover me" * 64
+                assert (
+                    reader.get("state", "alice:open_text")["text"] == "recover me" * 64
+                )
             assert not [
                 e for e in store.get_events("alice") if e["type"] == "text_chunk"
             ]
@@ -1763,10 +1796,11 @@ async def test_graceful_boundary_persists_uncheckpointed_tail(
     monkeypatch.setattr("kohakuterrarium.session.text_buffer._FLUSH_SECONDS", 3600)
     store, output = _make(tmp_path, _FakeAgent(turn=3, branch=2))
     try:
+        await _begin_text_generation(output)
         if prefix:
             await output.write_stream(prefix)
             await output.drain()
-            assert store.state.get("alice:open_text") == prefix
+            assert store.state.get("alice:open_text")["text"] == prefix
         await output.write_stream("TAIL")
         await getattr(output, boundary)()
         # Repeated lifecycle calls must not duplicate the finalized segment.

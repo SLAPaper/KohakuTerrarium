@@ -46,7 +46,6 @@ from kohakuterrarium.terrarium.recipe_discard import discard_recipe_graph_shield
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.service import (
     LocalTerrariumService,
-    _completed_branch_result,
     _normalize_command_args,
     creature_to_info,
 )
@@ -61,6 +60,7 @@ from kohakuterrarium.terrarium.wire import (
     unpack_creature_build_input,
 )
 from kohakuterrarium.utils.logging import get_logger
+from kohakuterrarium.core.interrupt_regeneration import RegenerationTurnError
 from kohakuterrarium.errors import ConflictError
 
 logger = get_logger(__name__)
@@ -143,6 +143,16 @@ class TerrariumRuntimeAdapter:
             return {"error": {"kind": "creature_not_hosted", "message": str(e)}}
         except (KeyError, FileNotFoundError) as e:
             return {"error": {"kind": "not_found", "message": str(e)}}
+        except RegenerationTurnError as e:
+            return {
+                "error": {
+                    "kind": "regeneration_failed",
+                    "message": str(e),
+                    "status": e.status,
+                    "receipt": e.receipt,
+                    "may_have_run": e.may_have_run,
+                }
+            }
         except ConflictError as e:
             return {"error": {"kind": "conflict", "message": str(e)}}
         except ValueError as e:
@@ -558,7 +568,8 @@ class TerrariumRuntimeAdapter:
                 return {"branches": chat_branches_for(self._engine, cid)}
 
             case "regenerate":
-                agent = self._require_hosted(msg.body["creature_id"]).agent
+                cid = msg.body["creature_id"]
+                self._require_hosted(cid)
                 raw_target = msg.body.get("target")
                 target = UserMessageSelector(**raw_target) if raw_target else None
                 kwargs = {
@@ -568,11 +579,13 @@ class TerrariumRuntimeAdapter:
                 }
                 if target is not None:
                     kwargs["target"] = target
-                await agent.regenerate_last_response(**kwargs)
-                return _completed_branch_result(agent, msg.body.get("request_id"))
+                return await LocalTerrariumService(self._engine).regenerate(
+                    cid, **kwargs
+                )
 
             case "edit_message":
-                agent = self._require_hosted(msg.body["creature_id"]).agent
+                cid = msg.body["creature_id"]
+                self._require_hosted(cid)
                 raw_target = msg.body.get("target")
                 target = UserMessageSelector(**raw_target) if raw_target else None
                 kwargs = {
@@ -583,14 +596,12 @@ class TerrariumRuntimeAdapter:
                 }
                 if target is not None:
                     kwargs["target"] = target
-                ok = await agent.edit_and_rerun(
+                return await LocalTerrariumService(self._engine).edit_message(
+                    cid,
                     msg.body["msg_idx"],
                     unpack_content(msg.body["content"]),
                     **kwargs,
                 )
-                if not ok:
-                    raise ValueError(f"message {msg.body['msg_idx']} cannot be edited")
-                return _completed_branch_result(agent, msg.body.get("request_id"))
 
             case "rewind":
                 await self._require_hosted(msg.body["creature_id"]).agent.rewind_to(
@@ -665,16 +676,13 @@ class TerrariumRuntimeAdapter:
 
             case "switch_model":
                 cid = msg.body["creature_id"]
-                creature = self._require_hosted(cid)
+                self._require_hosted(cid)
                 model = msg.body["model"]
-                # Remote profiles must be registered before synchronous model resolution.
                 await self._prewarm_profile_by_selector(model)
-                setter = getattr(creature.agent, "switch_model", None)
-                if callable(setter):
-                    setter(model)
-                else:
-                    creature.agent.config.model = model
-                return {"model": model}
+                resolved = await LocalTerrariumService(self._engine).switch_model(
+                    cid, model
+                )
+                return {"model": resolved}
 
             case "list_plugins":
                 cid = msg.body["creature_id"]

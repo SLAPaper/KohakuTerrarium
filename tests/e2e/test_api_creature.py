@@ -85,6 +85,18 @@ tools:
 # ── fixtures ──────────────────────────────────────────────────────────
 
 
+class JourneyLLM(ScriptedLLM):
+    async def chat(self, messages, **kwargs):
+        normalized = self._normalize_messages(messages)
+        user = next((m for m in reversed(normalized) if m.get("role") == "user"), {})
+        if user.get("content") == "e2e failed edit":
+            self.call_log.append(normalized)
+            self.call_count += 1
+            raise RuntimeError("e2e generation unavailable")
+        async for chunk in super().chat(messages, **kwargs):
+            yield chunk
+
+
 @pytest.fixture
 def scripted_llm(monkeypatch: pytest.MonkeyPatch) -> ScriptedLLM:
     """Replace the live LLM provider at BOTH bind points.
@@ -93,7 +105,7 @@ def scripted_llm(monkeypatch: pytest.MonkeyPatch) -> ScriptedLLM:
     ``bootstrap.agent_init`` imports it by name, so without the second
     patch the agent-init path would still reach a real provider.
     """
-    llm = ScriptedLLM(
+    llm = JourneyLLM(
         [
             ScriptEntry(_REPLY_GREET, match="hello creature"),
             ScriptEntry(_REPLY_FOLLOWUP, match="second question"),
@@ -623,6 +635,44 @@ class TestApiCreatureJourney:
         live_user = [m for m in edited_messages if m.get("role") == "user"]
         assert any(
             "edited hello creature" in (m.get("content") or "") for m in live_user
+        )
+
+        failed = client.post(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/messages/1/edit",
+            json={
+                "content": "e2e failed edit",
+                "turn_index": 1,
+                "request_id": "failed-edit-receipt",
+            },
+        )
+        assert failed.status_code == 409
+        detail = failed.json()["detail"]
+        assert detail["applied"] is True
+        assert detail["operation"]["status"] == "error"
+        assert detail["operation"]["request_id"] == "failed-edit-receipt"
+        assert (
+            detail["operation"]["turn_index"],
+            detail["operation"]["branch_id"],
+        ) == (1, 4)
+        failed_snapshot = _snapshot_messages(client, session_id, creature_id)
+        assert (
+            failed_snapshot[-1]["role"] == "user"
+            and failed_snapshot[-1]["content"] == "e2e failed edit"
+        )
+        failed_events = client.get(
+            f"/api/sessions/{session_id}/creatures/{creature_id}/history"
+        ).json()["events"]
+        assert (
+            len(
+                [
+                    e
+                    for e in failed_events
+                    if e.get("type") == "user_message"
+                    and e.get("turn_index") == 1
+                    and e.get("branch_id") == 4
+                ]
+            )
+            == 1
         )
 
         with client.websocket_connect(ws_url) as ws:

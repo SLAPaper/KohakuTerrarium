@@ -164,12 +164,29 @@ def _attach_chat_agent(engine, creature_id="alice"):
     control surface, recording forwarded args for observation. Mutating
     the existing agent keeps its lifecycle attrs intact for teardown."""
     agent = engine.get_creature(creature_id).agent
-    recorder = SimpleNamespace(regenerate_args=None, edit_args=None, rewind_args=None)
+    recorder = SimpleNamespace(
+        regenerate_args=None,
+        edit_args=None,
+        rewind_args=None,
+        regenerate_receipt=None,
+        edit_receipt=None,
+        legacy_calls=[],
+    )
     agent.conversation_history = [{"role": "user", "content": "hi"}]
     agent.session_store = None
+    agent._turn_index = agent._branch_id = 999
 
     async def _regen(*, turn_index=None, branch_view=None, request_id=None):
         recorder.regenerate_args = (turn_index, branch_view, request_id)
+        recorder.regenerate_receipt = {
+            "status": "completed",
+            "request_id": request_id,
+            "turn_index": 3,
+            "branch_id": 2,
+            "parent_branch_path": [[1, 1], [2, 2]],
+            "branch_view": {"1": 1, "2": 2, "3": 2},
+        }
+        return recorder.regenerate_receipt
 
     async def _edit(
         idx,
@@ -180,14 +197,34 @@ def _attach_chat_agent(engine, creature_id="alice"):
         branch_view=None,
         request_id=None,
     ):
-        recorder.edit_args = (idx, content, request_id)
-        return True
+        recorder.edit_args = (
+            idx,
+            content,
+            turn_index,
+            user_position,
+            branch_view,
+            request_id,
+        )
+        recorder.edit_receipt = {
+            "status": "completed",
+            "request_id": request_id,
+            "turn_index": 1,
+            "branch_id": 3,
+            "parent_branch_path": [],
+            "branch_view": {"1": 3},
+        }
+        return recorder.edit_receipt
 
     async def _rewind(idx):
         recorder.rewind_args = idx
 
-    agent.regenerate_last_response = _regen
-    agent.edit_and_rerun = _edit
+    async def _legacy(*args, **kwargs):
+        recorder.legacy_calls.append((args, kwargs))
+        raise AssertionError("Service used an outcome-discarding legacy entrypoint")
+
+    agent.interrupt_and_regenerate = _regen
+    agent._edit_and_rerun_result = _edit
+    agent.regenerate_last_response = agent.edit_and_rerun = _legacy
     agent.rewind_to = _rewind
     return recorder
 
@@ -197,24 +234,40 @@ class TestSessionsChatControlForward:
         s, engine = studio_engine
         agent = _attach_chat_agent(engine)
         gid = engine.get_creature("alice").graph_id
-        result = await s.sessions.chat.regenerate(gid, "alice")
-        # The facade preserves the authoritative service metadata.
-        assert result["status"] == "completed"
-        assert agent.regenerate_args == (None, None, None)
+        result = await s.sessions.chat.regenerate(
+            gid,
+            "alice",
+            turn_index=3,
+            branch_view={1: 1, 2: 2},
+            request_id="studio-regenerate",
+        )
+        assert result == agent.regenerate_receipt
+        assert result["turn_index"] == 3 and result["branch_id"] == 2
+        assert result["request_id"] == "studio-regenerate"
+        assert agent.regenerate_args == (3, {1: 1, 2: 2}, "studio-regenerate")
+        assert agent.legacy_calls == []
 
     async def test_edit_message_forwards_idx_and_content_and_returns_result(
         self, studio_engine
     ):
-        # Successful edits return a ``{status, [turn_index, branch_id]}``
-        # dict so the frontend can promote its <N/M> navigator before
-        # the post-turn resync. False is reserved for "edit refused".
         s, engine = studio_engine
         agent = _attach_chat_agent(engine)
         gid = engine.get_creature("alice").graph_id
-        out = await s.sessions.chat.edit_message(gid, "alice", 0, "edited text")
-        assert isinstance(out, dict)
-        assert out["status"] == "completed"
-        assert agent.edit_args == (0, "edited text", None)
+        out = await s.sessions.chat.edit_message(
+            gid,
+            "alice",
+            0,
+            "edited text",
+            turn_index=1,
+            user_position=0,
+            branch_view={1: 1},
+            request_id="studio-edit",
+        )
+        assert out == agent.edit_receipt
+        assert out["turn_index"] == 1 and out["branch_id"] == 3
+        assert out["request_id"] == "studio-edit"
+        assert agent.edit_args == (0, "edited text", 1, 0, {1: 1}, "studio-edit")
+        assert agent.legacy_calls == []
 
     async def test_rewind_reaches_the_agent(self, studio_engine):
         s, engine = studio_engine

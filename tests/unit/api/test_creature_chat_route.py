@@ -1,8 +1,13 @@
 """Unit tests for :mod:`kohakuterrarium.api.routes.sessions_v2.creatures_chat`."""
 
+import httpx
+import pytest
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from kohakuterrarium.core.config_types import AgentConfig
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.api.deps import get_service
 from kohakuterrarium.api.routes.sessions_v2 import creatures_chat as chat_mod
 from kohakuterrarium.terrarium.engine import Terrarium
@@ -177,6 +182,58 @@ class TestPagedChannelValidation:
 
 
 # ── chat ───────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("operation", ["regenerate", "edit"])
+async def test_failed_http_rerun_retains_applied_receipt_without_fake_success(
+    tmp_path, operation
+):
+    class FailedProvider(ScriptedLLM):
+        async def chat(self, messages, **kwargs):
+            if self.call_count:
+                self.call_count += 1
+                raise RuntimeError("HTTP rerun failed")
+            async for chunk in super().chat(messages, **kwargs):
+                yield chunk
+
+    provider = FailedProvider(["original answer"])
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"), llm=provider, io="headless", start=True
+        )
+        await creature.run("question", timeout=3)
+        app = FastAPI()
+        app.dependency_overrides[get_service] = lambda: LocalTerrariumService(engine)
+        app.include_router(chat_mod.router, prefix="/sessions")
+        path = f"/sessions/{creature.graph_id}/creatures/{creature.creature_id}"
+        body = {"request_id": "http-failed-rerun"}
+        if operation == "regenerate":
+            path += "/regenerate"
+        else:
+            index = next(
+                i
+                for i, m in enumerate(
+                    creature.agent.controller.conversation.get_messages()
+                )
+                if m.role == "user"
+            )
+            path += f"/messages/{index}/edit"
+            body["content"] = "edited question"
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(path, json=body)
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["applied"] is True
+        assert detail["operation"]["status"] == "error"
+        assert (
+            detail["operation"]["turn_index"] == 1
+            and detail["operation"]["branch_id"] == 2
+        )
+        assert detail["operation"]["request_id"] == "http-failed-rerun"
+        assert provider.call_count == 2
+        assert creature.agent.controller.conversation.get_messages()[-1].role == "user"
 
 
 class TestChat:

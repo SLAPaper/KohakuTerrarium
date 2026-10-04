@@ -30,6 +30,7 @@ explicit admin tooling, not the standard service surface.
 from collections.abc import AsyncIterator
 from typing import Any
 
+from kohakuterrarium.core.interrupt_regeneration import RegenerationTurnError
 from kohakuterrarium.errors import ConflictError, InvalidRequestError
 from kohakuterrarium.laboratory.protocols import LabSender
 from kohakuterrarium.laboratory._internal.client import (
@@ -114,6 +115,19 @@ def _maybe_raise(body: Any) -> dict[str, Any]:
             raise CreatureNotHostedHere(message)
         if kind == "not_found":
             raise KeyError(message)
+        if kind == "regeneration_failed":
+            receipt = err.get("receipt")
+            status = err.get("status")
+            applied = err.get("may_have_run")
+            if (
+                not isinstance(receipt, dict)
+                or status not in ("error", "interrupted", "rejected")
+                or type(applied) is not bool
+            ):
+                raise RemoteEngineError(
+                    "invalid_response", "Invalid failed regeneration receipt"
+                )
+            raise RegenerationTurnError(status, receipt, may_have_run=applied)
         if kind == "conflict":
             raise ConflictError(message)
         if kind == "invalid":

@@ -9,8 +9,10 @@ test-builder's `_FakeAgent` lacks the production agent surface.
 """
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 
+from kohakuterrarium.errors import ConflictError
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.adapters.terrarium_runtime import (
     TerrariumRuntimeAdapter,
@@ -72,7 +74,7 @@ async def _make_adapter():
 
 
 class TestMutationOps:
-    async def test_switch_model_uses_agent_setter_when_present(self):
+    async def test_switch_model_awaits_live_setter_and_returns_resolved_identity(self):
         adapter = await _make_adapter()
         try:
             creature = adapter._engine.get_creature("alice")
@@ -80,33 +82,39 @@ class TestMutationOps:
             creature.agent = SimpleNamespace(
                 is_running=False,
                 switch_model=lambda m: switched.append(m),
+                switch_model_async=AsyncMock(return_value="resolved/new"),
                 config=SimpleNamespace(model="old"),
             )
             out = await adapter._dispatch(
                 _msg("switch_model", {"creature_id": "alice", "model": "new"})
             )
-            assert out == {"model": "new"}
-            # Setter path is taken — config is NOT mutated directly.
-            assert switched == ["new"]
+            assert out == {"model": "resolved/new"}
+            creature.agent.switch_model_async.assert_awaited_once_with("new")
+            assert switched == []
             assert creature.agent.config.model == "old"
         finally:
             await adapter._engine.shutdown()
 
-    async def test_switch_model_falls_back_to_config_assignment(self):
+    async def test_refused_switch_does_not_fall_back_to_config_assignment(self):
         adapter = await _make_adapter()
         try:
             creature = adapter._engine.get_creature("alice")
             creature.agent = SimpleNamespace(
                 is_running=False,
                 switch_model=None,
+                switch_model_async=AsyncMock(
+                    side_effect=ConflictError("model binding reserved")
+                ),
                 config=SimpleNamespace(model="old"),
             )
             out = await adapter._dispatch(
                 _msg("switch_model", {"creature_id": "alice", "model": "new"})
             )
-            assert out == {"model": "new"}
-            # No callable setter → the op writes config.model directly.
-            assert creature.agent.config.model == "new"
+            assert out == {
+                "error": {"kind": "conflict", "message": "model binding reserved"}
+            }
+            creature.agent.switch_model_async.assert_awaited_once_with("new")
+            assert creature.agent.config.model == "old"
         finally:
             await adapter._engine.shutdown()
 

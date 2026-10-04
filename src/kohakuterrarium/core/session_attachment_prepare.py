@@ -16,7 +16,7 @@ from kohakuterrarium.modules.plugin.option_validation import validate_plugin_opt
 from kohakuterrarium.modules.subagent.persistence import settle
 from kohakuterrarium.modules.tool.runtime_options import validate_tool_options
 from kohakuterrarium.session.output import SessionOutput
-from kohakuterrarium.session.text_buffer import last_persisted_turn_branch
+from kohakuterrarium.session.text_recovery import validate_record
 
 _KEYS = (
     "native_tool_options",
@@ -29,12 +29,10 @@ _KEYS = (
 
 def _read_destination(store, name):
     values = {key: deepcopy(store.state.get(f"{name}:{key}")) for key in _KEYS}
-    text = store.state.get(f"{name}:open_text")
-    text = text if isinstance(text, str) else ""
-    coordinates = (
-        last_persisted_turn_branch(store, name) if text else (None, None, None)
-    )
-    return values, (text, *coordinates)
+    record = deepcopy(store.state.get(f"{name}:open_text"))
+    if record is not None and record != "":
+        validate_record(store, name, record)
+    return values, record
 
 
 def _mapping(value):
@@ -69,7 +67,7 @@ class PreparedAttachment:
     children: list
     compact_count: int
     compact_time: float
-    recovery: tuple
+    recovery: dict | str | None
 
     def stage(self):
         if self.sink is None or self.sink._store is not self.store:

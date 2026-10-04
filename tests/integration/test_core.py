@@ -37,6 +37,7 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.builtins.tools.canvas_image import CanvasImageTool
 from kohakuterrarium.builtins.tools.stop_task import StopTaskTool
+from kohakuterrarium.builtins.user_commands.branch import BranchCommand
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.core.config_types import (
     AgentConfig,
@@ -89,6 +90,7 @@ from kohakuterrarium.modules.tool.base import (
     ToolResult,
 )
 from kohakuterrarium.modules.trigger.base import BaseTrigger
+from kohakuterrarium.modules.user_command.base import UserCommandContext
 from kohakuterrarium.parsing import ToolCallEvent
 from kohakuterrarium.terrarium.creature_host import Creature
 from kohakuterrarium.terrarium.engine import Terrarium
@@ -2617,6 +2619,78 @@ class TestCoreIntegration:
                         )
                         == 1
                     )
+
+        provider = ScriptedLLM(
+            ["root", "child", "edited child", "continued", "edited root", "tail"]
+        )
+        async with Terrarium(session_dir=tmp_path / "resolved-branch") as engine:
+            creature = await engine.add_creature(
+                AgentConfig(name="branch_probe"),
+                llm=provider,
+                io="headless",
+                start=True,
+            )
+            agent = creature.agent
+            await creature.run("ROOT", timeout=5)
+            await creature.run("CHILD", timeout=5)
+            index = next(
+                i
+                for i, message in enumerate(
+                    agent.controller.conversation.get_messages()
+                )
+                if message.role == "user" and message.content == "CHILD"
+            )
+            await agent.edit_and_rerun(index, "EDITED-CHILD")
+            await agent.select_branch({1: 1, 2: 1})
+            assert await agent.inject_input("CONTINUE", branch_view={1: 1})
+            assert [
+                message["content"]
+                for message in provider.last_messages
+                if message["role"] == "user"
+            ] == ["ROOT", "EDITED-CHILD", "CONTINUE"]
+            rows = await agent.session_store.run(
+                agent.session_store.get_events, "branch_probe"
+            )
+            assert [
+                list(pair)
+                for pair in [row for row in rows if row["type"] == "user_message"][-1][
+                    "parent_branch_path"
+                ]
+            ] == [[1, 1], [2, 2]]
+            index = next(
+                i
+                for i, message in enumerate(
+                    agent.controller.conversation.get_messages()
+                )
+                if message.role == "user" and message.content == "ROOT"
+            )
+            await agent.edit_and_rerun(index, "EDITED-ROOT")
+            command = BranchCommand()
+            context = UserCommandContext(agent=agent)
+            assert (await command.execute("1 1", context)).success
+            assert (await command.execute("1 2", context)).success
+            assert [
+                message.content
+                for message in agent.controller.conversation.get_messages()
+                if message.role == "user"
+            ] == ["EDITED-ROOT"]
+            await creature.stop()
+            await creature.start()
+            await agent.select_branch({1: 2})
+            assert (await creature.run("TAIL", timeout=5)).text == "tail"
+            saved_path = agent.session_store.path
+        resumed_provider = ScriptedLLM(["after branch resume"])
+        resumed = await Terrarium.resume(saved_path, llm=resumed_provider)
+        async with resumed:
+            restored = resumed.list_creatures()[0]
+            assert (
+                await restored.run("AFTER", timeout=5)
+            ).text == "after branch resume"
+            assert [
+                message["content"]
+                for message in resumed_provider.last_messages
+                if message["role"] == "user"
+            ] == ["EDITED-ROOT", "TAIL", "AFTER"]
 
     async def test_inject_event_and_unified_trigger_model(
         self, make_creature, monkeypatch, tmp_path

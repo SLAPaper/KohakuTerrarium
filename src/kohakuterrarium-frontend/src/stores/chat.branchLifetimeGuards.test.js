@@ -333,6 +333,91 @@ describe("chat store — branch error classification (mayHaveRun)", () => {
     chat._clearBranchResyncTimers()
   })
 
+  it.each([
+    ["edit", "error"],
+    ["regenerate", "error"],
+    ["edit", "rejected"],
+    ["regenerate", "interrupted"],
+  ])("%s preserves an applied %s branch but reports failure", async (operation, status) => {
+    const chat = useChatStore()
+    seedInstance(chat)
+    chat._scheduleBranchResync = vi.fn()
+    const { agentAPI } = await import("@/utils/api")
+    const method = operation === "edit" ? "editMessage" : "regenerate"
+    vi.spyOn(agentAPI, method).mockImplementation(async (...args) => {
+      const options = args.at(-1)
+      throw Object.assign(Error("rerun provider failed"), {
+        response: {
+          status: 409,
+          data: {
+            detail: {
+              message: "rerun provider failed",
+              applied: true,
+              operation: {
+                status,
+                request_id: options.requestId,
+                turn_index: 1,
+                branch_id: 3,
+                parent_branch_path: [],
+              },
+            },
+          },
+        },
+      })
+    })
+    const result =
+      operation === "edit"
+        ? await chat.editMessage(0, "edited", {
+            tabId: "main",
+            turnIndex: 1,
+            userPosition: 0,
+            latestBranch: 1,
+          })
+        : await chat.regenerateLastResponse({ turnIndex: 1 })
+    expect(result.ok).toBe(false)
+    expect(chat.branchViewByTab.main[1]).toBe(3)
+    expect(JSON.stringify(chat.messagesByTab.main)).not.toContain("old-to-A")
+    expect(chat._branchResyncPendingByTab.main.expectedBranchByTurn[1]).toBe(3)
+    expect(chat.branchOperationErrorByTab.main).toContain("rerun provider failed")
+    expect(chat._scheduleBranchResync).toHaveBeenCalledWith("main")
+    chat._clearBranchResyncTimers()
+  })
+
+  it("an applied receipt from another request cannot overwrite this branch", async () => {
+    const chat = useChatStore()
+    seedInstance(chat)
+    const expected = JSON.parse(JSON.stringify(chat.messagesByTab.main))
+    const { agentAPI } = await import("@/utils/api")
+    vi.spyOn(agentAPI, "editMessage").mockRejectedValue(
+      Object.assign(Error("old failure"), {
+        response: {
+          status: 409,
+          data: {
+            detail: {
+              applied: true,
+              operation: {
+                status: "error",
+                request_id: "another-request",
+                turn_index: 1,
+                branch_id: 9,
+              },
+            },
+          },
+        },
+      }),
+    )
+    const result = await chat.editMessage(0, "edited", {
+      tabId: "main",
+      turnIndex: 1,
+      userPosition: 0,
+      latestBranch: 1,
+    })
+    expect(result.ok).toBe(false)
+    expect(chat.messagesByTab.main).toEqual(expected)
+    expect(chat.branchViewByTab.main?.[1]).not.toBe(9)
+    chat._clearBranchResyncTimers()
+  })
+
   it("502 keeps the optimism even when mayHaveRun is false", async () => {
     const chat = useChatStore()
     seedInstance(chat)

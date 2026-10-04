@@ -26,10 +26,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import numpy as np
 import pytest
 
+from kohakuterrarium import Terrarium
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.errors import HistoryCompatibilityError
@@ -72,6 +74,7 @@ from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.session.resume import detect_session_type, resume_agent
 from kohakuterrarium.session.resume_async import resume_agent_async
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.text_recovery import build_record
 from kohakuterrarium.session.version import FORMAT_VERSION, detect_format_version
 from kohakuterrarium.testing.llm import ScriptedLLM
 
@@ -743,7 +746,49 @@ class TestSessionIntegration:
             interrupted.state["scribe:open_text"] = "interrupted async response"
         finally:
             interrupted.close(update_status=False)
+        with pytest.raises(HistoryCompatibilityError, match="Legacy open-text"):
+            await resume_agent_async(session_path)
+        interrupted = SessionStore(str(session_path))
+        try:
+            assert interrupted.state["scribe:open_text"] == "interrupted async response"
+            declarations = [
+                row
+                for row in interrupted.get_events("scribe")
+                if row["type"] == "assistant_generation_start"
+            ]
+            previous = declarations[-1]
+            generation = {
+                "schema": 1,
+                "generation_id": str(uuid4()),
+                "source": deepcopy(previous["source"]),
+            }
+            interrupted.append_event(
+                "scribe",
+                "assistant_generation_start",
+                generation,
+                turn_index=previous["turn_index"],
+                branch_id=previous["branch_id"],
+                parent_branch_path=previous["parent_branch_path"],
+            )
+            interrupted.checkpoint(strict=True)
+            interrupted.state["scribe:open_text"] = build_record(
+                interrupted,
+                "scribe",
+                "interrupted async response",
+                generation,
+                previous["turn_index"],
+                previous["branch_id"],
+                previous["parent_branch_path"],
+            )
+            interrupted.checkpoint(strict=True)
+        finally:
+            interrupted.close(update_status=False)
         async_agent, async_store = await resume_agent_async(session_path)
+        assert any(
+            message.content == "interrupted async response"
+            for message in async_agent.controller.conversation.get_messages()
+            if message.role == "assistant"
+        )
         try:
             await async_agent._session_output.drain()
             await async_agent._session_output.write_stream("graceful tail")
@@ -1043,7 +1088,7 @@ class TestSessionIntegration:
             child_store.append_event(
                 "scribe",
                 "subagent_call",
-                identity,
+                deepcopy(identity),
                 turn_index=1,
                 branch_id=1,
                 parent_branch_path=[],
@@ -1267,6 +1312,62 @@ class TestSessionIntegration:
             finally:
                 await recovered.stop()
                 await asyncio.to_thread(recovered_store.close)
+
+        crash_root = tmp_path / "hard-crash"
+        crash_root.mkdir()
+        child = (
+            Path(__file__).resolve().parents[1]
+            / "helpers"
+            / "text_recovery_crash_child.py"
+        )
+        process = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, str(child), str(crash_root)],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        assert process.returncode == 7, process.stderr
+        crash_path = next((crash_root / "sessions").glob("*.kohakutr"))
+        for question, answer in (
+            ("continue after crash", "continued"),
+            ("continue after second resume", "continued again"),
+        ):
+            provider = ScriptedLLM([answer])
+            resumed = await Terrarium.resume(crash_path, llm=provider)
+            async with resumed:
+                restored = resumed.list_creatures()[0]
+                assert any(
+                    message.role == "assistant" and message.content == "P" * 600
+                    for message in restored.agent.controller.conversation.get_messages()
+                )
+                assert (await restored.run(question, timeout=5)).text == answer
+                assert (
+                    sum(
+                        message["role"] == "assistant"
+                        and message["content"] == "P" * 600
+                        for message in provider.last_messages
+                    )
+                    == 1
+                )
+                crash_store = restored.agent.session_store
+                crash_rows = await crash_store.run(
+                    crash_store.get_events, "crash_recovery"
+                )
+                assert (
+                    len(
+                        [
+                            row
+                            for row in crash_rows
+                            if row.get("finalize") == "recovered"
+                        ]
+                    )
+                    == 1
+                )
+                assert await crash_store.run(
+                    crash_store.state.get, "crash_recovery:open_text"
+                ) in (None, "")
 
     async def test_memory_index_and_search_finds_exact_turn(
         self, patched_llm, tmp_path

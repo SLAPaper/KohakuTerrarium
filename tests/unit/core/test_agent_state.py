@@ -1,10 +1,14 @@
-"""First session-state owner lifecycle slice on a real Agent."""
+"""Session-state owner lifecycle and submission tests."""
+
+from __future__ import annotations
 
 import asyncio
 
 import pytest
 
-from kohakuterrarium import Agent
+from kohakuterrarium import Agent, Terrarium
+from kohakuterrarium.core.agent_state import run_session_state
+from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.errors import ConflictError, InvalidRequestError
 from kohakuterrarium.modules.plugin.base import BasePlugin
 from kohakuterrarium.testing.llm import ScriptedLLM
@@ -348,3 +352,99 @@ async def test_start_reentry_and_running_are_idempotent(tmp_path):
     finally:
         release.set()
         await stopping
+
+
+async def test_creature_stop_start_reopens_public_session_state_and_history(tmp_path):
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(
+                name="creature_state_probe", system_prompt="Preserve this prompt"
+            ),
+            llm=ScriptedLLM(["initial reply", "regenerated reply", "edited reply"]),
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        turn = await creature.run("hello")
+        assert turn.text == "initial reply"
+
+        source_events = await agent.session_store.run(
+            agent.session_store.get_events, agent.config.name
+        )
+        assert len(source_events) > 0
+
+        await creature.stop()
+        assert agent._model_switch_closing is True
+        assert agent._history_selection_closing is True
+
+        await creature.start()
+        assert agent._model_switch_closing is False
+        assert agent._history_selection_closing is False
+
+        result = await run_session_state(agent, lambda: "reopened")
+        assert result == "reopened"
+
+        # History regeneration and branch selection succeed
+        await agent.regenerate_last_response()
+        selected_count = await agent.select_branch({1: 1})
+        assert selected_count >= 1
+
+        # Edit and rerun succeeds
+        edited = await agent.edit_and_rerun(1, "edited query")
+        assert edited is True
+
+        # Source events remain preserved as the prefix of post-rerun events
+        events_after = await agent.session_store.run(
+            agent.session_store.get_events, agent.config.name
+        )
+        assert events_after[: len(source_events)] == source_events
+        assert len(events_after) > len(source_events)
+
+
+async def test_stop_start_retains_uncertain_flags_and_rejects_unsafe_history(tmp_path):
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="uncertain_probe", system_prompt="Preserve this prompt"),
+            llm=ScriptedLLM(["initial reply"]),
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        turn = await creature.run("hello")
+        assert turn.text == "initial reply"
+
+        agent._history_selection_uncertain = True
+        agent._model_switch_uncertain = True
+
+        await creature.stop()
+        await creature.start()
+
+        # Uncertain flags must not be cleared by startup
+        assert agent._history_selection_uncertain is True
+        assert agent._model_switch_uncertain is True
+
+        # History selection and mutation are rejected while uncertain
+        with pytest.raises(ConflictError, match="uncertain"):
+            await agent.select_branch({1: 1})
+
+        with pytest.raises(ConflictError, match="uncertain"):
+            await agent.regenerate_last_response()
+
+
+async def test_failed_start_keeps_public_admission_closed(tmp_path):
+    agent = await _agent(tmp_path)
+    agent.input = BoomInput()
+    with pytest.raises(RuntimeError, match="input start failed"):
+        await agent.start()
+
+    assert agent._running is False
+    assert agent._model_switch_closing is True
+    assert agent._history_selection_closing is True
+
+    with pytest.raises(
+        InvalidRequestError, match="session-state public admission is closed"
+    ):
+        run_session_state(agent, lambda: "blocked")
+
+    with pytest.raises(ConflictError):
+        await agent.select_branch(None)

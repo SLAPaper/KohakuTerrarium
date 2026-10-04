@@ -33,6 +33,7 @@ No shape asserts: every assertion pins an exact value or an observable
 side effect.
 """
 
+import asyncio
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +46,7 @@ from kohakuterrarium.errors import (
 )
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
+from kohakuterrarium.modules.plugin.base import BasePlugin
 from kohakuterrarium.session.embedding import BaseEmbedder
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.identity import grok_subscription
@@ -749,6 +751,52 @@ class TestStudioIntegration:
 
             out = await _drain_chat(studio, session_id, creature_id, "do the thing")
             assert out == "Acknowledged."
+            live = studio.engine.get_creature(creature_id)
+
+            class BeginGate(BasePlugin):
+                name = "busy_regeneration_probe"
+
+                def __init__(self):
+                    self.entered = asyncio.Event()
+                    self.release = asyncio.Event()
+                    self.once = False
+
+                async def on_event(self, event):
+                    if not self.once and event.content == "busy question":
+                        self.once = True
+                        self.entered.set()
+                        await self.release.wait()
+
+            gate = BeginGate()
+            await live.agent.add_plugin(gate)
+            pending_turn = asyncio.create_task(
+                live.run("busy question", timeout=5, raise_on_error=False)
+            )
+            try:
+                await asyncio.wait_for(gate.entered.wait(), 2)
+                receipt = await studio.sessions.chat.regenerate(
+                    session_id, creature_id, request_id="studio-busy-rerun"
+                )
+                assert (
+                    receipt["status"] == "completed"
+                    and receipt["request_id"] == "studio-busy-rerun"
+                )
+                assert (receipt["turn_index"], receipt["branch_id"]) == (2, 2)
+                assert (await pending_turn).status == "interrupted"
+                assert live.agent.llm.call_count == 2
+                assert live.agent.llm.last_user_message == "busy question"
+                history = await studio.sessions.chat.history(session_id, creature_id)
+                assert history["messages"][-1]["content"] == "Acknowledged."
+                assert history["messages"][-2]["content"] == "busy question"
+            finally:
+                gate.release.set()
+                await asyncio.gather(pending_turn, return_exceptions=True)
+            assert await studio.sessions.plugins.toggle(
+                session_id, creature_id, gate.name
+            ) == {
+                "name": gate.name,
+                "enabled": False,
+            }
 
             # --- lifecycle lookups: get / find by id + name -------------
             # ``get_session`` rebuilds a full handle from the graph id.

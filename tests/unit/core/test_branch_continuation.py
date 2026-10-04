@@ -1,11 +1,12 @@
-"""Explicit continuation coordinates are detached and rejected before ingress."""
+"""Resolved selected paths govern continuation without replacing exact live context."""
 
 import pytest
 
-from kohakuterrarium import Agent
+from kohakuterrarium import Agent, Terrarium
 from kohakuterrarium.core.branch_continuation import normalize_branch_view
 from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.session.history_support import InvalidBranchViewError
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 
@@ -74,3 +75,81 @@ async def test_same_branch_input_uses_live_context_and_uncertainty_fence(tmp_pat
         agent._paused = False
         agent._history_selection_uncertain = False
         await agent.stop()
+
+
+async def test_sparse_ancestor_continuation_uses_latest_compatible_child(tmp_path):
+    provider = ScriptedLLM(["root", "child", "edited", "continued"])
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=provider,
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        await creature.run("ROOT", timeout=3)
+        await creature.run("CHILD", timeout=3)
+        index = next(
+            i
+            for i, message in enumerate(agent.controller.conversation.get_messages())
+            if message.role == "user" and message.content == "CHILD"
+        )
+        await agent.edit_and_rerun(index, "EDITED-CHILD")
+        await agent.select_branch({1: 1, 2: 1})
+        assert await agent.inject_input("CONTINUE", branch_view={1: 1})
+        assert agent.controller.conversation.get_messages()[-1].content == "continued"
+        assert [
+            m["content"] for m in provider.last_messages if m["role"] == "user"
+        ] == ["ROOT", "EDITED-CHILD", "CONTINUE"]
+        rows = await agent.session_store.run(agent.session_store.get_events, "alice")
+        assert [
+            list(pair)
+            for pair in [r for r in rows if r["type"] == "user_message"][-1][
+                "parent_branch_path"
+            ]
+        ] == [[1, 1], [2, 2]]
+
+
+async def test_exact_resolved_selection_keeps_live_system_and_compact_summary(tmp_path):
+    provider = ScriptedLLM(["first", "continued"])
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice", system_prompt="baseline"),
+            llm=provider,
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        await creature.run("ROOT", timeout=3)
+        conversation = agent.controller.conversation
+        system = conversation.get_messages()[0]
+        conversation.append(
+            "system", "retained live summary", metadata={"is_compact_summary": True}
+        )
+        assert await agent.inject_input("CONTINUE", branch_view={1: 1})
+        assert agent.controller.conversation.get_messages()[-1].content == "continued"
+        assert agent.controller.conversation is conversation
+        assert agent.controller.conversation.get_messages()[0] is system
+        assert any(
+            m["content"] == "retained live summary" for m in provider.last_messages
+        )
+
+
+async def test_invalid_explicit_branch_does_not_run_or_change_live_binding(tmp_path):
+    provider = ScriptedLLM(["root", "child"])
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=provider,
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        await creature.run("ROOT", timeout=3)
+        await creature.run("CHILD", timeout=3)
+        conversation = agent.controller.conversation
+        with pytest.raises((ConflictError, InvalidBranchViewError)):
+            await agent.inject_input("MUST NOT RUN", branch_view={1: 999})
+        assert provider.call_count == 2
+        assert agent.controller.conversation is conversation
+        assert not agent._processing_lock.locked()

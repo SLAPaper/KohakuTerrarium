@@ -2713,6 +2713,9 @@ const _chatStoreOptions = {
       if (typeof text === "string" ? !text.trim() : !text.length) return
 
       const tab = this.activeTab
+      if (!tab.startsWith("ch:") && this.branchOperationByTab?.[tab]) {
+        throw Error("Cannot send while a branch operation is pending")
+      }
       const branchView = _detachBranchView(this.branchViewByTab?.[tab])
       const slashCommand = _parseSlashCommand(text)
       if (slashCommand && !tab.startsWith("ch:")) {
@@ -4249,6 +4252,50 @@ const _chatStoreOptions = {
       this.branchOperationErrorByTab[tab] = null
     },
 
+    _settleAppliedBranchFailure(owner, error) {
+      const detail = error?.response?.data?.detail
+      const receipt = detail?.operation
+      if (
+        !this._branchOpOwned(owner) ||
+        detail?.applied !== true ||
+        receipt?.request_id !== owner.requestId ||
+        !["error", "interrupted", "rejected"].includes(receipt?.status) ||
+        !Number.isInteger(receipt?.turn_index) ||
+        receipt.turn_index <= 0 ||
+        !Number.isInteger(receipt?.branch_id) ||
+        receipt.branch_id <= 0
+      )
+        return false
+      const tab = owner.tab
+      this._reconcileBranchOperation(tab, receipt.turn_index, receipt.branch_id, owner.requestId)
+      const parents = receipt.parent_branch_path
+      if (
+        Array.isArray(parents) &&
+        parents.every(
+          (pair) =>
+            Array.isArray(pair) &&
+            pair.length === 2 &&
+            Number.isInteger(pair[0]) &&
+            pair[0] > 0 &&
+            pair[0] < receipt.turn_index &&
+            Number.isInteger(pair[1]) &&
+            pair[1] > 0,
+        )
+      ) {
+        this.branchViewByTab[tab] = Object.fromEntries([
+          ...parents,
+          [receipt.turn_index, receipt.branch_id],
+        ])
+        this._rebuildMessages(tab)
+      }
+      this._markBranchResyncPending(tab, {
+        expectedBranchByTurn: { [receipt.turn_index]: receipt.branch_id },
+      })
+      this._scheduleBranchResync(tab)
+      const message = this._failBranchOperation(tab, detail.message || error)
+      return this._branchOperationResult(false, tab, null, message)
+    },
+
     _failBranchOperation(tab, error) {
       const message =
         error instanceof Error ? error.message : String(error || "Branch operation failed")
@@ -4474,6 +4521,8 @@ const _chatStoreOptions = {
             return this._branchOpSuperseded(tab)
           }
           // A lost response retains the speculative branch until history confirms it.
+          const failedReceipt = this._settleAppliedBranchFailure(owner, e)
+          if (failedReceipt) return failedReceipt
           if (optimisticApplied && tab && this._requestMayStillBeRunning(e)) {
             console.warn("Regenerate transport error; keeping optimistic branch:", e)
             this._scheduleBranchResync(tab)
@@ -4691,6 +4740,8 @@ const _chatStoreOptions = {
             return this._branchOpSuperseded(tab)
           }
           // A lost response retains the speculative branch until history confirms it.
+          const failedReceipt = this._settleAppliedBranchFailure(owner, e)
+          if (failedReceipt) return failedReceipt
           if (tab && (optimisticApplied || validTarget) && this._requestMayStillBeRunning(e)) {
             console.warn("Edit transport error; keeping optimistic branch:", e)
             this._scheduleBranchResync(tab)
@@ -5083,7 +5134,23 @@ const _chatStoreOptions = {
       const tab = tabOverride || this.activeTab
       if (!tab || this.branchOperationByTab[tab]) return false
       if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
-      this.branchViewByTab[tab][turnIndex] = branchId
+      const currentView = this.branchViewByTab[tab]
+      const targetTurn = Number(turnIndex)
+      const events = this.eventsByTab[tab] || []
+      const currentSelection = _collectBranchMetadata(events, currentView)?.branchSelection
+      const currentEffectiveBranch =
+        Number.isSafeInteger(targetTurn) && currentSelection?.has(targetTurn)
+          ? currentSelection.get(targetTurn)
+          : (currentView[targetTurn] ?? currentView[turnIndex])
+      if (currentEffectiveBranch !== branchId) {
+        for (const key of Object.keys(currentView)) {
+          const num = Number(key)
+          if (Number.isSafeInteger(num) && num > targetTurn) {
+            delete currentView[key]
+          }
+        }
+      }
+      currentView[turnIndex] = branchId
       this._rebuildMessages(tab)
       // If a stream is still in flight on this tab, an off-branch
       // switch may have missed chunks; the on-branch path back also

@@ -45,6 +45,7 @@ from kohakuterrarium.session.resume_build import (
     build_conversation as _build_conversation,
 )
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.text_recovery import recover_record
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -215,6 +216,7 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
     ancestry raises :class:`SessionError`.
     """
     _reject_running_injection(agent)
+    recover_record(store, agent_name)
     # ONE raw read of the event log feeds every consumer below (conversation
     # replay, branch restore, mismatch replay) — not the old 3-4 scans.
     events = store.get_events(agent_name)

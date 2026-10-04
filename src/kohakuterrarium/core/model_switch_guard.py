@@ -2,6 +2,7 @@
 
 import asyncio
 
+from kohakuterrarium.core.regeneration_reservation import require_regeneration_available
 from kohakuterrarium.errors import ConflictError
 
 
@@ -17,9 +18,18 @@ def require_topology_mutation_available(agent) -> None:
         raise ConflictError("Graph handoff is awaiting completion")
 
 
-def require_model_mutation_available(agent, *, allow_compact_pending=False) -> None:
+def require_model_mutation_available(
+    agent, *, allow_compact_pending=False, regeneration_completion=None
+) -> None:
     """Refuse changes to prepared model state before touching live collaborators."""
     require_topology_mutation_available(agent)
+    claim = getattr(agent, "_regeneration_reservation", None)
+    if (
+        claim is None
+        or regeneration_completion is None
+        or regeneration_completion is not claim.completion
+    ):
+        require_regeneration_available(agent)
     if getattr(agent, "_session_attach_uncertain", False):
         raise ConflictError(
             "Session attachment rollback failed; cold recovery required"

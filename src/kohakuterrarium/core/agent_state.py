@@ -29,6 +29,8 @@ def ensure_session_state_owner(agent: Any) -> None:
 async def rollback_failed_start(agent: Any) -> None:
     """Stop producers, the consumer, and the owner after an incomplete start."""
     agent._running = False
+    agent._model_switch_closing = True
+    agent._history_selection_closing = True
     shutdown = getattr(agent, "_shutdown_event", None)
     if shutdown is not None:
         shutdown.set()
@@ -73,6 +75,9 @@ async def rollback_failed_start(agent: Any) -> None:
 
 async def start_agent(agent: Any) -> None:
     """Start the owner, then existing modules, rolling back on failure."""
+    shutdown = getattr(agent, "_shutdown_task", None)
+    if shutdown is not None and not shutdown.done():
+        raise ConflictError("Cannot start while the agent is stopping")
     stop_lock = getattr(agent, "_stop_lock", None)
     if stop_lock is not None and stop_lock.locked():
         raise ConflictError("Cannot start while the agent is stopping")
@@ -87,6 +92,11 @@ async def start_agent(agent: Any) -> None:
     agent._starting = True
     try:
         await agent._start_modules()
+        owner = getattr(agent, "_session_state_owner", None)
+        if owner is None or not owner.is_running:
+            raise ConflictError("Agent startup lost its session-state owner")
+        agent._model_switch_closing = False
+        agent._history_selection_closing = False
     except BaseException:
         await rollback_failed_start(agent)
         raise

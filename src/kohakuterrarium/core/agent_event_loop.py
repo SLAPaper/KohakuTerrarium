@@ -12,6 +12,11 @@ from copy import deepcopy
 from kohakuterrarium.core.agent_mid_turn import _to_serializable_content
 from kohakuterrarium.core.agent_runtime_tools import _make_job_label
 from kohakuterrarium.core.agent_state import submit_internal_session_state
+from kohakuterrarium.core.agent_turn_control import (
+    SettledProcessingFailure,
+    finalize_turn,
+    withdraw_turn_events,
+)
 from kohakuterrarium.core.background_admission import admit_background_run
 from kohakuterrarium.core.branch_selection import _join_accepted
 from kohakuterrarium.core.event_inbox import EventEnvelope, TurnOutcome
@@ -23,6 +28,7 @@ from kohakuterrarium.core.feedback_admission import (
 )
 from kohakuterrarium.core.metrics_hook import metrics
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
+from kohakuterrarium.core.shutdown_callbacks import stop_wait_ineligible
 from kohakuterrarium.core.pending_input import pending_id_of
 from kohakuterrarium.core.primary_user_identity import (
     arm_primary_user,
@@ -30,6 +36,7 @@ from kohakuterrarium.core.primary_user_identity import (
     clear_primary_user,
     install_primary_user,
 )
+from kohakuterrarium.core.regeneration_reservation import wait_regeneration_admission
 from kohakuterrarium.session.raw_history import append_user_event_pair
 from kohakuterrarium.modules.output.event import OutputEvent
 from kohakuterrarium.skills.hints import inject_skill_path_hint
@@ -103,12 +110,7 @@ class AgentEventLoopMixin:
         stash.clear()
 
     async def _run_event_consumer(self) -> None:
-        """Drain the inbox forever: claim ALL → one turn per stackable run.
-
-        The only park is ``inbox.wait_nonempty()`` (woken by ``put``) plus
-        the warm-pause gate; both re-checked each loop so an event landing
-        at any boundary is never lost and a paused agent processes nothing
-        until resume."""
+        """Drain claimed input into turns under pause and mutation admission gates."""
         batch: list[EventEnvelope] = []
         try:
             while self._running:
@@ -140,6 +142,9 @@ class AgentEventLoopMixin:
                     break
                 if not self._consumer_resume.is_set():
                     continue
+                claim = getattr(self, "_regeneration_reservation", None)
+                if claim is not None:
+                    await claim.dispatch_ready.wait()
                 batch = self._event_inbox.drain_all()
                 for run in segment_stackable(batch):
                     await self._consumer_resume.wait()
@@ -147,7 +152,11 @@ class AgentEventLoopMixin:
                         self._reject_run(run, status="rejected")
                         continue
                     try:
-                        await self._run_turn_for_batch(run)
+                        if not await wait_regeneration_admission(self, run):
+                            for envelope in run:
+                                self._event_inbox.put(envelope)
+                            continue
+                        await self._run_interruptible_turn(run)
                     except asyncio.CancelledError:
                         self._reject_run(run, status="interrupted")
                         raise
@@ -160,12 +169,42 @@ class AgentEventLoopMixin:
             self._reject_run(batch)
             self._drain_and_reject_inbox()
 
-    async def _run_turn_for_batch(self, run: list[EventEnvelope]) -> None:
-        """Run ONE turn for a stackable run and resolve its futures.
+    async def _run_interruptible_turn(self, run: list[EventEnvelope]) -> None:
+        """Keep cancellation of one turn separate from the ingress consumer."""
+        self._active_turn_run = run
+        self._interrupt_requested = False
+        self._turn_phase = "admission"
+        task = asyncio.create_task(self._run_turn_for_batch(run))
+        self._active_turn_task = task
+        try:
+            try:
+                await asyncio.wait({task})
+            except asyncio.CancelledError as cancellation:
+                task.cancel()
+                try:
+                    await _join_accepted(task)
+                except BaseException as exc:
+                    raise cancellation from exc
+                raise
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                self._resolve_run(
+                    run,
+                    status="interrupted",
+                    interrupted=any(
+                        env.event.context.get("interrupted_by_user") for env in run
+                    ),
+                )
+        finally:
+            if getattr(self, "_active_turn_task", None) is task:
+                self._active_turn_task = None
+                self._active_turn_run = None
+                self._turn_phase = None
 
-        Awaiting captures (``run`` / ``run_stream`` / ``run_event``) attach
-        BEFORE the turn so they record it from the start and detach after.
-        The turn mutex is held for the whole turn so ``stop()`` can join."""
+    @stop_wait_ineligible
+    async def _run_turn_for_batch(self, run: list[EventEnvelope]) -> None:
+        """Run a claimed batch under source admission and attach turn-scoped captures."""
         run = [env for env in run if not env.withdrawn]
         if not run:
             return
@@ -197,13 +236,19 @@ class AgentEventLoopMixin:
         for cap in captures:
             self.output_router.add_secondary(cap)
         interrupted = False
+        cancelled = False
         try:
+            self._turn_phase = "begin"
             self._active_turn_stackable = primary.stackable
             if not self._running:
                 self._reject_run(run, status="rejected")
                 return
-            require_model_mutation_available(self)
+            require_model_mutation_available(
+                self, regeneration_completion=run[0].future
+            )
             await self._begin_batch(events)
+            if self._interrupt_requested:
+                raise asyncio.CancelledError()
             cancelled = await self._process_batch_with_controller(
                 events, self.controller
             )
@@ -212,6 +257,17 @@ class AgentEventLoopMixin:
             )
             if interrupted:
                 self._flush_trigger_backlog_stash()
+        except asyncio.CancelledError:
+            cancelled = True
+            interrupted = bool(primary.context.get("interrupted_by_user"))
+            if self._turn_phase != "finalizing":
+                withdraw_turn_events(self.controller, events)
+                await finalize_turn(self, primary, self.controller, [])
+            if (
+                asyncio.current_task() is not getattr(self, "_active_turn_task", None)
+                or not self._interrupt_requested
+            ):
+                raise
         finally:
             try:
                 await _join_accepted(
@@ -243,11 +299,7 @@ class AgentEventLoopMixin:
     def _resolve_run(
         self, run: list[EventEnvelope], *, status: str, interrupted: bool = False
     ) -> None:
-        """Resolve every awaiting envelope's future at turn end.
-
-        The first envelope of a fresh run is the primary (``was_primary``);
-        the rest folded. Capture-based callers build their ``TurnResult``
-        from their own capture and read only ``status`` + interrupt here."""
+        """Resolve awaited envelopes with their turn outcome and primary participation."""
         for idx, env in enumerate(run):
             fut = env.future
             if fut is None or fut.done():
@@ -278,9 +330,7 @@ class AgentEventLoopMixin:
                 fut.set_result(TurnOutcome(status="rejected", was_primary=False))
 
     async def _begin_batch(self, events: list) -> None:
-        """Pre-turn side effects for the whole batch: primary branch /
-        session / output / plugin bookkeeping, folded-event injected
-        records, and ONE combined background-delivery banner."""
+        """Publish primary and folded input identity, output and plugin lifecycle."""
         primary = events[0]
         is_rerun = bool(primary.context.get("rerun")) if primary.context else False
         is_edited = bool(primary.context.get("edited")) if primary.context else False
@@ -477,9 +527,7 @@ class AgentEventLoopMixin:
         )
 
     async def _process_batch_with_controller(self, events: list, controller) -> bool:
-        """Push the whole stackable run to the controller (one combined
-        ``role=user`` message) and drive the controller loop. Cancellable
-        via ``interrupt()``."""
+        """Drive combined controller input and settle output before reporting its outcome."""
         primary = events[0]
         self._prepare_processing_cycle(primary, controller)
         await _join_accepted(
@@ -506,12 +554,16 @@ class AgentEventLoopMixin:
 
         if any(env.withdrawn for env in getattr(self, "_active_event_run", None) or []):
             self._interrupt_active_turn()
+        if self._interrupt_requested:
+            raise asyncio.CancelledError()
         all_round_text: list[str] = []
+        self._turn_phase = "controller"
         loop_task = asyncio.create_task(
             self._run_controller_loop(controller, all_round_text)
         )
         self._processing_task = loop_task
         cancelled = False
+        failure = None
         try:
             await loop_task
         except asyncio.CancelledError:
@@ -521,6 +573,7 @@ class AgentEventLoopMixin:
                 "interrupt", "[system] Processing interrupted"
             )
         except Exception as e:
+            failure = e
             error_type = type(e).__name__
             error_msg = str(e)
             logger.error("Processing error", error_type=error_type, error=error_msg)
@@ -532,9 +585,16 @@ class AgentEventLoopMixin:
             metrics.observe_error("controller")
         finally:
             self._processing_task = None
-        if self._interrupt_requested and not any(
-            env.withdrawn for env in getattr(self, "_active_event_run", None) or []
+        shutdown = getattr(self, "_shutdown_task", None)
+        if (
+            self._interrupt_requested
+            and (shutdown is None or shutdown.done())
+            and not any(
+                env.withdrawn for env in getattr(self, "_active_event_run", None) or []
+            )
         ):
             primary.context["interrupted_by_user"] = True
-        await self._finalize_processing(primary, controller, all_round_text)
+        await finalize_turn(self, primary, controller, all_round_text)
+        if failure is not None:
+            raise SettledProcessingFailure(str(failure)) from failure
         return cancelled

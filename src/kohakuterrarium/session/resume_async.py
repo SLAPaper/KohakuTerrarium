@@ -37,7 +37,17 @@ async def inject_saved_state_async(agent, store: SessionStore, agent_name: str) 
     including the event scan and conversation replay — leaves the caller's
     event loop.
     """
-    await store.run(inject_saved_state, agent, store, agent_name)
+    injection = asyncio.create_task(
+        store.run(inject_saved_state, agent, store, agent_name)
+    )
+    try:
+        await asyncio.shield(injection)
+    except asyncio.CancelledError as cancellation:
+        try:
+            await _finish_cleanup(injection)
+        except BaseException as exc:
+            raise cancellation from exc
+        raise
 
 
 async def _resume_agent_from_open_store_async(
@@ -127,7 +137,10 @@ async def resume_agent_async(
         # Any post-open failure must release the writer lock before
         # propagating; close checkpoints WAL and must stay off the loop.
         try:
-            await asyncio.to_thread(store.close, update_status=False)
+            closing = asyncio.create_task(
+                asyncio.to_thread(store.close, update_status=False)
+            )
+            await _finish_cleanup(closing)
         except Exception:
             logger.warning(
                 "resume_agent_async: closing store after failed resume failed",

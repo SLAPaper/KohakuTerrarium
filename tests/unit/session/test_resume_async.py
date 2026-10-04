@@ -10,6 +10,7 @@ import pytest
 from kohakuterrarium.session import resume_async
 from kohakuterrarium.session.resume_async import resume_agent_async
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.text_recovery import build_record
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 
@@ -35,7 +36,26 @@ def _interrupted_session(tmp_path):
             parent_branch_path=[],
         )
         store.save_conversation("resumee", [{"role": "user", "content": "hello"}])
-        store.state["resumee:open_text"] = "interrupted response"
+        generation = {"schema": 1, "generation_id": "confirmed-partial", "source": {}}
+        store.append_event(
+            "resumee",
+            "assistant_generation_start",
+            generation,
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        store.checkpoint(strict=True)
+        store.state["resumee:open_text"] = build_record(
+            store,
+            "resumee",
+            "interrupted response",
+            generation,
+            1,
+            1,
+            [],
+        )
+        store.checkpoint(strict=True)
     finally:
         store.close(update_status=False)
     return path
@@ -62,7 +82,7 @@ async def test_recovery_scans_off_loop_and_persists_text_once(tmp_path, monkeypa
             assert chunks[0]["content"] == "interrupted response"
             assert chunks[0]["turn_index"] == 1
             assert chunks[0]["branch_id"] == 1
-            assert await store.run(store.state.get, "resumee:open_text") == ""
+            assert await store.run(store.state.get, "resumee:open_text") in (None, "")
         finally:
             await asyncio.to_thread(store.close, update_status=False)
     assert scans
@@ -127,22 +147,22 @@ async def test_cancel_between_recovery_append_and_slot_clear_does_not_duplicate(
     append_queued = asyncio.Event()
     close_started = asyncio.Event()
     release = threading.Event()
-    submit = SessionStore.submit
+    append = SessionStore.append_event
     shutdown = SessionStore._shutdown_affinity
 
-    def gated_submit(self, fn, *args, **kwargs):
-        future = submit(self, fn, *args, **kwargs)
-        if getattr(fn, "__name__", "") == "append_event" and args[1] == "text_chunk":
+    def gated_append(self, namespace, kind, data, **kwargs):
+        receipt = append(self, namespace, kind, data, **kwargs)
+        if kind == "text_chunk":
             loop.call_soon_threadsafe(append_queued.set)
             assert release.wait(30), "recovery append was not released"
-        return future
+        return receipt
 
     def observed_shutdown(self):
         if self._closed:
             loop.call_soon_threadsafe(close_started.set)
         shutdown(self)
 
-    monkeypatch.setattr(SessionStore, "submit", gated_submit)
+    monkeypatch.setattr(SessionStore, "append_event", gated_append)
     monkeypatch.setattr(SessionStore, "_shutdown_affinity", observed_shutdown)
     task = asyncio.create_task(resume_agent_async(path, llm=ScriptedLLM(["unused"])))
     try:
@@ -163,11 +183,11 @@ async def test_cancel_between_recovery_append_and_slot_clear_does_not_duplicate(
         release.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    monkeypatch.setattr(SessionStore, "submit", submit)
+    monkeypatch.setattr(SessionStore, "append_event", append)
     monkeypatch.setattr(SessionStore, "_shutdown_affinity", shutdown)
     check = SessionStore(path)
     try:
-        assert check.state.get("resumee:open_text") == ""
+        assert check.state.get("resumee:open_text") in (None, "")
         assert [
             e["content"]
             for e in check.get_events("resumee")
