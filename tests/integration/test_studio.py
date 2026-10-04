@@ -51,6 +51,7 @@ from kohakuterrarium.session.embedding import BaseEmbedder
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.identity import grok_subscription
 from kohakuterrarium.studio.persistence import store as _persistence_store_mod
+from kohakuterrarium.studio.persistence.session_index import close_session_index
 from kohakuterrarium.studio.sessions import memory_search as _session_memory_mod
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.testing.llm import ScriptedLLM
@@ -595,7 +596,19 @@ class TestStudioIntegration:
                 store.close(update_status=False)
 
             # --- persistence.resume: adopt the saved session -----------
+            expected_plain = {row["filename"] for row in studio.persistence.list()}
+            expected_saved = {
+                row["filename"] for row in studio.persistence.list(search="scout")
+            }
+            assert saved_path.name in expected_saved
+            close_session_index()
             resumed = await studio.persistence.resume(saved_path)
+            assert {
+                row["filename"] for row in studio.persistence.list()
+            } == expected_plain
+            assert {
+                row["filename"] for row in studio.persistence.list(search="scout")
+            } == expected_saved
             assert len(resumed.creatures) == 1
             resumed_cid = resumed.creatures[0]["creature_id"]
             resumed_history = await studio.sessions.chat.history(
