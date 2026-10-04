@@ -1,15 +1,18 @@
 """Persistent event provenance survives retries, hops, reopen, and forks."""
 
+from contextlib import closing
 from copy import deepcopy
 from uuid import uuid4
 
 import pytest
+from kohakuvault import KVault
 
 import kohakuterrarium.session.store as store_module
 from kohakuterrarium.errors import HistoryCompatibilityError
 from kohakuterrarium.session.event_origin import (
     EVENT_ORIGIN,
     STORE_UUID,
+    LocalOriginIndex,
     append_mirrored,
     capture_events,
     import_events,
@@ -112,7 +115,12 @@ def test_resume_generation_survives_legacy_same_namespace_event_id_collision(sto
         store.append_event,
         "alice",
         "plugin_hook_timing",
-        {"hook": "on_agent_stop", "plugin": "context_files", "event_id": 78283, "ts": 10},
+        {
+            "hook": "on_agent_stop",
+            "plugin": "context_files",
+            "event_id": 78283,
+            "ts": 10,
+        },
         turn_index=149,
         branch_id=1,
         parent_branch_path=[],
@@ -188,6 +196,86 @@ def test_resume_generation_survives_legacy_same_namespace_event_id_collision(sto
         {"type": "user_input", "event_id": 78283},
     ]
     assert events[-1]["type"] == "output_delivery"
+
+
+@pytest.mark.parametrize("duplicate_coordinate", [False, True])
+def test_local_index_never_resolves_last_writer_for_ambiguous_reference(
+    stores, duplicate_coordinate
+):
+    store, _, _ = stores
+    append(store)
+    uid = store.submit(store_uuid, store).result()
+    collision = uid if not duplicate_coordinate else str(uuid4())
+    store.submit(
+        lambda: store.events.__setitem__(
+            "alice:e000001",
+            {
+                "type": "user_message",
+                "event_id": 1,
+                "content": "second",
+                EVENT_ORIGIN: [collision, "alice", 1],
+            },
+        )
+    ).result()
+    store.submit(
+        store.append_event, "bob", "user_message", {"content": "unrelated"}
+    ).result()
+    _, captured = store.submit(capture_events, store, unique=False).result()
+    index = LocalOriginIndex(captured, "alice")
+    for ref in {(uid, "alice", 1), (collision, "alice", 1)}:
+        with pytest.raises(HistoryCompatibilityError, match="ambiguous"):
+            index.get(ref)
+        with pytest.raises(HistoryCompatibilityError, match="ambiguous"):
+            index[ref]
+    for read_rows in (
+        lambda: list(index.values()),
+        lambda: list(index.items()),
+        lambda: dict(index),
+    ):
+        with pytest.raises(HistoryCompatibilityError, match="ambiguous"):
+            read_rows()
+    with pytest.raises(TypeError):
+        index[(uid, "alice", 1)] = {"content": "bypass"}
+    bob = LocalOriginIndex(captured, "bob")
+    assert bob[(uid, "bob", 2)]["content"] == "unrelated"
+    assert index.get((uid, "alice", 100), "missing") == "missing"
+
+
+@pytest.mark.parametrize("generation_first", [False, True])
+def test_local_generation_proof_rejects_its_own_colliding_origin(
+    stores, generation_first
+):
+    store, _, _ = stores
+    generation = {
+        "schema": 1,
+        "generation_id": "ambiguous-generation",
+        "source": {"model": "scripted"},
+    }
+    records = [
+        ("plugin_hook_timing", {"hook": "on_agent_stop"}),
+        ("assistant_generation_start", generation),
+    ]
+    if generation_first:
+        records.reverse()
+    for kind, data in records:
+        store.submit(
+            store.append_event,
+            "alice",
+            kind,
+            {**deepcopy(data), "event_id": 7},
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        ).result()
+    before = store.submit(store.get_events, "alice").result()
+    with pytest.raises(HistoryCompatibilityError, match="ambiguous"):
+        store.submit(
+            prove_generation_origin, store, "alice", generation, 1, 1, []
+        ).result()
+    assert [
+        {k: v for k, v in row.items() if k != "_kt_event_coordinate_v1"}
+        for row in store.submit(store.get_events, "alice").result()
+    ] == before
 
 
 @pytest.mark.parametrize("activated", [False, True])
@@ -328,6 +416,94 @@ def test_legacy_collision_does_not_block_child_feedback_or_native_ack(stores):
             [],
         ).result()
     assert store.submit(store.get_events, "alice").result() == before
+
+
+def test_legacy_local_ack_and_feedback_reject_colliding_referenced_receipts(stores):
+    store, _, _ = stores
+    origin = {
+        "runtime_scope_id": "scope",
+        "delivery_id": "dispatch",
+        "execution_class": "background",
+        "turn_index": 1,
+        "branch_id": 1,
+        "parent_branch_path": [],
+        "generation_id": "generation",
+    }
+    uid = store.submit(store_uuid, store).result()
+    declaration = {
+        "generation_id": "generation",
+        "veto_group_id": "scope:generation",
+        "tool_calls": [
+            {"id": "native-child", "function": {"name": "child", "arguments": "{}"}}
+        ],
+    }
+    _, declaration_id = store.submit(
+        store.append_event,
+        "alice",
+        "assistant_tool_calls",
+        declaration,
+        turn_index=1,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    dispatch = {"job_id": "child", "origin": origin, "tool_call_id": "native-child"}
+    store.submit(
+        store.append_event,
+        "alice",
+        "subagent_call",
+        deepcopy(dispatch),
+        turn_index=1,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    ack = {
+        **dispatch,
+        "phase": "ack",
+        "declaration_origin": [uid, "alice", declaration_id],
+    }
+    receipt, _ = store.submit(persist_ack, store, "alice", ack).result()
+    store.submit(
+        lambda: store.events.__setitem__(
+            "alice:e900000",
+            {
+                "event_id": receipt[2],
+                "type": "plugin_hook_timing",
+                "hook": "legacy collision",
+            },
+        )
+    ).result()
+    before = store.submit(store.get_events, "alice").result()
+    with pytest.raises(HistoryCompatibilityError, match="ambiguous"):
+        store.submit(persist_ack, store, "alice", ack).result()
+    assert store.submit(store.get_events, "alice").result() == before
+    plain_origin = {**origin, "delivery_id": "plain-dispatch"}
+    _, plain_id = store.submit(
+        store.append_event,
+        "alice",
+        "tool_call",
+        {"job_id": "plain", "origin": plain_origin},
+        turn_index=1,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    store.submit(
+        lambda: store.events.__setitem__(
+            "alice:e900001",
+            {
+                "event_id": plain_id,
+                "type": "plugin_hook_timing",
+                "hook": "another collision",
+            },
+        )
+    ).result()
+    proof = {"job_id": "plain", "origin": plain_origin, "mode": "dispatch_ack"}
+    before = store.submit(store.get_events, "alice").result()
+    with pytest.raises(HistoryCompatibilityError, match="ambiguous"):
+        store.submit(
+            persist_feedback, store, "alice", "accepted dispatch", [proof], 1, 1, []
+        ).result()
+    assert store.submit(store.get_events, "alice").result() == before
+    assert "dispatch_origin" not in proof
 
 
 def test_legacy_collision_preserves_output_generation_receipt(stores):
@@ -732,6 +908,40 @@ def test_readonly_source_never_mints_identity(stores, identity):
             copy_events_into(b, source)
     finally:
         source.close(update_status=False)
+
+
+@pytest.mark.parametrize("persisted_max", [0, 1, 100])
+def test_legacy_reopen_reconciles_counter_before_first_append(tmp_path, persisted_max):
+    path = tmp_path / "legacy.kohakutr"
+    with closing(SessionStore(path)) as original:
+        for namespace in ("alice", "alice:child", "alice"):
+            original.submit(
+                original.append_event, namespace, "user_message", {"content": namespace}
+            ).result()
+        before = original.submit(original.get_events, "alice").result()
+        assert original.meta.get(STORE_UUID) is None
+    with closing(KVault(str(path), table="state")) as native:
+        native.enable_auto_pack()
+        native["counters:max_event_id"] = persisted_max
+    with closing(SessionStore(path)) as resumed:
+        _, event_id = resumed.submit(
+            resumed.append_event, "alice", "assistant_generation_start", {}
+        ).result()
+        assert event_id == max(3, persisted_max) + 1
+        assert resumed.submit(resumed.get_events, "alice").result()[:-1] == before
+        _, captured = resumed.submit(capture_events, resumed).result()
+        assert len(captured) == 4
+        assert len({(name, row["event_id"]) for name, _, row, _ in captured}) == 4
+    with closing(SessionStore(path)) as again:
+        assert (
+            again.submit(
+                again.append_event,
+                "alice",
+                "user_message",
+                {"content": "second reopen"},
+            ).result()[1]
+            > event_id
+        )
 
 
 @pytest.mark.parametrize("persisted_max", [0, 100])

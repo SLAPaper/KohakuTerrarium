@@ -822,9 +822,10 @@ class TestLoadConversationFallback:
 
         reopened = SessionStore(str(path))
         try:
-            assert reopened.max_event_id("alice") == eid  # lagging counter
+            assert reopened.state.get("counters:max_event_id") == eid
             true_max = max(evt["event_id"] for evt in reopened.get_events("alice"))
-            assert true_max == eid + 1  # table holds a newer event
+            assert true_max == eid + 1
+            assert reopened.max_event_id("alice") == true_max
             counting = _CountingStore(reopened)
             out = _load_conversation_with_replay_fallback(counting, "alice")
             contents = [m["content"] for m in out if m["role"] == "user"]

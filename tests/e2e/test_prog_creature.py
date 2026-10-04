@@ -22,10 +22,12 @@ over a deterministic embedder — is the production collaborator.
 
 import asyncio
 import hashlib
+from contextlib import closing
 import threading
 
 import numpy as np
 import pytest
+from kohakuvault import KVault
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
@@ -772,6 +774,61 @@ class TestProgCreatureJourney:
         assert sem_hits, "semantic search returned nothing"
         assert sem_hits[0].content == "first recorded question"
         sem_memory.close()
+
+        legacy_path = tmp_path / "legacy-counter-resume.kohakutr"
+        legacy_config = _write_config(tmp_path / "legacy-creature", name="pilot")
+        with closing(SessionStore(legacy_path)) as legacy:
+            legacy.init_meta(
+                "legacy-counter-resume",
+                "agent",
+                str(legacy_config),
+                str(tmp_path),
+                ["pilot"],
+            )
+            for kind, content in (
+                ("user_message", "legacy question"),
+                ("text_chunk", "legacy answer"),
+            ):
+                legacy.append_event(
+                    "pilot",
+                    kind,
+                    {"content": content},
+                    turn_index=1,
+                    branch_id=1,
+                    parent_branch_path=[],
+                )
+            assert legacy.meta.get("_kt_store_uuid_v1") is None
+        with closing(KVault(str(legacy_path), table="state")) as native_state:
+            native_state.enable_auto_pack()
+            native_state["counters:max_event_id"] = 0
+        for attempt in range(2):
+            patched_llm["script"] = [f"legacy resumed reply {attempt}"]
+            recovered, recovered_store = resume_agent(legacy_path)
+            try:
+                await recovered.start()
+                assert (
+                    await recovered.run(f"continue legacy {attempt}", timeout=5)
+                ).text == f"legacy resumed reply {attempt}"
+                saved = await recovered_store.run(recovered_store.get_events, "pilot")
+                assert [(row["event_id"], row.get("content")) for row in saved[:2]] == [
+                    (1, "legacy question"),
+                    (2, "legacy answer"),
+                ]
+                assert len({row["event_id"] for row in saved}) == len(saved)
+                assert all(row["event_id"] > 2 for row in saved[2:])
+                assert (
+                    sum(row["type"] == "assistant_generation_start" for row in saved)
+                    == attempt + 1
+                )
+                assert "legacy question" in str(
+                    recovered.controller.conversation.to_messages()
+                )
+                assert "legacy answer" in str(
+                    recovered.controller.conversation.to_messages()
+                )
+            finally:
+                await recovered.stop()
+                await asyncio.to_thread(recovered_store.close)
 
         entered, release = threading.Event(), threading.Event()
 

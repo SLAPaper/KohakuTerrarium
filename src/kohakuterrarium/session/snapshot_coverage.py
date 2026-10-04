@@ -4,6 +4,8 @@ from copy import deepcopy
 
 from kohakuterrarium.errors import ConflictError, HistoryCompatibilityError
 from kohakuterrarium.session.event_origin import (
+    EVENT_COORDINATE,
+    LocalOriginIndex,
     capture_events,
     row_origin,
     store_uuid,
@@ -99,6 +101,9 @@ def prefix_origins(envelope, uid, namespace, captured):
         existing = {origin for _, _, _, origin in rows}
         if not set(members) <= existing:
             raise HistoryCompatibilityError("Snapshot prefix member is missing")
+        index = LocalOriginIndex(captured, namespace)
+        for origin in members:
+            index[origin]
         return members
     raise HistoryCompatibilityError("Unsupported snapshot prefix coverage")
 
@@ -109,6 +114,32 @@ def partition_snapshot(store, namespace, events):
         return None
     uid, captured = capture_events(store, unique=False)
     members = set(prefix_origins(value, uid, namespace, captured))
+    rows = [
+        (key, row, origin) for name, key, row, origin in captured if name == namespace
+    ]
+    coverage = value["coverage"]
+    if coverage["mode"] == "physical_prefix":
+        cursor = coverage["next_sequence"]
+        raw_events = [
+            {key: item for key, item in event.items() if key != EVENT_COORDINATE}
+            for event in events
+        ]
+        if raw_events == [row for _, row, _ in rows]:
+            prior, tail = [], []
+            for event, (key, _, _) in zip(events, rows):
+                target = prior if int(key.rsplit(":e", 1)[1]) < cursor else tail
+                target.append(event)
+            return prior, tail
+        sides = {}
+        for key, _, origin in rows:
+            sides.setdefault(origin, set()).add(int(key.rsplit(":e", 1)[1]) < cursor)
+        if any(
+            len(sides.get(row_origin(uid, namespace, event), set())) != 1
+            for event in events
+        ):
+            raise HistoryCompatibilityError(
+                "Snapshot physical prefix reference is missing or ambiguous"
+            )
     prior, tail = [], []
     for event in events:
         target = prior if row_origin(uid, namespace, event) in members else tail

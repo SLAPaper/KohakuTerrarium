@@ -1,8 +1,11 @@
 """Durable event origins and retryable per-store transfer receipts."""
 
+from collections.abc import Mapping
 from contextvars import ContextVar
 from copy import deepcopy
 from uuid import UUID, uuid4
+
+from kohakuterrarium.errors import HistoryCompatibilityError
 
 STORE_UUID = "_kt_store_uuid_v1"
 EVENT_ORIGIN = "_kt_event_origin_v1"
@@ -136,6 +139,38 @@ def capture_events(store, *, unique=True):
             )
         store.flush()
     return uid, captured
+
+
+class LocalOriginIndex(Mapping):
+    """Resolve only unambiguous references within a locally captured namespace."""
+
+    def __init__(self, captured, namespace):
+        self._rows = {}
+        self._ambiguous = set()
+        coordinates = {}
+        for name, _, row, origin in captured:
+            if name != namespace:
+                continue
+            coordinate = row["event_id"]
+            if origin in self._rows:
+                self._ambiguous.add(origin)
+            if coordinate in coordinates:
+                self._ambiguous.update((origin, coordinates[coordinate]))
+            coordinates[coordinate] = origin
+            self._rows[origin] = row
+
+    def __getitem__(self, origin):
+        if origin in self._ambiguous:
+            raise HistoryCompatibilityError(
+                "Referenced local event origin is ambiguous"
+            )
+        return self._rows[origin]
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __len__(self):
+        return len(self._rows)
 
 
 def validate_append_origin(store, namespace, data):

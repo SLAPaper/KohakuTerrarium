@@ -223,7 +223,7 @@ class SessionStore(StoreAffinityMixin):
             self.events,
             self._event_seq,
             state=self.state,
-            verify_rows=bool(self.meta.get(event_origin.STORE_UUID)),
+            verify_rows=True,
         )
         restore_suffix_counters(self.channels, ":m", self._channel_seq)
         restore_subagent_counters(self.subagents, self._subagent_runs)

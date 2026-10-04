@@ -18,6 +18,7 @@ the agent from the ``config_path`` in meta and re-injects state;
 """
 
 import asyncio
+from contextlib import closing
 from copy import deepcopy
 import hashlib
 import os
@@ -30,6 +31,7 @@ from uuid import uuid4
 
 import numpy as np
 import pytest
+from kohakuvault import KVault
 
 from kohakuterrarium import Terrarium
 from kohakuterrarium.bootstrap import agent_init as _agent_init
@@ -1101,7 +1103,22 @@ class TestSessionIntegration:
                 branch_id=1,
                 parent_branch_path=[],
             )
+        child_store.append_event(
+            "scribe",
+            "plugin_hook_timing",
+            {"event_id": 1, "hook": "on_agent_stop", "plugin": "legacy"},
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        legacy_events = child_store.get_events("scribe")
+        assert child_store.meta.get("_kt_store_uuid_v1") is None
+        legacy_max = max(row["event_id"] for row in legacy_events)
+        assert [row["event_id"] for row in legacy_events].count(1) == 2
         child_store.close()
+        with closing(KVault(str(child_path), table="state")) as native_state:
+            native_state.enable_auto_pack()
+            native_state["counters:max_event_id"] = 0
         child_llm = ScriptedLLM(["child history continued"])
         restored_child, child_store = await resume_agent_async(
             child_path, llm=child_llm
@@ -1126,6 +1143,27 @@ class TestSessionIntegration:
             assert (
                 await restored_child.run("continue", timeout=5)
             ).text == "child history continued"
+            continued_events = await child_store.run(child_store.get_events, "scribe")
+            assert [
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "_kt_event_coordinate_v1"
+                }
+                for row in continued_events[: len(legacy_events)]
+            ] == legacy_events
+            new_events = continued_events[len(legacy_events) :]
+            assert all(row["event_id"] > legacy_max for row in new_events)
+            assert len({row["event_id"] for row in new_events}) == len(new_events)
+            assert any(
+                row["type"] == "assistant_generation_start" for row in new_events
+            )
+            assert any(
+                row["type"] == "text_chunk"
+                and row.get("content") == "child history continued"
+                for row in new_events
+            )
+            assert child_llm.call_count == 1
         finally:
             await restored_child.stop()
             await asyncio.to_thread(child_store.close)

@@ -79,9 +79,7 @@ def _scan_max_event_id(events: KVault, *, strict: bool = False) -> int:
                 or type(evt.get("event_id")) is not int
                 or evt["event_id"] <= 0
             ):
-                raise ValueError(
-                    "Invalid event ID while restoring identity-enabled counters"
-                )
+                raise ValueError("Invalid stored event IDs while restoring counters")
             if isinstance(evt, dict):
                 eid = evt.get("event_id")
                 if isinstance(eid, int) and eid > max_event_id:

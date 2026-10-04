@@ -8,6 +8,7 @@ from kohakuterrarium.session.output_delivery import validate_output_source
 from kohakuterrarium.session.event_origin import (
     EVENT_COORDINATE,
     EVENT_ORIGIN,
+    LocalOriginIndex,
     capture_events,
     store_uuid,
 )
@@ -93,7 +94,7 @@ def _pair_sources(proof, index, coordinates):
 
 def persist_feedback(store, namespace, content, deliveries, turn, branch, path):
     uid, captured = capture_events(store, unique=False)
-    index = {origin: row for name, _, row, origin in captured if name == namespace}
+    index = LocalOriginIndex(captured, namespace)
     coordinates = {"turn_index": turn, "branch_id": branch, "parent_branch_path": path}
     sources = []
     deliveries = deepcopy(deliveries)
@@ -159,7 +160,9 @@ def persist_feedback(store, namespace, content, deliveries, turn, branch, path):
             raise HistoryCompatibilityError("Feedback terminal provenance conflicts")
         if mode == "dispatch_ack":
             delivery["dispatch_origin"] = list(matches[0][1])
-        sources.extend(ref for _, ref in matches)
+        for _, ref in matches:
+            index[ref]
+            sources.append(ref)
     if len(set(sources)) != len(sources):
         raise HistoryCompatibilityError("Feedback sources must be distinct")
     for proof in inputs:

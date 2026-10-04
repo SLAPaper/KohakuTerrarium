@@ -4,7 +4,7 @@ from copy import deepcopy
 
 from kohakuterrarium.errors import HistoryCompatibilityError
 from kohakuterrarium.session.compact_coverage import coordinate, parse_origin
-from kohakuterrarium.session.event_origin import capture_events
+from kohakuterrarium.session.event_origin import LocalOriginIndex, capture_events
 
 
 def ack_sources(payload, by_origin):
@@ -139,7 +139,7 @@ def persist_ack(store, namespace, payload):
     """Confirm one source-bound acknowledgement, reusing an identical retry."""
     uid, captured = capture_events(store, unique=False)
     rows = [(row, origin) for name, _, row, origin in captured if name == namespace]
-    by_origin = {origin: row for row, origin in rows}
+    by_origin = LocalOriginIndex(captured, namespace)
     payload = deepcopy(payload)
     matches = [
         (row, origin)
@@ -166,6 +166,7 @@ def persist_ack(store, namespace, payload):
             prior[0][0].get(key) != value for key, value in payload.items()
         ):
             raise HistoryCompatibilityError("Native acknowledgement retry conflicts")
+        by_origin[prior[0][1]]
         return list(prior[0][1]), payload
     origin = payload["origin"]
     _, eid = store.append_event(

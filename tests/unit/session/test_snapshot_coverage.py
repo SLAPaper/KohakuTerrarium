@@ -1,5 +1,6 @@
 """Snapshot bases retain their physical source prefix despite nonmonotonic IDs."""
 
+import asyncio
 import json
 from copy import deepcopy
 from uuid import uuid4
@@ -15,6 +16,8 @@ from kohakuterrarium.session import output as session_output
 from kohakuterrarium.session.event_origin import import_events
 from kohakuterrarium.session.snapshot_coverage import (
     capture_snapshot_transfer,
+    encode_snapshot,
+    partition_snapshot,
     install_snapshot_transfer,
 )
 from kohakuterrarium.session.resume_branch import load_conversation_with_replay_fallback
@@ -24,6 +27,64 @@ from kohakuterrarium.terrarium.session_coord import (
     merge_session_stores,
     _copy_session_into,
 )
+
+
+@pytest.mark.parametrize("cursor", [0, 1, 2])
+async def test_physical_prefix_does_not_expand_across_legacy_duplicate_origin(
+    tmp_path, cursor
+):
+    store = SessionStore(tmp_path / "legacy-prefix.kohakutr")
+    try:
+
+        def prepare():
+            store.append_event(
+                "alice", "plugin_hook_timing", {"event_id": 7, "hook": "on_agent_stop"}
+            )
+            store.append_event(
+                "alice", "user_input", {"event_id": 7, "content": "uncovered input"}
+            )
+            envelope = encode_snapshot(store, "alice", [])
+            envelope["coverage"]["next_sequence"] = cursor
+            store.save_conversation("alice", envelope)
+            return store.get_events("alice")
+
+        events = await store.run(prepare)
+        prior, tail = await store.run(partition_snapshot, store, "alice", events)
+        assert [event["type"] for event in prior] == [
+            event["type"] for event in events[:cursor]
+        ]
+        assert [event["type"] for event in tail] == [
+            event["type"] for event in events[cursor:]
+        ]
+        if cursor == 1:
+            with pytest.raises(HistoryCompatibilityError, match="ambiguous"):
+                await store.run(partition_snapshot, store, "alice", events[1:])
+    finally:
+        await asyncio.to_thread(store.close)
+
+
+async def test_canonical_prefix_refuses_ambiguous_legacy_origin(tmp_path):
+    store = SessionStore(tmp_path / "ambiguous-canonical.kohakutr")
+    try:
+
+        def prepare():
+            for text in ("first", "second"):
+                store.append_event(
+                    "alice", "user_input", {"event_id": 7, "content": text}
+                )
+            envelope = encode_snapshot(store, "alice", [])
+            envelope["coverage"] = {
+                "mode": "canonical_prefix",
+                "origins": [[envelope["store_uuid"], "alice", 7]],
+            }
+            store.save_conversation("alice", envelope)
+            return store.get_events("alice")
+
+        events = await store.run(prepare)
+        with pytest.raises(HistoryCompatibilityError, match="ambiguous"):
+            await store.run(partition_snapshot, store, "alice", events)
+    finally:
+        await asyncio.to_thread(store.close)
 
 
 async def test_compact_event_after_snapshot_replaces_base_instead_of_appending_summary(

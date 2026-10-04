@@ -2,7 +2,7 @@
 
 from kohakuterrarium.errors import HistoryCompatibilityError
 from kohakuterrarium.session.compact_coverage import exact_origins, parse_origin
-from kohakuterrarium.session.event_origin import capture_events
+from kohakuterrarium.session.event_origin import LocalOriginIndex, capture_events
 from kohakuterrarium.session.feedback_admission import (
     admission_sources,
     validate_dispatch_terminal,
@@ -22,7 +22,7 @@ def compile_coverage(store, namespace, prefix, retained):
     """Read one worker-local event snapshot and resolve an actual message prefix."""
     uid, captured = capture_events(store, unique=False)
     rows = [(row, origin) for name, _, row, origin in captured if name == namespace]
-    by_origin = {origin: row for row, origin in rows}
+    by_origin = LocalOriginIndex(captured, namespace)
 
     def resolve(message):
         metadata = message.get("metadata") or {}
@@ -273,6 +273,9 @@ def compile_coverage(store, namespace, prefix, retained):
         groups = [resolve(message) for message in prefix]
         covered = set().union(*groups)
         keep = set().union(*(resolve(message) for message in retained))
+        for origin in covered | keep:
+            if by_origin.get(origin) is None:
+                raise HistoryCompatibilityError("Compact coverage reference is missing")
         covered.difference_update(keep)
         if not covered:
             raise _Unproven("empty_effective_prefix")

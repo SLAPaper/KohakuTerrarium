@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 from kohakuterrarium.errors import HistoryCompatibilityError
 from kohakuterrarium.session.event_origin import (
+    LocalOriginIndex,
     capture_events,
     row_origin,
     store_uuid,
@@ -69,6 +70,7 @@ def _declaration(
             "Missing or ambiguous open-text generation declaration"
         )
     row, origin = candidates[0]
+    LocalOriginIndex(records, namespace)[origin]
     if (
         row.get("schema") != generation["schema"]
         or row.get("source") != generation["source"]

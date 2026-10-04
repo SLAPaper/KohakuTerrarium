@@ -4,7 +4,7 @@ from copy import deepcopy
 
 from kohakuterrarium.errors import HistoryCompatibilityError
 from kohakuterrarium.session.compact_coverage import parse_origin
-from kohakuterrarium.session.event_origin import capture_events
+from kohakuterrarium.session.event_origin import LocalOriginIndex, capture_events
 
 
 def validate_output_source(proof, index):
@@ -84,6 +84,7 @@ def persist_output_delivery(store, namespace, generation, payload):
             "Output attempt generation is missing or ambiguous"
         )
     source, ref = matches[0]
+    LocalOriginIndex(captured, namespace)[ref]
     payload = {
         **deepcopy(payload),
         "generation_id": generation["generation_id"],
