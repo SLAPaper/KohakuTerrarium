@@ -88,8 +88,8 @@ Key invariants:
 ## What you can therefore do
 
 - **Swap LLM mid-session.** The `/model` user command or the
-  `switch_model` API swaps the LLM provider in place. The controller
-  does not care which provider it is talking to.
+  `await agent.switch_model_async(...)` API confirms the live provider
+  replacement. Synchronous `switch_model(...)` is for pre-start setup only.
 - **Dynamic system prompt.** `update_system_prompt(...)` appends or
   replaces the prompt before the next turn; the controller picks it up
   automatically.
@@ -99,6 +99,25 @@ Key invariants:
   event queue, a plugin, a tool, or external Python code can call
   `agent.inject_event(...)` and the controller will process it in
   order.
+
+## Settled history results
+
+`await agent.regenerate_last_response_result(...)` and
+`await agent.edit_and_rerun_result(index, content, ...)` return fixed receipts
+with `status`, `request_id`, `turn_index`, `branch_id`, and `branch_view`.
+They require local idle; an invalid edit returns `None`. A failed or interrupted
+rerun raises `RegenerationTurnError` from `kohakuterrarium.core.interrupt_regeneration`;
+its receipt identifies the branch already applied, not a rolled-back operation.
+Pre-admission validation and persistence errors can still raise their own errors.
+
+Legacy `regenerate_last_response()` returns `None`; `edit_and_rerun()` returns
+an admission boolean. Neither legacy return value proves successful generation.
+External busy callers can use `interrupt_and_regenerate(...)`; callbacks should
+schedule `request_regeneration(...)` and return, not await their own completion.
+`get_regeneration_status(token)` separates operation status from
+`waiter_cancelled`. `applied` and `waiter_cancelled` may be `None` when unknown;
+missing confirmation never means rollback. Accepted work settles before a
+cancelled waiter exits, so cancellation alone is not a safe retry signal.
 
 ## Don't be bounded
 

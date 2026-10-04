@@ -295,10 +295,10 @@ class TestPerCreatureOps:
             "parent_branch_path": [],
             "branch_view": {"1": 2},
         }
-        c.agent._edit_and_rerun_result = AsyncMock(return_value=receipt)
+        c.agent.edit_and_rerun_result = AsyncMock(return_value=receipt)
         out = await svc.edit_message("cid", 2, "new content", request_id="edit-token")
         assert out == receipt
-        c.agent._edit_and_rerun_result.assert_awaited_once_with(
+        c.agent.edit_and_rerun_result.assert_awaited_once_with(
             2,
             "new content",
             turn_index=None,
@@ -310,7 +310,7 @@ class TestPerCreatureOps:
 
     async def test_edit_message_rejected_target_returns_false(self):
         svc, c = _build_service()
-        c.agent._edit_and_rerun_result = AsyncMock(return_value=None)
+        c.agent.edit_and_rerun_result = AsyncMock(return_value=None)
         with pytest.raises(ValueError, match="cannot be edited"):
             await svc.edit_message("cid", 2, "new content")
 

@@ -1,6 +1,7 @@
 """Regenerate the last assistant response with the current agent settings."""
 
 from kohakuterrarium.builtins.user_commands.registry import register_user_command
+from kohakuterrarium.core.interrupt_regeneration import RegenerationTurnError
 from kohakuterrarium.modules.user_command.base import (
     BaseUserCommand,
     CommandLayer,
@@ -21,5 +22,14 @@ class RegenCommand(BaseUserCommand):
     ) -> UserCommandResult:
         if not context.agent:
             return UserCommandResult(error="No agent context.")
-        await context.agent.regenerate_last_response()
-        return UserCommandResult(output="Regenerating last response...")
+        try:
+            receipt = await context.agent.regenerate_last_response_result()
+        except RegenerationTurnError as exc:
+            return UserCommandResult(
+                error=str(exc),
+                data={"operation": exc.receipt, "applied": exc.may_have_run},
+            )
+        return UserCommandResult(
+            output="Regenerated last response.",
+            data={"operation": receipt, "applied": True},
+        )

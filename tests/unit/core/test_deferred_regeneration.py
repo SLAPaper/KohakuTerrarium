@@ -78,6 +78,94 @@ async def test_deferred_rerun_interrupted_outcome_is_not_success(tmp_path):
             await asyncio.gather(pending, return_exceptions=True)
 
 
+@pytest.mark.parametrize("terminal", ["completed", "error", "interrupted"])
+async def test_cancelled_deferred_waiter_retains_actual_terminal_receipt(
+    tmp_path, terminal
+):
+    class FailureProvider(ScriptedLLM):
+        async def chat(self, messages, **kwargs):
+            if self.call_count and terminal == "error":
+                self.call_count += 1
+                raise RuntimeError("deferred provider failure")
+            async for chunk in super().chat(messages, **kwargs):
+                yield chunk
+
+    provider, gate, activities = (
+        FailureProvider(["original", "replacement"]),
+        RerunGate(),
+        Activities(),
+    )
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"),
+            llm=provider,
+            plugins=[gate],
+            io="headless",
+            start=True,
+        )
+        agent = creature.agent
+        agent.output_router.add_secondary(activities)
+        await creature.run("question", timeout=3)
+        token = agent.request_regeneration(request_id="cancelled-waiter")
+        pending = agent._deferred_regeneration_task
+        try:
+            await asyncio.wait_for(gate.entered.wait(), 2)
+            pending.cancel()
+            await asyncio.sleep(0)
+            assert not pending.done()
+            if terminal == "interrupted":
+                await agent.interrupt_and_wait(timeout=1)
+            gate.release.set()
+            await asyncio.gather(pending, return_exceptions=True)
+            await asyncio.sleep(0)
+            status = agent.get_regeneration_status(token)
+            assert status["status"] == terminal
+            assert status["waiter_cancelled"] is True
+            assert status["applied"] is True
+            assert (
+                status["receipt"]["branch_id"] == 2
+                and status["receipt"]["turn_index"] == 1
+            )
+            assert status["receipt"]["request_id"] == token
+            expected = (
+                "regeneration_done"
+                if terminal == "completed"
+                else (
+                    "regeneration_cancelled"
+                    if terminal == "interrupted"
+                    else "regeneration_failed"
+                )
+            )
+            assert activities.kinds.count(expected) == 1
+            if terminal != "completed":
+                assert "regeneration_done" not in activities.kinds
+            assert provider.call_count == (1 if terminal == "interrupted" else 2)
+            assert agent.request_regeneration(request_id=token) == token
+            status["receipt"]["branch_id"] = 999
+            assert agent.get_regeneration_status(token)["receipt"]["branch_id"] == 2
+        finally:
+            gate.release.set()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
+async def test_deferred_cancel_before_first_step_has_no_applied_receipt(tmp_path):
+    provider = ScriptedLLM(["original", "must not run"])
+    async with Terrarium(session_dir=tmp_path / "sessions") as engine:
+        creature = await engine.add_creature(
+            AgentConfig(name="alice"), llm=provider, io="headless", start=True
+        )
+        await creature.run("question", timeout=3)
+        agent = creature.agent
+        token = agent.request_regeneration(request_id="pre-start-cancel")
+        agent._deferred_regeneration_task.cancel()
+        await asyncio.gather(agent._deferred_regeneration_task, return_exceptions=True)
+        status = agent.get_regeneration_status(token)
+        assert status["status"] == "cancelled" and status["waiter_cancelled"]
+        assert not status["applied"] and status["receipt"] is None
+        assert agent._branch_id == 1 and provider.call_count == 1
+        assert not getattr(agent, "_regeneration_reservation", None)
+
+
 async def test_pinned_provider_rechecked_at_actual_rerun_owner_admission(
     tmp_path, monkeypatch
 ):

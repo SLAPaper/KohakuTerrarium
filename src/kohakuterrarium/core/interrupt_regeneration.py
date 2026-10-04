@@ -9,6 +9,10 @@ from uuid import uuid4
 from kohakuterrarium.core.branch_edit_prepare import EditRequest
 from kohakuterrarium.core.branch_rerun import request_rerun
 from kohakuterrarium.core.branch_selection import _await_owner, _scope_id
+from kohakuterrarium.core.deferred_regeneration import (
+    DeferredRegenerationStatus,
+    run_deferred_regeneration,
+)
 from kohakuterrarium.core.message_locator import is_turn_user_message
 from kohakuterrarium.core.model_switch_guard import require_model_mutation_available
 from kohakuterrarium.core.operation_admission import reject_own_turn
@@ -212,6 +216,9 @@ async def interrupt_and_regenerate(
 
 
 def _request_status(task, request_id):
+    record = getattr(task, "_regeneration_status", None)
+    if record is not None:
+        return record.snapshot(task, request_id)
     if not task.done():
         return {"request_id": request_id, "status": "pending", "error": None}
     if task.cancelled():
@@ -235,25 +242,21 @@ def get_regeneration_status(agent, request_id):
 
 
 def _observe_request(agent, task, request_id):
-    if task.cancelled():
-        agent.output_router.notify_activity("regeneration_cancelled", request_id)
-        return
-    error = task.exception()
-    if error is not None:
+    status = _request_status(task, request_id)
+    if status["error"] is not None:
         logger.warning(
-            "Deferred regeneration failed", error=str(error), request_id=request_id
+            "Deferred regeneration failed", error=status["error"], request_id=request_id
         )
-        status = _request_status(task, request_id)
-        kind = (
-            "regeneration_cancelled"
-            if status["status"] == "interrupted"
-            else "regeneration_failed"
-        )
-        agent.output_router.notify_activity(kind, str(error), metadata=status)
-    else:
-        agent.output_router.notify_activity(
-            "regeneration_done", request_id, metadata=_request_status(task, request_id)
-        )
+    match status["status"]:
+        case "completed":
+            kind = "regeneration_done"
+        case "interrupted" | "cancelled":
+            kind = "regeneration_cancelled"
+        case _:
+            kind = "regeneration_failed"
+    agent.output_router.notify_activity(
+        kind, status["error"] or request_id, metadata=status
+    )
 
 
 def request_regeneration(
@@ -283,17 +286,23 @@ def request_regeneration(
         return previous_id
     binding = _capture(agent)
     token = request_id or str(uuid4())
+    record = DeferredRegenerationStatus()
     task = asyncio.create_task(
-        interrupt_and_regenerate(
+        run_deferred_regeneration(
+            interrupt_and_regenerate,
             agent,
-            timeout=timeout,
-            turn_index=turn_index,
-            branch_view=deepcopy(branch_view),
-            request_id=token,
-            target=target,
-            binding=binding,
+            {
+                "timeout": timeout,
+                "turn_index": turn_index,
+                "branch_view": deepcopy(branch_view),
+                "request_id": token,
+                "target": target,
+                "binding": binding,
+            },
+            record,
         )
     )
+    task._regeneration_status = record
     agent._deferred_regeneration_task = task
     agent._deferred_regeneration_id = token
     agent._deferred_regeneration_options = options

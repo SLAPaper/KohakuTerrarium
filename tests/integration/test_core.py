@@ -2621,7 +2621,15 @@ class TestCoreIntegration:
                     )
 
         provider = ScriptedLLM(
-            ["root", "child", "edited child", "continued", "edited root", "tail"]
+            [
+                "root",
+                "child",
+                "edited child",
+                "continued",
+                "edited root",
+                "tail",
+                "settled after waiter cancellation",
+            ]
         )
         async with Terrarium(session_dir=tmp_path / "resolved-branch") as engine:
             creature = await engine.add_creature(
@@ -2640,7 +2648,14 @@ class TestCoreIntegration:
                 )
                 if message.role == "user" and message.content == "CHILD"
             )
-            await agent.edit_and_rerun(index, "EDITED-CHILD")
+            edited = await agent.edit_and_rerun_result(
+                index, "EDITED-CHILD", request_id="edit-child-result"
+            )
+            assert (
+                edited["status"] == "completed"
+                and edited["request_id"] == "edit-child-result"
+            )
+            assert (edited["turn_index"], edited["branch_id"]) == (2, 2)
             await agent.select_branch({1: 1, 2: 1})
             assert await agent.inject_input("CONTINUE", branch_view={1: 1})
             assert [
@@ -2664,7 +2679,13 @@ class TestCoreIntegration:
                 )
                 if message.role == "user" and message.content == "ROOT"
             )
-            await agent.edit_and_rerun(index, "EDITED-ROOT")
+            edited = await agent.edit_and_rerun_result(
+                index, "EDITED-ROOT", request_id="edit-root-result"
+            )
+            assert (
+                edited["status"] == "completed" and edited["parent_branch_path"] == []
+            )
+            assert (edited["turn_index"], edited["branch_id"]) == (1, 2)
             command = BranchCommand()
             context = UserCommandContext(agent=agent)
             assert (await command.execute("1 1", context)).success
@@ -2678,6 +2699,43 @@ class TestCoreIntegration:
             await creature.start()
             await agent.select_branch({1: 2})
             assert (await creature.run("TAIL", timeout=5)).text == "tail"
+
+            class DeferredGate(BasePlugin):
+                name = "deferred_history_gate"
+
+                def __init__(self):
+                    self.entered, self.release = asyncio.Event(), asyncio.Event()
+
+                async def on_event(self, event):
+                    if event.context.get("rerun"):
+                        self.entered.set()
+                        await self.release.wait()
+
+            gate = DeferredGate()
+            await agent.add_plugin(gate)
+            token = agent.request_regeneration(request_id="history-waiter-cancel")
+            pending = agent._deferred_regeneration_task
+            try:
+                await asyncio.wait_for(gate.entered.wait(), 3)
+                pending.cancel()
+                await asyncio.sleep(0)
+                assert not pending.done()
+                gate.release.set()
+                await asyncio.gather(pending, return_exceptions=True)
+                status = agent.get_regeneration_status(token)
+                assert status["status"] == "completed" and status["waiter_cancelled"]
+                assert (
+                    status["receipt"]["turn_index"] == 2
+                    and status["receipt"]["branch_id"] == 4
+                )
+                assert (
+                    agent.controller.conversation.get_messages()[-1].content
+                    == "settled after waiter cancellation"
+                )
+                assert provider.call_count == 7
+            finally:
+                gate.release.set()
+                await asyncio.gather(pending, return_exceptions=True)
             saved_path = agent.session_store.path
         resumed_provider = ScriptedLLM(["after branch resume"])
         resumed = await Terrarium.resume(saved_path, llm=resumed_provider)

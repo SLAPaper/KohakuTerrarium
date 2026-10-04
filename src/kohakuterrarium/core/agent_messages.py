@@ -4,6 +4,7 @@ Modify past messages, regenerate responses, and replay conversation branches.
 """
 
 import asyncio
+from uuid import uuid4
 
 from kohakuterrarium.core.agent_lifecycle import wait_for_turn_completion
 from kohakuterrarium.core.agent_message_history import (
@@ -133,6 +134,34 @@ class AgentMessagesMixin:
 
         await self._regenerate_tail_response(request_id=request_id)
 
+    async def regenerate_last_response_result(
+        self,
+        *,
+        turn_index: int | None = None,
+        branch_view: dict[int, int] | None = None,
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> dict:
+        """Return a fixed settled receipt, or raise a failed-turn error; requires local idle."""
+        edit = (
+            EditRequest(
+                turn_index=turn_index,
+                branch_view=branch_view,
+                target=target,
+                regenerate=True,
+            )
+            if target is not None or turn_index is not None
+            else None
+        )
+        outcome, receipt = await request_rerun(
+            self,
+            append_user_event_pair,
+            request_id=request_id or uuid4().hex,
+            edit=edit,
+            return_receipt=True,
+        )
+        return completed_regeneration_result(outcome, receipt)
+
     async def _regenerate_tail_response(self, *, request_id: str | None) -> None:
         """Persist tail regeneration before publishing its context and rerun."""
         await request_rerun(self, append_user_event_pair, request_id=request_id)
@@ -158,7 +187,7 @@ class AgentMessagesMixin:
             ),
         )
 
-    async def _edit_and_rerun_result(
+    async def edit_and_rerun_result(
         self,
         message_idx,
         new_content,
@@ -173,13 +202,17 @@ class AgentMessagesMixin:
         outcome, receipt = await request_rerun(
             self,
             append_user_event_pair,
-            request_id=request_id,
+            request_id=request_id or uuid4().hex,
             edit=EditRequest(
                 message_idx, new_content, turn_index, user_position, branch_view, target
             ),
             return_receipt=True,
         )
         return completed_regeneration_result(outcome, receipt) if receipt else None
+
+    async def _edit_and_rerun_result(self, message_idx, new_content, **options):
+        """Compatibility alias for the public settled-result entrypoint."""
+        return await self.edit_and_rerun_result(message_idx, new_content, **options)
 
     async def rewind_to(self, message_idx: int) -> None:
         """Drop messages from ``message_idx`` onward without re-running."""

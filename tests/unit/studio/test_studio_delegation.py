@@ -223,7 +223,7 @@ def _attach_chat_agent(engine, creature_id="alice"):
         raise AssertionError("Service used an outcome-discarding legacy entrypoint")
 
     agent.interrupt_and_regenerate = _regen
-    agent._edit_and_rerun_result = _edit
+    agent.edit_and_rerun_result = _edit
     agent.regenerate_last_response = agent.edit_and_rerun = _legacy
     agent.rewind_to = _rewind
     return recorder

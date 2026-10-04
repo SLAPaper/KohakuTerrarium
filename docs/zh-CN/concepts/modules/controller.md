@@ -71,9 +71,9 @@ loop:
 
 ## 因此你可以做什么
 
-- **在会话中途切换 LLM**。 `/model` 用户指令或 `switch_model`
-  API 会原地切换 LLM provider。控制器不在乎自己正在和哪个 provider
-  对话。
+- **在会话中途切换 LLM**。 `/model` 或
+  `await agent.switch_model_async(...)` 确认 live provider 替换。
+  同步 `switch_model(...)` 仅用于启动前配置。
 - **动态 system prompt**。 `update_system_prompt(...)` 可以在下一回
   合前追加或替换提示词；控制器会自动接手使用。
 - **重生某一回合**。 `regenerate_last_response()` 会告诉控制器用当前
@@ -81,6 +81,22 @@ loop:
 - **从任何地方注入事件**。 因为一切都经过事件队列，plugin、工具，
   或外部 Python 程序都可以调用 `Agent.inject_event(...)`，控制器会
   按顺序处理它。
+
+## 已结算的历史操作结果
+
+`await agent.regenerate_last_response_result(...)` 和
+`await agent.edit_and_rerun_result(index, content, ...)` 返回固定回执，包含
+`status`、`request_id`、`turn_index`、`branch_id`、`branch_view`。它们要求本地空闲；
+无效编辑返回 `None`。rerun 失败或被 interrupt 时抛出
+`kohakuterrarium.core.interrupt_regeneration.RegenerationTurnError`，
+其回执说明已应用的分支，不表示事务已回滚。准入校验或持久化失败仍可能抛自身异常。
+
+兼容接口 `regenerate_last_response()` 返回 `None`，`edit_and_rerun()` 返回准入布尔值，
+两者都不能证明生成成功。外部忙碌调用者可用 `interrupt_and_regenerate(...)`；
+callback 应调用 `request_regeneration(...)` 后返回，不等待自身完成。
+`get_regeneration_status(token)` 区分操作终态与 `waiter_cancelled`。
+`applied` 和 `waiter_cancelled` 在无法确认时可为 `None`；没有确认不等于回滚。
+已接受操作会先结算再报告等待者取消，因此取消本身不是安全重试信号。
 
 ## 不要被它框住
 

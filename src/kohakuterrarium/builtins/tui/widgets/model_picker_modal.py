@@ -1,11 +1,12 @@
 """Switch the active agent using canonical model and variation identifiers.
 
 Available models are grouped by provider, current selections are restored, and
-variation controls are filtered before ``switch_model`` receives the identifier.
+variation controls are filtered before confirmed asynchronous model switching.
 """
 
 from typing import Any
 
+from rich.markup import escape
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
@@ -125,6 +126,7 @@ class ModelPickerModal(ModalScreen[bool]):
         self._tab_to_provider: dict[str, str] = {}
         self._selected_variations: dict[str, str] = {}
         self._current_identifier = ""
+        self._applying = False
 
     def compose(self):
         with Vertical(id="picker-container"):
@@ -327,22 +329,38 @@ class ModelPickerModal(ModalScreen[bool]):
             row.mount(select)
 
     def _apply(self) -> None:
+        if self._applying:
+            self._set_status("[red]A model switch is already in progress[/red]")
+            return
         entry = self._highlighted_entry()
         if not entry:
             self._set_status("[red]No model selected[/red]")
             return
         ident = _format_identifier(_identifier(entry), self._selected_variations)
-        switch = getattr(self._agent, "switch_model", None)
-        if not callable(switch):
-            self._set_status("[red]Agent does not support model switching[/red]")
-            return
+        self._applying = True
+        self._set_status("[dim]Waiting for confirmed model switch…[/dim]")
+        operation = self._apply_selected(ident)
         try:
-            applied = switch(ident)
-        except ValueError as exc:
-            self._set_status(f"[red]{exc}[/red]")
-            return
-        self._set_status(f"[green]Switched to {applied}[/green]")
-        self.dismiss(True)
+            self.run_worker(operation, group="model-apply")
+        except BaseException:
+            operation.close()
+            self._applying = False
+            raise
+
+    async def _apply_selected(self, ident: str) -> None:
+        try:
+            applied = await self._agent.switch_model_async(ident)
+        except Exception as exc:
+            logger.warning("Model picker switch failed", error=str(exc))
+            if self.is_mounted:
+                self._set_status(f"[red]{escape(str(exc))}[/red]")
+        else:
+            self._current_identifier = applied
+            if self.is_mounted:
+                self._set_status(f"[green]Switched to {escape(applied)}[/green]")
+                self.dismiss(True)
+        finally:
+            self._applying = False
 
     def _set_status(self, text: str) -> None:
         try:

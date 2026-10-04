@@ -769,7 +769,7 @@ class LocalTerrariumService(
         if target is not None:
             kwargs["target"] = target
         kwargs["request_id"] = request_id or uuid.uuid4().hex
-        receipt = await agent._edit_and_rerun_result(msg_idx, content, **kwargs)
+        receipt = await agent.edit_and_rerun_result(msg_idx, content, **kwargs)
         if receipt is None:
             raise ValueError(f"message {msg_idx} cannot be edited")
         return receipt

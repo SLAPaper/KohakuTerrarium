@@ -446,7 +446,7 @@ class TestChatOps:
 
             creature.agent = SimpleNamespace(
                 is_running=False,
-                _edit_and_rerun_result=_edit,
+                edit_and_rerun_result=_edit,
                 edit_and_rerun=_legacy_edit,
             )
             out = await adapter._dispatch(
@@ -499,7 +499,7 @@ class TestChatOps:
 
             creature.agent = SimpleNamespace(
                 is_running=False,
-                _edit_and_rerun_result=_edit,
+                edit_and_rerun_result=_edit,
                 edit_and_rerun=_legacy_edit,
                 _turn_index=999,
                 _branch_id=999,
@@ -544,7 +544,7 @@ class TestChatOps:
 
             creature.agent = SimpleNamespace(
                 is_running=False,
-                _edit_and_rerun_result=_edit,
+                edit_and_rerun_result=_edit,
                 edit_and_rerun=lambda *a, **kw: None,
             )
             out = await adapter._dispatch(
@@ -572,7 +572,7 @@ class TestChatOps:
 
     async def test_edit_message_failure_does_not_leak_branch_metadata(self):
         # When the agent refuses the edit (wrong target, etc.),
-        # _edit_and_rerun_result returns None which service maps to ValueError.
+        # edit_and_rerun_result returns None which service maps to ValueError.
         # The invalid error reply must NOT carry stale turn_index or branch_id —
         # the caller receives kind="invalid" without leaking branch metadata.
         adapter = await _make_adapter()
@@ -591,7 +591,7 @@ class TestChatOps:
 
             creature.agent = SimpleNamespace(
                 is_running=False,
-                _edit_and_rerun_result=_edit,
+                edit_and_rerun_result=_edit,
                 edit_and_rerun=_legacy_edit,
                 _turn_index=7,
                 _branch_id=9,

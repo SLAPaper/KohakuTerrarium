@@ -420,6 +420,7 @@ async def _admit(agent, append_pair, request_id, edit=None, validate=None):
         lambda: _allocate(agent, capture, branch, prepared_edit)
     )
     user_event_id = None
+    published = False
     try:
         if store is not None:
             turn, old_branch, path = capture["coordinates"]
@@ -444,18 +445,20 @@ async def _admit(agent, append_pair, request_id, edit=None, validate=None):
                 retained,
                 source_view,
             )
-        if prepared_edit is not None:
-            receipt = await owner.submit_internal(
-                lambda: _commit_edit(
+
+        def publish():
+            nonlocal published
+            receipt = (
+                _commit_edit(
                     agent, capture, prepared_edit, request_id, bundle, user_event_id
                 )
+                if prepared_edit is not None
+                else _commit(agent, capture, branch, request_id, bundle, user_event_id)
             )
-        else:
-            receipt = await owner.submit_internal(
-                lambda: _commit(
-                    agent, capture, branch, request_id, bundle, user_event_id
-                )
-            )
+            published = True
+            return receipt
+
+        receipt = await _join_accepted(owner.submit_internal(publish))
         turn, _, path = capture["coordinates"]
         if prepared_edit is not None:
             turn, path = prepared_edit["turn"], prepared_edit["path"]
@@ -466,8 +469,9 @@ async def _admit(agent, append_pair, request_id, edit=None, validate=None):
             "parent_branch_path": [list(pair) for pair in path],
             "branch_view": {str(t): b for t, b in (*path, (turn, branch))},
         }
-    except BaseException:
-        agent._history_rerun_uncertain = True
+    except BaseException as exc:
+        if not (isinstance(exc, asyncio.CancelledError) and published):
+            agent._history_rerun_uncertain = True
         raise
 
 

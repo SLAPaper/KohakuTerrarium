@@ -384,10 +384,12 @@ async def _publish_on_owner(
             _bind(agent, request, prepared, bundle)
             if continuation is not None:
                 agent._event_inbox.put_front([continuation])
+            prepared["published"] = True
 
         await _await_owner(owner.submit_internal(publish))
-        prepared["published"] = True
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError) and prepared["published"]:
+            raise
         # A failed multi-key save can already be partial on disk. Fail closed.
         agent._history_selection_uncertain = True
         if getattr(agent, "_runtime_context_bundle", None) is bundle:
