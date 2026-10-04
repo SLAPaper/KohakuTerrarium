@@ -69,7 +69,7 @@ def persist_output_delivery(store, namespace, generation, payload):
         raise HistoryCompatibilityError(
             "Output attempt has invalid generation evidence"
         )
-    uid, captured = capture_events(store)
+    uid, captured = capture_events(store, unique=False)
     matches = [
         (row, origin)
         for name, _, row, origin in captured

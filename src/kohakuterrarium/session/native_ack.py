@@ -137,7 +137,7 @@ def project_ack_results(events):
 
 def persist_ack(store, namespace, payload):
     """Confirm one source-bound acknowledgement, reusing an identical retry."""
-    uid, captured = capture_events(store)
+    uid, captured = capture_events(store, unique=False)
     rows = [(row, origin) for name, _, row, origin in captured if name == namespace]
     by_origin = {origin: row for row, origin in rows}
     payload = deepcopy(payload)

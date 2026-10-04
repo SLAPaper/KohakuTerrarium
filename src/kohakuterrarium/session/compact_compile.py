@@ -20,7 +20,7 @@ class _Unproven(Exception):
 
 def compile_coverage(store, namespace, prefix, retained):
     """Read one worker-local event snapshot and resolve an actual message prefix."""
-    uid, captured = capture_events(store)
+    uid, captured = capture_events(store, unique=False)
     rows = [(row, origin) for name, _, row, origin in captured if name == namespace]
     by_origin = {origin: row for row, origin in rows}
 

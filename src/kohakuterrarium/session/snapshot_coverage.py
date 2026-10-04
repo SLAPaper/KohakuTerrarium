@@ -107,7 +107,7 @@ def partition_snapshot(store, namespace, events):
     value = store.conversation.get(namespace)
     if not isinstance(value, dict) or SNAPSHOT_VERSION not in value:
         return None
-    uid, captured = capture_events(store)
+    uid, captured = capture_events(store, unique=False)
     members = set(prefix_origins(value, uid, namespace, captured))
     prior, tail = [], []
     for event in events:

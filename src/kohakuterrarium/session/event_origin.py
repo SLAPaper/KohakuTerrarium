@@ -109,7 +109,13 @@ def _payload(row):
     }
 
 
-def capture_events(store):
+def capture_events(store, *, unique=True):
+    """Read every durable row and mint a store identity if needed.
+
+    Copy and import keep ``unique=True`` so colliding origins cannot hop stores.
+    Local persist and resume lookups may pass ``unique=False`` to continue a
+    historically colliding session without rewriting its rows.
+    """
     rows = strict_rows(store)
     uid = store_uuid(store, rows)
     seen, event_ids = set(), set()
@@ -117,7 +123,7 @@ def capture_events(store):
     for name, key, row in rows:
         origin = row_origin(uid, name, row)
         coordinate = (name, row["event_id"])
-        if origin in seen or coordinate in event_ids:
+        if unique and (origin in seen or coordinate in event_ids):
             raise ValueError("Duplicate stored event origin or namespace event ID")
         seen.add(origin)
         event_ids.add(coordinate)

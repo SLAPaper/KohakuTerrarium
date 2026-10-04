@@ -92,7 +92,7 @@ def _pair_sources(proof, index, coordinates):
 
 
 def persist_feedback(store, namespace, content, deliveries, turn, branch, path):
-    uid, captured = capture_events(store)
+    uid, captured = capture_events(store, unique=False)
     index = {origin: row for name, _, row, origin in captured if name == namespace}
     coordinates = {"turn_index": turn, "branch_id": branch, "parent_branch_path": path}
     sources = []

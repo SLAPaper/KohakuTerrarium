@@ -21,6 +21,7 @@ from kohakuterrarium.session.output_delivery import (
     persist_output_delivery,
     validate_output_source,
 )
+from kohakuterrarium.session.text_recovery import prove_generation_origin
 from kohakuterrarium.session.history_replay import replay_selected_events
 from kohakuterrarium.session.history_support import dedupe_adjacent_duplicate_events
 from kohakuterrarium.session.store import SessionStore
@@ -103,6 +104,90 @@ def test_capture_rejects_same_namespace_id_even_with_distinct_origins(
         with pytest.raises(ValueError, match="Duplicate stored"):
             operation()
     assert destination.submit(destination.get_events, "alice").result() == []
+
+
+def test_resume_generation_survives_legacy_same_namespace_event_id_collision(stores):
+    store, _, _ = stores
+    store.submit(
+        store.append_event,
+        "alice",
+        "plugin_hook_timing",
+        {"hook": "on_agent_stop", "plugin": "context_files", "event_id": 78283, "ts": 10},
+        turn_index=149,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    store.submit(
+        store.append_event,
+        "alice",
+        "user_input",
+        {
+            "content": [{"text": "可以继续了", "type": "text"}],
+            "event_id": 78283,
+            "ts": 20,
+        },
+        turn_index=150,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    store.submit(store.flush).result()
+    before = store.submit(store.get_events, "alice").result()
+    assert [row["event_id"] for row in before] == [78283, 78283]
+    assert [row["type"] for row in before] == ["plugin_hook_timing", "user_input"]
+
+    generation = {
+        "schema": 1,
+        "generation_id": "generation-resume",
+        "source": {"model": "scripted"},
+    }
+    _, event_id = store.submit(
+        store.append_event,
+        "alice",
+        "assistant_generation_start",
+        deepcopy(generation),
+        turn_index=150,
+        branch_id=1,
+        parent_branch_path=[],
+    ).result()
+    store.submit(store.flush).result()
+    proof = store.submit(
+        prove_generation_origin,
+        store,
+        "alice",
+        generation,
+        150,
+        1,
+        [],
+        event_id=event_id,
+    ).result()
+    assert proof["generation_id"] == "generation-resume"
+    assert proof["event_id"] == event_id
+    assert event_id != 78283
+    receipt = store.submit(
+        persist_output_delivery,
+        store,
+        "alice",
+        generation,
+        {
+            "output_id": "one",
+            "target": "notice",
+            "content": "body",
+            "success": True,
+            "error": None,
+            "completed_at": "2026-10-04",
+            "feedback_line": "notice: body",
+        },
+    ).result()
+    assert receipt["payload"]["generation_id"] == "generation-resume"
+    events = store.submit(store.get_events, "alice").result()
+    assert [
+        {key: row[key] for key in ("type", "event_id") if key in row}
+        for row in events[:2]
+    ] == [
+        {"type": "plugin_hook_timing", "event_id": 78283},
+        {"type": "user_input", "event_id": 78283},
+    ]
+    assert events[-1]["type"] == "output_delivery"
 
 
 @pytest.mark.parametrize("activated", [False, True])

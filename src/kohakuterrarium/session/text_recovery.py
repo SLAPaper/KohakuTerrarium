@@ -56,7 +56,7 @@ def _declaration(
         or not isinstance(generation.get("source"), dict)
     ):
         raise HistoryCompatibilityError("Invalid open-text generation declaration")
-    _, records = capture_events(store)
+    _, records = capture_events(store, unique=False)
     candidates = [
         (row, origin)
         for name, _, row, origin in records
