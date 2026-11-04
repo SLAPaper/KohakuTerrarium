@@ -4,6 +4,7 @@ import sqlite3
 from contextlib import closing
 
 from kohakuvault import KVault
+import pytest
 
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.store.lifecycle.obsolete import (
@@ -16,7 +17,11 @@ def names(path):
         return {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
 
 
-def test_readonly_preserves_guards_and_writable_open_preserves_all_state(tmp_path):
+@pytest.mark.parametrize("mobile", [False, True])
+def test_readonly_preserves_guards_and_writable_open_preserves_all_state(
+    tmp_path, monkeypatch, mobile
+):
+    monkeypatch.setenv("KT_PROFILE", "mobile" if mobile else "desktop")
     path = tmp_path / "obsolete.kohakutr"
     state = {
         "a:recovery_context": [{"role": "user", "content": "legacy value"}],
@@ -58,12 +63,15 @@ def test_readonly_preserves_guards_and_writable_open_preserves_all_state(tmp_pat
             assert {key: store.state[key] for key in state} == state
             assert store.get_events("a")[0]["content"] == "archived"
             store.append_event("a", "activity", {"detail": "continued"})
-    assert not {
-        "kt_event_insert",
-        "kt_event_revisions",
-        "kt_value_revisions",
-        "kt_event_sequences",
-    } & names(path)
+    if mobile:
+        assert names(path) == before
+    else:
+        assert not {
+            "kt_event_insert",
+            "kt_event_revisions",
+            "kt_value_revisions",
+            "kt_event_sequences",
+        } & names(path)
     assert {"user_audit", "user_event_insert"} <= names(path)
     with closing(sqlite3.connect(path)) as connection:
         assert connection.execute("SELECT count(*) FROM user_audit").fetchone()[0] == 2

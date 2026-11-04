@@ -10,14 +10,14 @@ from kohakuvault import KVault
 
 from kohakuterrarium.core.agent.history.message_history import replay_with_settled_tools
 from kohakuterrarium.session.history.payloads import (
-    PAGE_BYTES,
-    PAGE_ROWS,
     event_pages,
     read_descriptors,
 )
 from kohakuterrarium.session.history.read import materialize_event_paths
 from kohakuterrarium.session.history.replay import dedupe_adjacent_duplicate_events
 from kohakuterrarium.session.store import SessionStore
+
+PAGE_BYTES = 1 << 20
 
 
 def test_descriptors_borrow_one_body_and_preserve_public_values(tmp_path, monkeypatch):
@@ -49,7 +49,7 @@ def test_descriptors_borrow_one_body_and_preserve_public_values(tmp_path, monkey
         monkeypatch.setattr(KVault, "get_many", observed)
         events = read_descriptors(store, "a")
         assert sum(map(len, calls)) == 193
-        assert max(map(len, calls)) <= PAGE_ROWS
+        assert max(map(len, calls)) == 1
         reader = events[0]._reader
         assert reader._values == {}
         assert all(
@@ -90,15 +90,15 @@ def test_pages_bound_encoded_bytes_and_allow_one_oversized_value(tmp_path):
         store.flush()
         pages = list(event_pages(store, "a"))
         assert sum(map(len, pages)) == 4
-        with closing(sqlite3.connect(store.path)) as connection:
-            for page in pages:
-                size = sum(
-                    connection.execute(
-                        "SELECT length(value) FROM events WHERE key=?", (key,)
-                    ).fetchone()[0]
-                    for key in page
-                )
-                assert size <= PAGE_BYTES or len(page) == 1
+    with closing(sqlite3.connect(tmp_path / "pages.kohakutr")) as connection:
+        for page in pages:
+            size = sum(
+                connection.execute(
+                    "SELECT length(value) FROM events WHERE key=?", (key,)
+                ).fetchone()[0]
+                for key in page
+            )
+            assert size <= PAGE_BYTES or len(page) == 1
 
 
 def test_previous_oversized_body_is_released_before_decoding_next_page(

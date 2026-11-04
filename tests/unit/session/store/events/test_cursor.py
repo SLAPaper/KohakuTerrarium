@@ -1,6 +1,8 @@
 """Native event seeks stay bounded and exact to the requested namespace."""
 
 from contextlib import closing
+import sqlite3
+import subprocess
 
 import pytest
 
@@ -8,6 +10,38 @@ from kohakuvault import KVault
 
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.store.events.cursor import event_rows
+from kohakuterrarium.session.history.payloads import read_descriptors
+from kohakuterrarium.session.store.lifecycle.obsolete import (
+    remove_obsolete_resume_guards,
+)
+
+
+@pytest.mark.parametrize("mobile", [False, True])
+def test_live_vault_never_opens_the_other_sqlite_library(tmp_path, monkeypatch, mobile):
+    monkeypatch.setenv("KT_PROFILE", "mobile" if mobile else "desktop")
+    with closing(SessionStore(tmp_path / "sqlite-libraries.kohakutr")) as store:
+        store.append_event("a", "user_message", {"content": "before"}, turn_index=1)
+        store.flush()
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Python sqlite3 must not open a live KohakuVault")
+
+        with monkeypatch.context() as guard:
+            guard.setattr(sqlite3, "connect", forbidden)
+            if mobile:
+                guard.setattr(subprocess, "run", forbidden)
+                guard.setattr(subprocess, "Popen", forbidden)
+            remove_obsolete_resume_guards(store)
+            assert read_descriptors(store, "a")[0]["content"] == "before"
+            assert store.get_last_turn_event("a")["turn_index"] == 1
+            store.append_event("a", "user_message", {"content": "after"}, turn_index=2)
+            assert store.get_last_turn_event("a")["content"] == "after"
+            assert [e["content"] for e in store.get_events("a")] == ["before", "after"]
+        if mobile:
+            with monkeypatch.context() as guard:
+                guard.setattr(subprocess, "run", forbidden)
+                with closing(SessionStore(store.path, writer_lock=False)) as reopened:
+                    assert reopened.get_last_turn_event("a")["turn_index"] == 2
 
 
 def test_reverse_turn_seek_reads_one_page_and_skips_neighbor_namespace(

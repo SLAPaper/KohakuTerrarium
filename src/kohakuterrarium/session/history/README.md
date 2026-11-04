@@ -11,11 +11,17 @@ signatures. Field names and event types share interned strings. No hash is
 persisted or used to authenticate checkpoints.
 
 The first pass still decodes historical records because metadata and bodies
-share one stored value. SQL locators stream in physical order. Pages contain
-at most 64 records and 1 MiB of encoded values, except that one oversized value
-occupies its own page. Later payload reads fetch only the requested event and
-retain at most that one decoded event. The encoded size budget bounds batches,
-not decoded Python objects or RSS.
+share one stored value. Native keys stream in physical order, 64 keys per page.
+Payload pages contain exactly one event, so decoding never overlaps multiple
+large records. A single event can still exceed any encoded size budget. Later
+payload reads fetch only the requested event and retain at most that one decoded
+event. These bounds do not cap decoded Python objects or RSS. Reverse turn seeks
+retain the namespace's keys before reading bodies; their key memory is O(N).
+
+Live archives use only KohakuVault's native SQLite library. Python SQLite must
+not open the same file in that process: the separate libraries can invalidate
+WAL and locks on POSIX. Native scans also work in embedded mobile runtimes
+without spawning a Python interpreter.
 
 Existing replay planning resolves branches, compaction, canonical assistant
 rounds and late ancestor tool results over descriptors. Body reads can revisit
@@ -42,8 +48,11 @@ those lists and pay their memory cost. Normal checkpoints save snapshots and
 runtime state without a third recovery context or historical authentication.
 
 Archives produced by experimental recovery-cache builds can contain native
-revision guards. Writable opens remove only those triggers and revision tables.
-Read-only opens preserve them. State values remain opaque: their key names can
+revision guards. Desktop and CLI writable opens remove only those triggers and
+revision tables in a standalone stdlib-only process, using the launcher-aware
+interpreter command. Newly created files skip this DDL. Read-only and mobile
+opens preserve the guards; embedded mobile runtimes cannot spawn Python, and
+the guards remain compatible with normal writes. State values remain opaque: their key names can
 also identify plugin, run-tracker or child-namespace state. Recovery and normal
 checkpoints do not read or update the old cache values; generic archive copying
 can still copy them as State. Cleanup does not vacuum the archive.

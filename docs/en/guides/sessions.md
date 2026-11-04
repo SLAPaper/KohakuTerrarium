@@ -608,9 +608,10 @@ No `.kohakutr` is created. This also disables compaction's ability to recover pr
 
 Recovery builds temporary event descriptors containing small metadata, shared
 ancestry and payload locations. The initial scan still decodes historical
-records because metadata and bodies share one stored value. Reads are paged by
-64 rows and 1 MiB of encoded values, with a single oversized record allowed.
-Later body lookups load only the requested event and retain one decoded event.
+records because metadata and bodies share one stored value. Native key scans
+page 64 keys at a time; payload reads decode one event at a time, including a
+potentially oversized record. Later body lookups load only the requested event
+and retain one decoded event. Reverse turn seeks retain only namespace keys.
 These limits bound batches, not total process memory; descriptors, the restored
 conversation, legacy inline catalogs and native caches also occupy memory.
 

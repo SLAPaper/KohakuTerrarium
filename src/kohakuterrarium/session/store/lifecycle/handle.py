@@ -79,12 +79,14 @@ class StoreHandleMixin:
 
     def _open_tables(self) -> None:
         """Open every table; a writable store also gets its flush pipeline."""
+        existing = Path(self._resume_index_path).exists()
         open_store_tables(
             self, self._path, read_only=self._readonly, policy=self._table_policy
         )
         if self._readonly:
             return
-        remove_obsolete_resume_guards(self)
+        if existing:
+            remove_obsolete_resume_guards(self)
         self.events.enable_cache()
         self._flush = EventFlushPipeline(
             self.events,

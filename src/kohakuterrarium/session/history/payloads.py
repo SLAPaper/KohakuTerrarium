@@ -1,7 +1,6 @@
 """Build temporary event descriptors with bounded, borrowed payload reads."""
 
 from collections.abc import Mapping
-from contextlib import closing
 from sys import intern
 
 from kohakuterrarium.session.history.ancestry import BranchAncestry
@@ -10,40 +9,21 @@ from kohakuterrarium.session.history.signature import (
     event_signature,
     _event_signature_value,
 )
-from kohakuterrarium.session.store.events.cursor import connect
+from kohakuterrarium.session.store.events.cursor import event_keys
 from kohakuterrarium.session.vault.io import key_text, read_values
-
-PAGE_ROWS = 64
-PAGE_BYTES = 1 << 20
 
 
 def event_pages(store, namespace, before_sequence=None, legacy_keys=None):
-    """Page exact-namespace locators by row count and encoded value size."""
-    prefix = f"{namespace}:e".encode()
-    upper = prefix[:-1] + bytes([prefix[-1] + 1])
-    with closing(connect(store)) as connection:
-        cursor = connection.execute(
-            "SELECT key,length(value) FROM events WHERE key>=? AND key<? ORDER BY key",
-            (prefix, upper),
-        )
-        page, size = [], 0
-        for key, encoded_size in cursor:
-            text = key_text(key)
-            owner, suffix = text.rsplit(":e", 1)
-            if owner != namespace:
+    """Read one payload per page without mixing SQLite libraries in the owner."""
+    for key in event_keys(store, namespace):
+        text = key_text(key)
+        suffix = text.rsplit(":e", 1)[1]
+        if suffix.isascii() and suffix.isdigit():
+            if before_sequence is not None and int(suffix) >= before_sequence:
                 continue
-            if suffix.isascii() and suffix.isdigit():
-                if before_sequence is not None and int(suffix) >= before_sequence:
-                    continue
-            elif legacy_keys is not None and text not in legacy_keys:
-                continue
-            if page and (len(page) >= PAGE_ROWS or size + encoded_size > PAGE_BYTES):
-                yield page
-                page, size = [], 0
-            page.append(key)
-            size += encoded_size
-        if page:
-            yield page
+        elif legacy_keys is not None and text not in legacy_keys:
+            continue
+        yield [key]
 
 
 class EventPayloads:
