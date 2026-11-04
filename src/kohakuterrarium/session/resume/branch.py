@@ -19,29 +19,31 @@ from kohakuterrarium.session.history.replay import (
     resolve_selected_branches,
     select_live_event_ids,
 )
-from kohakuterrarium.session.store.records.snapshot import load_records
+from kohakuterrarium.session.history.read import read_restore_events
+from kohakuterrarium.session.store.records.snapshot import load_headers, snapshot_lock
 
 
 def prepare_saved_snapshot(store, namespace: str, events: list[dict]) -> dict | None:
     """Select a branch checkpoint under the persisted resume view."""
-    records = load_records(store, namespace)
-    if not records:
-        return None
-    parent_paths = index_parent_paths(events)
-    selected = resolve_selected_branches(
-        events, parent_paths, load_persisted_branch_view(store, namespace)
-    )
-    return prepare_snapshot(
-        store,
-        namespace,
-        events,
-        selected,
-        records=records,
-        parent_paths=parent_paths,
-        replay=replay_with_settled_tools,
-        needs_replay=snapshot_needs_settled_tool_replay,
-        keep_delivered_pending=True,
-    )
+    with snapshot_lock(store):
+        records = load_headers(store, namespace, shared_paths=True)
+        if not records:
+            return None
+        parent_paths = index_parent_paths(events)
+        selected = resolve_selected_branches(
+            events, parent_paths, load_persisted_branch_view(store, namespace)
+        )
+        return prepare_snapshot(
+            store,
+            namespace,
+            events,
+            selected,
+            records=records,
+            parent_paths=parent_paths,
+            replay=replay_with_settled_tools,
+            needs_replay=snapshot_needs_settled_tool_replay,
+            keep_delivered_pending=True,
+        )
 
 
 def snapshot_has_turn_metadata(snapshot: list[dict]) -> bool:
@@ -261,7 +263,7 @@ def replayed_messages_for(
     """
     if events is None:
         try:
-            events = list(store.get_events(agent_name))
+            events = list(read_restore_events(store, agent_name))
         except Exception:  # pragma: no cover - defensive
             return []
     if not events:

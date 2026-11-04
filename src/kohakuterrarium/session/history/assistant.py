@@ -7,11 +7,13 @@ announcement. Streamed display pieces stay in place as
 """
 
 import json
+from collections.abc import Iterator
 from copy import deepcopy
 from typing import Any
 
 from kohakuterrarium.llm.antigravity.format import replay_target
 from kohakuterrarium.llm.message import ASSISTANT_STATE_KEYS, ImagePart
+from kohakuterrarium.session.history.branch_paths import ParentPath, _coerce_path
 
 _DISPLAY_TYPES = frozenset(
     {
@@ -33,18 +35,12 @@ def _positive_id(value: Any) -> int | None:
     return value
 
 
-def _lineage(event: dict[str, Any]) -> tuple[Any, Any, tuple[tuple[int, int], ...]]:
-    raw_path = event.get("parent_branch_path") or ()
-    path: list[tuple[int, int]] = []
-    try:
-        for item in raw_path:
-            if isinstance(item, (list, tuple)) and len(item) == 2:
-                turn, branch = item
-                if isinstance(turn, int) and isinstance(branch, int):
-                    path.append((turn, branch))
-    except TypeError:
-        path = []
-    return (event.get("turn_index"), event.get("branch_id"), tuple(path))
+def _lineage(event: dict[str, Any]) -> tuple[Any, Any, ParentPath]:
+    return (
+        event.get("turn_index"),
+        event.get("branch_id"),
+        _coerce_path(event.get("parent_branch_path")),
+    )
 
 
 def _eligible(event_id: int, eligible_ids: set[int] | None) -> bool:
@@ -171,6 +167,24 @@ def assistant_round_messages(
     return messages
 
 
+def assistant_round_call_ids(events: list[dict], eligible_ids: set[int]) -> dict:
+    """Keep canonical announcement identities without retaining message bodies."""
+    ends = _find_pairs(events, eligible_ids)
+    ends.update(
+        (event["event_id"], event)
+        for event in events
+        if event.get("_assistant_projected")
+        and _eligible(event.get("event_id"), eligible_ids)
+    )
+    return {
+        start: tuple(
+            str(call.get("id") or "")
+            for call in (end["message"].get("tool_calls") or [])
+        )
+        for start, end in ends.items()
+    }
+
+
 def project_assistant_rounds(
     events: list[dict[str, Any]],
     eligible_ids: set[int] | None = None,
@@ -183,6 +197,16 @@ def project_assistant_rounds(
     streamed display pieces inside the pair become ``assistant_round_display``.
     Unpaired / malformed / conflicting anchors leave display pieces intact.
     """
+    return list(iter_assistant_rounds(events, eligible_ids, copy_unchanged=True))
+
+
+def iter_assistant_rounds(
+    events: list[dict[str, Any]],
+    eligible_ids: set[int] | None = None,
+    *,
+    copy_unchanged: bool = False,
+) -> Iterator[dict[str, Any]]:
+    """Yield projected rounds, borrowing unchanged events for internal replay."""
     pairs = _find_pairs(events, eligible_ids)
     end_ids = {
         end.get("event_id")
@@ -190,9 +214,7 @@ def project_assistant_rounds(
         if _positive_id(end.get("event_id")) is not None
     }
     active_calls: set[str] | None = None
-    projected: list[dict[str, Any]] = []
     for event in events:
-        copied = _copy_event(event)
         event_id = _positive_id(event.get("event_id"))
         etype = event.get("type")
 
@@ -201,6 +223,7 @@ def project_assistant_rounds(
             and event_id is not None
             and event_id in pairs
         ):
+            copied = _copy_event(event)
             end = pairs[event_id]
             copied["type"] = "assistant_message"
             copied["message"] = deepcopy(end.get("message"))
@@ -209,7 +232,7 @@ def project_assistant_rounds(
             active_calls = {
                 call.get("id") for call in (end["message"].get("tool_calls") or [])
             }
-            projected.append(copied)
+            yield copied
             continue
 
         if (
@@ -217,9 +240,10 @@ def project_assistant_rounds(
             and event_id is not None
             and event_id in end_ids
         ):
+            copied = _copy_event(event)
             copied["type"] = "assistant_round_end"
             active_calls = None
-            projected.append(copied)
+            yield copied
             continue
 
         if active_calls is not None and etype in _DISPLAY_TYPES:
@@ -229,10 +253,11 @@ def project_assistant_rounds(
                 else set()
             )
             if calls.issubset(active_calls):
+                copied = _copy_event(event)
                 copied["type"] = "assistant_round_display"
-        projected.append(copied)
-
-    return projected
+                yield copied
+                continue
+        yield _copy_event(event) if copy_unchanged else event
 
 
 def _coerce_tool_args_to_json(args: Any) -> str:

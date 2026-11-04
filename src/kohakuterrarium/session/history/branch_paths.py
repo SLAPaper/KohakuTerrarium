@@ -2,13 +2,19 @@
 
 from typing import Any, Iterable
 
+from kohakuterrarium.session.history.ancestry import BranchAncestry, SharedPath
 
-def _coerce_path(raw: Any) -> tuple[tuple[int, int], ...]:
-    """Normalize a parent_branch_path payload into a tuple of pairs.
+ParentPath = tuple[tuple[int, int], ...] | SharedPath
+
+
+def _coerce_path(raw: Any) -> ParentPath:
+    """Normalize a parent path, retaining validated shared views.
 
     Accept JSON-friendly lists or tuples of integer pairs. Invalid or missing
     input produces an empty path.
     """
+    if isinstance(raw, SharedPath):
+        return raw
     if not raw:
         return ()
     out: list[tuple[int, int]] = []
@@ -25,7 +31,7 @@ def _coerce_path(raw: Any) -> tuple[tuple[int, int], ...]:
 
 def index_parent_paths(
     events_list: list[dict[str, Any]],
-) -> dict[int, tuple[tuple[int, int], ...]]:
+) -> dict[int, ParentPath]:
     """Map each event_id → its parent_branch_path.
 
     Explicit paths take precedence. Legacy events inherit the latest branch seen
@@ -33,10 +39,27 @@ def index_parent_paths(
     Public: shared by replay selection and ``session.resume`` branch-state
     restore.
     """
-    paths: dict[int, tuple[tuple[int, int], ...]] = {}
+    paths: dict[int, ParentPath] = {}
+    tree = next(
+        (
+            raw.tree
+            for event in events_list
+            if isinstance(raw := event.get("parent_branch_path"), SharedPath)
+        ),
+        BranchAncestry(),
+    )
+
+    def share(path):
+        if isinstance(path, SharedPath) and path.tree is tree:
+            return path
+        try:
+            return tree.view(tree.intern(path))
+        except ValueError:
+            return path
+
     latest_by_turn: dict[int, int] = {}
-    shared: dict[tuple, tuple] = {}
-    legacy: dict[int, tuple] = {}
+    latest_leaf: int | None = 0
+    legacy: dict[int, ParentPath] = {}
     latest_cached_turn: int | None = None
     canonical = True
     for evt in events_list:
@@ -51,20 +74,29 @@ def index_parent_paths(
         explicit = _coerce_path(evt.get("parent_branch_path"))
         if isinstance(eid, int):
             if explicit:
-                if all(type(t) is int and type(b) is int for t, b in explicit):
-                    explicit = shared.setdefault(explicit, explicit)
+                if isinstance(explicit, SharedPath) or all(
+                    type(t) is int and type(b) is int for t, b in explicit
+                ):
+                    explicit = share(explicit)
                 paths[eid] = explicit
             elif isinstance(ti, int):
                 path = legacy.get(ti) if canonical else None
                 if path is None:
-                    path = tuple(
-                        sorted(
-                            ((t, b) for t, b in latest_by_turn.items() if t < ti),
-                            key=lambda p: p[0],
+                    if (
+                        canonical
+                        and latest_leaf is not None
+                        and (not latest_leaf or tree.nodes[latest_leaf - 1][1] < ti)
+                    ):
+                        path = tree.view(latest_leaf)
+                    else:
+                        path = tuple(
+                            sorted(
+                                ((t, b) for t, b in latest_by_turn.items() if t < ti),
+                                key=lambda p: p[0],
+                            )
                         )
-                    )
                     if canonical:
-                        path = shared.setdefault(path, path)
+                        path = share(path)
                         legacy[ti] = path
                         latest_cached_turn = (
                             ti
@@ -76,6 +108,15 @@ def index_parent_paths(
             prev = latest_by_turn.get(ti, 0)
             if bi > prev:
                 latest_by_turn[ti] = bi
+                if canonical and latest_leaf is not None:
+                    if ti <= 0:
+                        latest_leaf = None
+                    elif not latest_leaf or tree.nodes[latest_leaf - 1][1] < ti:
+                        latest_leaf = tree.add(latest_leaf, ti, bi)
+                    elif tree.nodes[latest_leaf - 1][1] == ti:
+                        latest_leaf = tree.add(tree.nodes[latest_leaf - 1][0], ti, bi)
+                    else:
+                        latest_leaf = None
                 if (
                     canonical
                     and latest_cached_turn is not None
@@ -87,7 +128,7 @@ def index_parent_paths(
 
 
 def _path_matches(
-    parent_path: tuple[tuple[int, int], ...],
+    parent_path: ParentPath,
     selected: dict[int, int],
 ) -> bool:
     """Return whether a parent path is compatible with selected branches.
@@ -143,8 +184,8 @@ def resolve_branch_view_strict(
     parent_paths = index_parent_paths(events_list)
 
     pairs: set[tuple[int, int]] = set()
-    pair_paths: dict[tuple[int, int], tuple[tuple[int, int], ...]] = {}
-    candidates: dict[int, list[tuple[tuple[tuple[int, int], ...], int]]] = {}
+    pair_paths: dict[tuple[int, int], ParentPath] = {}
+    candidates: dict[int, list[tuple[ParentPath, int]]] = {}
     seen_pairs: set[tuple[Any, Any]] = set()
     for evt in events_list:
         seen_pairs.add((evt.get("turn_index"), evt.get("branch_id")))

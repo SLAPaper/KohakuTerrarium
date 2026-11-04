@@ -14,6 +14,7 @@ from kohakuterrarium.core.conversation.continuation import (
 from kohakuterrarium.core.events import TriggerEvent, create_user_input_event
 from kohakuterrarium.llm.message import ContentPart
 from kohakuterrarium.modules.output.event import OutputEvent
+from kohakuterrarium.session.resume.history import replay_output_history
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -44,15 +45,7 @@ class AgentDriveMixin:
         non-engine standalone path; both routes share this body.
         """
         try:
-            # Replay session history to output if resuming
-            if self._pending_resume_events:
-                await self.output_router.emit(
-                    OutputEvent(
-                        type="resume_batch",
-                        payload={"events": self._pending_resume_events},
-                    )
-                )
-                self._pending_resume_events = None
+            await replay_output_history(self)
 
             # Re-create resumable triggers from saved state
             pending_triggers = getattr(self, "_pending_resume_triggers", None)

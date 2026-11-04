@@ -1,6 +1,7 @@
 """Conversation snapshots, per-agent runtime state and turn rollups."""
 
 import json
+from threading import RLock
 from typing import Any
 
 from kohakuterrarium.session.store.records.rollup import (
@@ -9,6 +10,7 @@ from kohakuterrarium.session.store.records.rollup import (
     save_turn_rollup,
 )
 from kohakuterrarium.session.store.records.snapshot import (
+    clear_records,
     load_branch_snapshot,
     save_branch_snapshot,
 )
@@ -22,13 +24,16 @@ class ConversationRecordsMixin:
     conversation: Any
     turn_rollup: Any
 
+    def _init_conversation_records(self) -> None:
+        self._snapshot_lock = RLock()
+
     def save_conversation(self, agent: str, messages: list[dict] | str) -> None:
         """Save a conversation snapshot (overwritten each time).
 
         Accepts either a list of message dicts (preferred, stored via msgpack)
         or a JSON string (legacy, stored as-is).
         """
-        self.state[f"{agent}:branch_snapshots"] = []
+        clear_records(self, agent)
         self.conversation[agent] = messages
 
     def save_branch_snapshot(
@@ -41,14 +46,15 @@ class ConversationRecordsMixin:
         compact_state: dict | None = None,
     ) -> None:
         """Save a branch-local checkpoint alongside the latest conversation."""
-        save_branch_snapshot(
-            self,
-            agent,
-            messages,
-            branch=branch,
-            watermark=watermark,
-            compact_state=compact_state,
-        )
+        with self._snapshot_lock:
+            save_branch_snapshot(
+                self,
+                agent,
+                messages,
+                branch=branch,
+                watermark=watermark,
+                compact_state=compact_state,
+            )
 
     def load_branch_snapshot(
         self, agent: str, branch_view: dict[int, int]

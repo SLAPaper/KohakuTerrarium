@@ -3,11 +3,10 @@
 import sys
 from typing import TextIO
 
-from kohakuterrarium.llm.message import content_display_text
 from kohakuterrarium.modules.output.base import BaseOutputModule
-from kohakuterrarium.session.history.replay import (
-    dedupe_adjacent_duplicate_events,
-    select_live_event_ids,
+from kohakuterrarium.builtins.outputs.stdout_history import (
+    _group_resume_events as _group_resume_events,
+    _render_resume_text,
 )
 from kohakuterrarium.utils.logging import get_logger
 
@@ -24,52 +23,6 @@ def _write_safe(stream: TextIO, text: str) -> None:
 
     encoding = getattr(stream, "encoding", None) or "utf-8"
     stream.write(text.encode(encoding, errors="replace").decode(encoding))
-
-
-def _group_resume_events(events: list[dict]) -> list[dict]:
-    """Group live-branch session events into condensed resume turns."""
-    if not events:
-        return []
-    events = dedupe_adjacent_duplicate_events(events)
-    live_ids = select_live_event_ids(events)
-    turns: list[dict] = []
-    current: dict = {"user": "", "text": "", "tools": []}
-
-    for evt in events:
-        etype = evt.get("type", "")
-        eid = evt.get("event_id")
-        if isinstance(eid, int) and eid not in live_ids:
-            continue
-        if etype == "user_input":
-            if current["user"] or current["text"]:
-                turns.append(current)
-            # Multimodal content lists render as display text, not Python repr.
-            current = {
-                "user": content_display_text(evt.get("content", "")),
-                "text": "",
-                "tools": [],
-            }
-        elif etype == "trigger_fired":
-            if current["user"] or current["text"]:
-                turns.append(current)
-            channel = evt.get("channel", "")
-            sender = evt.get("sender", "")
-            current = {
-                "user": f"[trigger: {channel} from {sender}]",
-                "text": "",
-                "tools": [],
-            }
-        elif etype in ("text", "text_chunk"):
-            # Persisted full text and streamed chunks share one preview buffer.
-            current["text"] += evt.get("content", "")
-        elif etype == "tool_call":
-            name = evt.get("name", "tool")
-            if name not in current["tools"]:
-                current["tools"].append(name)
-
-    if current["user"] or current["text"]:
-        turns.append(current)
-    return turns
 
 
 class StdoutOutput(BaseOutputModule):
@@ -158,31 +111,27 @@ class StdoutOutput(BaseOutputModule):
         sys.stdout.flush()
 
     async def on_resume(self, events: list[dict]) -> None:
-        """Render a bounded summary of live session history after resume."""
-        if not events:
-            return
+        """Render bounded turn previews from legacy replay events."""
+        await self._deliver_history_text(_render_resume_text(events))
 
-        turns = _group_resume_events(events)
-        if not turns:
-            return
+    async def prepare_resume(self, history):
+        """Prepare bounded history text on the store worker."""
+        callback = getattr(self.on_resume, "__func__", self.on_resume)
+        if callback is not StdoutOutput.on_resume:
+            return await super().prepare_resume(history)
+        return await history.projection(_render_resume_text, normalize=False)
 
-        _write_safe(sys.stdout, f"\n--- Resumed session ({len(turns)} turns) ---\n")
-        for turn in turns:
-            if turn["user"]:
-                user_preview = turn["user"][:120]
-                if len(turn["user"]) > 120:
-                    user_preview += "..."
-                _write_safe(sys.stdout, f"You: {user_preview}\n")
-            if turn["text"]:
-                text_preview = turn["text"].strip()[:200]
-                if len(turn["text"].strip()) > 200:
-                    text_preview += "..."
-                tools_str = ""
-                if turn["tools"]:
-                    tools_str = f" [used {', '.join(turn['tools'])}]"
-                _write_safe(sys.stdout, f"Assistant:{tools_str} {text_preview}\n")
-        _write_safe(sys.stdout, "--- End of history ---\n\n")
-        sys.stdout.flush()
+    async def deliver_resume(self, prepared) -> None:
+        """Deliver prepared text or retain a subclass's legacy callback."""
+        if isinstance(prepared, str):
+            await self._deliver_history_text(prepared)
+        else:
+            await self.on_resume(prepared)
+
+    async def _deliver_history_text(self, text: str) -> None:
+        if text:
+            _write_safe(sys.stdout, text)
+            sys.stdout.flush()
 
 
 class PrefixedStdoutOutput(StdoutOutput):

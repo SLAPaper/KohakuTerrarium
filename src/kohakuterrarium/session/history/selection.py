@@ -3,6 +3,8 @@
 import bisect
 from typing import Any
 
+from kohakuterrarium.session.history.ancestry import SharedPath
+
 Path = tuple[tuple[int, int], ...]
 _NONCANONICAL = object()
 
@@ -21,6 +23,22 @@ class SelectionCompatibility:
         self._paths: dict[int, tuple[Path, int | None]] = {}
         self._pair_conflicts: dict[tuple[int, int], bool] = {}
         self._custom_compatibility: dict[tuple[int, Path], bool] = {}
+        self._node_conflicts: dict[object, dict[int, int | None]] = {}
+
+    def _shared_conflict(self, path: SharedPath) -> int | None:
+        """Visit each shared prefix once for this fixed plain-dict selection."""
+        cache = self._node_conflicts.setdefault(path.tree, {0: None})
+        pending, leaf = [], path.leaf
+        while leaf not in cache:
+            pending.append(leaf)
+            leaf = path.tree.nodes[leaf - 1][0]
+        first = cache[leaf]
+        for leaf in reversed(pending):
+            _, turn, branch = path.tree.nodes[leaf - 1]
+            if first is None and self._pair_conflict((turn, branch)):
+                first = turn
+            cache[leaf] = first
+        return first
 
     def _pair_conflict(self, pair: tuple[int, int]) -> bool:
         """Compare one canonical parent coordinate with the selected view."""
@@ -72,6 +90,16 @@ class SelectionCompatibility:
 
     def matches(self, path: Any, turn: int) -> bool:
         """Return compatibility with the selected prefix preceding a turn."""
+        if (
+            isinstance(path, SharedPath)
+            and self._canonical_selection
+            and type(self._selected) is dict
+            and type(turn) in (int, bool)
+        ):
+            first = self._shared_conflict(path)
+            return first is None or first >= turn
+        if isinstance(path, SharedPath):
+            path = tuple(path)
         if (
             self._canonical_selection
             and (type(turn) is int or type(turn) is bool)

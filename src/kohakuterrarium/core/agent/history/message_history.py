@@ -25,8 +25,8 @@ from kohakuterrarium.core.conversation.snapshot import (
 from kohakuterrarium.session.history.replay import (
     compact_covered_event_ids,
     index_parent_paths,
-    normalize_resumable_events,
     normalize_tool_call_events,
+    prepare_replay_events,
     replay_conversation,
     resolve_branch_view_strict,
     select_live_event_ids,
@@ -311,14 +311,9 @@ def replay_with_settled_tools(
     replay_events = include_settled_tool_results(
         events, live_event_ids, covered_event_ids=covered_ids
     )
-    if resumable:
-        replay_events = normalize_resumable_events(
-            replay_events, covered_event_ids=covered_ids
-        )
-    else:
-        replay_events = normalize_tool_call_events(
-            replay_events, covered_event_ids=covered_ids
-        )
+    replay_events = prepare_replay_events(
+        replay_events, resumable=resumable, covered_event_ids=covered_ids
+    )
     return replay_conversation(
         replay_events,
         branch_view=branch_view,

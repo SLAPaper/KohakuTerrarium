@@ -93,6 +93,14 @@ class BaseOutputModule(ABC):
         """Handle subclass-specific startup."""
         pass
 
+    async def prepare_resume(self, history):
+        """Prepare output-owned replay data from a fixed-boundary history source."""
+        return await history.events()
+
+    async def deliver_resume(self, prepared) -> None:
+        """Deliver previously prepared legacy replay events."""
+        await self.on_resume(prepared)
+
     async def _on_stop(self) -> None:
         """Handle subclass-specific shutdown."""
         pass
@@ -177,3 +185,20 @@ class BaseOutputModule(ABC):
                     self.on_activity_with_metadata(event.type, detail, event.payload)
                 else:
                     self.on_activity(event.type, detail)
+
+
+def wants_resume_history(output) -> bool:
+    """Whether an output consumes legacy history or prepares its own replay."""
+    if output is None:
+        return False
+    explicit = getattr(output, "needs_resume_history", None)
+    if explicit is not None:
+        return bool(explicit)
+    callback = getattr(output, "on_resume", None)
+    prepare = getattr(output, "prepare_resume", None)
+    return (
+        callable(callback)
+        and getattr(callback, "__func__", callback) is not BaseOutputModule.on_resume
+        or callable(prepare)
+        and getattr(prepare, "__func__", prepare) is not BaseOutputModule.prepare_resume
+    )

@@ -11,7 +11,12 @@ from kohakuterrarium.core.agent.history.message_history import (
     snapshot_needs_settled_tool_replay,
 )
 from kohakuterrarium.core.conversation.snapshot import prepare_snapshot
-from kohakuterrarium.session.store.records.snapshot import load_records
+from kohakuterrarium.session.history.ancestry import BranchAncestry
+from kohakuterrarium.session.store.records.snapshot import (
+    PAYLOAD_MARKER,
+    load_headers,
+    load_records,
+)
 from kohakuterrarium.session.store import SessionStore
 
 _EVENTS = [
@@ -209,6 +214,36 @@ def _save_branch_msgs_a(store: SessionStore) -> None:
     )
 
 
+@pytest.mark.parametrize("path_kind", ["lists", "shared", "tuples"])
+def test_filtered_system_only_checkpoint_preserves_path_type_semantics(
+    store, path_kind
+):
+    path = [[1, 1], [2, 1]]
+    if path_kind == "shared":
+        tree = BranchAncestry()
+        path = tree.view(tree.intern(path))
+    elif path_kind == "tuples":
+        path = tuple(map(tuple, path))
+    record = {
+        "path": path,
+        "watermark": 1,
+        "messages": _EMPTY_SYSTEM,
+        "compact_state": {"compact_count": 0, "last_compact_time": 0.0},
+    }
+    prepared = prepare_snapshot(
+        store,
+        "alice",
+        [_EVENTS[0]],
+        {1: 1},
+        records=[record],
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+    )
+    assert prepared is not None
+    assert prepared["messages"] == _EMPTY_SYSTEM
+    assert prepared["context_cutoff_event_id"] == (0 if path_kind == "tuples" else 1)
+
+
 def _save_cutoff_ack_snapshot(store: SessionStore, pending: bool) -> None:
     ack = _RETAINED_CUTOFF_MESSAGES + (
         [
@@ -297,6 +332,80 @@ def test_prepare_snapshot_exact_checkpoint_ignores_latest_mirror(
     ]
 
 
+def test_metadata_selection_skips_inferior_branch_payloads(store, monkeypatch):
+    for branch in range(1, 5):
+        _, event_id = store.append_event(
+            "alice",
+            "user_message",
+            {"content": f"raw-{branch}"},
+            turn_index=1,
+            branch_id=branch,
+        )
+        store.save_branch_snapshot(
+            "alice",
+            [
+                {
+                    "role": "user",
+                    "content": f"snapshot-{branch}",
+                    "metadata": {"turn_index": 1, "branch_id": branch},
+                }
+            ],
+            branch={"turn_index": 1, "branch_id": branch, "parent_branch_path": []},
+            watermark=event_id,
+        )
+    headers = load_headers(store, "alice")
+    read = type(store.state).get
+    reads = []
+
+    def observe(vault, key, *args, **kwargs):
+        if vault is store.state and PAYLOAD_MARKER in key:
+            reads.append(key)
+        return read(vault, key, *args, **kwargs)
+
+    monkeypatch.setattr(type(store.state), "get", observe)
+    result = _prepare(store, store.get_events("alice"), {1: 4})
+    assert result["messages"][0]["content"] == "snapshot-4"
+    assert reads == [headers[-1]["messages_key"]] * 2
+
+
+def test_equal_rank_preserves_first_checkpoint_and_returns_detached_messages(
+    store, base_events
+):
+    _save_branch_msgs_a(store)
+    record = load_records(store, "alice")[0]
+    second = copy.deepcopy(record)
+    second["messages"][-1]["content"] = "other tied checkpoint"
+    result = prepare_snapshot(
+        store,
+        "alice",
+        base_events,
+        {1: 1, 2: 1},
+        records=[record, second],
+        replay=replay_with_settled_tools,
+        needs_replay=snapshot_needs_settled_tool_replay,
+    )
+    assert result["messages"][-1]["content"] == "snap_a2"
+    result["messages"][0]["content"] = "changed result"
+    assert record["messages"][0]["content"] == "snap_u1"
+
+
+def test_unrecorded_checkpoint_turn_is_skipped_before_loading_messages(store):
+    _, event_id = store.append_event("alice", "token_usage", {"prompt_tokens": 1})
+    store.save_branch_snapshot(
+        "alice",
+        [
+            {
+                "role": "user",
+                "content": "unrecorded turn",
+                "metadata": {"turn_index": 1, "branch_id": 1},
+            }
+        ],
+        branch={"turn_index": 1, "branch_id": 1, "parent_branch_path": []},
+        watermark=event_id,
+    )
+    assert _prepare(store, store.get_events("alice"), {}) is None
+
+
 @pytest.mark.parametrize("empty", [False, True])
 def test_prepare_snapshot_uses_preloaded_records_without_reading_store(
     store, base_events, monkeypatch, empty
@@ -308,7 +417,7 @@ def test_prepare_snapshot_uses_preloaded_records_without_reading_store(
     def forbidden(*args, **kwargs):
         raise AssertionError("Preloaded records must not trigger another read")
 
-    monkeypatch.setattr(snapshot_history, "load_records", forbidden)
+    monkeypatch.setattr(snapshot_history, "load_headers", forbidden)
     outcome = prepare_snapshot(
         store,
         "alice",
@@ -324,7 +433,7 @@ def test_prepare_snapshot_uses_preloaded_records_without_reading_store(
         assert outcome["messages"] == _MSGS_A
         outcome["messages"][0]["content"] = "changed result"
     assert records == original_records
-    assert store.state["alice:branch_snapshots"][0]["messages"] == _MSGS_A
+    assert load_records(store, "alice")[0]["messages"] == _MSGS_A
 
 
 @pytest.mark.parametrize(

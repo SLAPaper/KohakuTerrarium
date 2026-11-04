@@ -6,11 +6,18 @@ from typing import Any, Callable
 
 from kohakuterrarium.core.compact.branch import compact_source_path_from_event
 from kohakuterrarium.core.conversation.settled_identity import delivered_jobs
+from kohakuterrarium.session.history.ancestry import SharedPath
+from kohakuterrarium.session.history.branch_paths import ParentPath
 from kohakuterrarium.session.history.replay import (
     compact_covered_event_ids,
     select_live_event_ids,
 )
-from kohakuterrarium.session.store.records.snapshot import load_records
+from kohakuterrarium.session.store.records.snapshot import (
+    load_headers,
+    load_record,
+    matches_snapshot_view,
+    snapshot_lock,
+)
 
 
 def replayed_compact_state(messages: list[dict]) -> dict:
@@ -123,7 +130,7 @@ def _prefix(
         )
     ):
         return None
-    return deepcopy(kept), record["path"][-1][0] if lineage else last_turn
+    return kept, record["path"][-1][0] if lineage else last_turn
 
 
 def _boundary_turn(
@@ -213,7 +220,7 @@ def prepare_snapshot(
     needs_replay: Callable,
     before_turn: int | None = None,
     records: list[dict] | None = None,
-    parent_paths: dict[int, tuple[tuple[int, int], ...]] | None = None,
+    parent_paths: dict[int, ParentPath] | None = None,
     keep_delivered_pending: bool = False,
 ) -> dict | None:
     """Restore a checkpoint prefix; supplied paths match unchanged raw events and order.
@@ -222,178 +229,260 @@ def prepare_snapshot(
     the checkpoint already delivers; only a whole-conversation restore may, since
     truncating callers would cut the delivery and keep the placeholder.
     """
-    if records is None:
-        records = load_records(store, namespace)
-    if not records:
-        return None
-    # Every recorded turn counts: trigger- and background-opened turns have no
-    # user_message yet still sit on a checkpoint's branch path.
-    raw_pairs = {
-        (event.get("turn_index"), event.get("branch_id"))
-        for event in events
-        if type(event.get("turn_index")) is int and type(event.get("branch_id")) is int
-    }
-    live_ids = select_live_event_ids(
-        events, branch_view=selected, parent_paths=parent_paths
-    )
-    covered = compact_covered_event_ids(events, selected, parent_paths=parent_paths)
-    # Checkpoint paths record only real turns; pre-turn events sit at (0, 0).
-    path_view = {t: b for t, b in selected.items() if t > 0 and b > 0}
-    user_pairs = {
-        (event.get("turn_index"), event.get("branch_id"))
-        for event in events
-        if event.get("type") == "user_message"
-    }
-    candidates, repairs = [], []
-    for record in records:
-        # A turn the view leaves unselected that has no user message (or was
-        # never recorded) cannot diverge from the view, so it does not count.
-        path = [
-            pair
-            for pair in record["path"]
-            if pair[0] in path_view or tuple(pair) in user_pairs
-        ]
-        if len(path) != len(record["path"]):
-            record = {**record, "path": path}
-        if not set(map(tuple, record["path"])).issubset(raw_pairs) or not _fresh(
-            store, namespace, events, record["watermark"]
-        ):
-            continue
-        cutoff = record.get("context_cutoff_event_id", 0)
-        boundary_turn = _boundary_turn(record, events, path_view, before_turn)
-        if cutoff:
-            if boundary_turn is None:
-                continue
-            repairs.append((boundary_turn, record["watermark"], cutoff, record))
-        prefix = _prefix(
-            record, path_view, before_turn, empty_boundary=boundary_turn is not None
-        )
-        if prefix is None:
-            continue
-        messages, last_turn = prefix
-        last_turn = max(last_turn, boundary_turn or 0)
-        whole = before_turn is None and record["path"] == sorted(
-            [t, b] for t, b in path_view.items()
-        )
-        if whole and not any(
-            message["role"] != "system" for message in record["messages"]
-        ):
-            cutoff = max(cutoff, record["watermark"])
-        if cutoff:
-            repairs.append((last_turn, record["watermark"], cutoff, record))
-        if whole:
-            tail = [
-                event
-                for event in events
-                if event.get("event_id", 0) > record["watermark"]
-                and event.get("event_id") in live_ids
-            ]
-        else:
-            tail = [
-                event
-                for event in events
-                if event.get("event_id") in live_ids
-                and type(event.get("turn_index")) is int
-                and event["turn_index"] > last_turn
-                and (before_turn is None or event["turn_index"] < before_turn)
-            ]
-        if any(
-            event.get("event_id", 0) > record["watermark"]
-            and event.get("event_id") in live_ids
-            and event.get("type")
-            in {
-                "text_chunk",
-                "text",
-                "assistant_reasoning",
-                "assistant_tool_calls",
-                "assistant_message",
-                "assistant_image",
-                "user_message",
-                "tool_call",
-                "compact_complete",
-                "compact_replace",
-                "context_cleared",
-            }
-            and event.get("turn_index", last_turn) <= last_turn
+    with snapshot_lock(store):
+        if records is None:
+            records = load_headers(store, namespace)
+        if not records:
+            return None
+        # Every recorded turn counts: trigger- and background-opened turns have no
+        # user_message yet still sit on a checkpoint's branch path.
+        raw_pairs = {
+            (event.get("turn_index"), event.get("branch_id"))
             for event in events
-        ):
-            continue
-        if any(
-            event.get("type")
-            in {
-                "compact_complete",
-                "compact_replace",
-                "context_cleared",
-                "system_prompt_set",
-            }
-            for event in tail
-        ):
-            continue
-        pending = {
-            message.get("metadata", {}).get("job_id")
-            for message in messages
-            if message.get("metadata", {}).get("tool_result_phase") == "pending"
+            if type(event.get("turn_index")) is int
+            and type(event.get("branch_id")) is int
         }
-        if keep_delivered_pending:
-            pending -= delivered_jobs(messages)
-        if any(
-            event.get("type") == "tool_result"
-            and event.get("event_id") not in covered
-            and (event.get("call_id") or event.get("job_id")) in pending
-            for event in events
-        ):
-            continue
-        messages.extend(
-            replay(tail, branch_view=selected, include_metadata=True, resumable=True)
+        live_ids = select_live_event_ids(
+            events, branch_view=selected, parent_paths=parent_paths
         )
-        if before_turn is not None:
-            call_ids = {
-                call.get("id")
-                for message in messages
-                for call in message.get("tool_calls") or []
-            }
+        covered = compact_covered_event_ids(events, selected, parent_paths=parent_paths)
+        # Checkpoint paths record only real turns; pre-turn events sit at (0, 0).
+        path_view = {t: b for t, b in selected.items() if t > 0 and b > 0}
+        user_pairs = {
+            (event.get("turn_index"), event.get("branch_id"))
+            for event in events
+            if event.get("type") == "user_message"
+        }
+        best, repairs = None, []
+        ordered = sorted(
+            enumerate(records),
+            key=lambda item: (item[1]["path"][-1][0], item[1]["watermark"]),
+            reverse=True,
+        )
+        for position, record in ordered:
+            loaded = prefix = messages = None
+            # A turn the view leaves unselected that has no user message (or was
+            # never recorded) cannot diverge from the view, so it does not count.
+            path = [
+                pair
+                for pair in record["path"]
+                if pair[0] in path_view or tuple(pair) in user_pairs
+            ]
+            if not path:
+                continue
+            if len(path) != len(record["path"]):
+                if isinstance(record["path"], SharedPath):
+                    path = [list(pair) for pair in path]
+                record = {**record, "path": path}
+            if not set(map(tuple, record["path"])).issubset(raw_pairs) or not _fresh(
+                store, namespace, events, record["watermark"]
+            ):
+                continue
+            cutoff = record.get("context_cutoff_event_id", 0)
+            boundary_turn = _boundary_turn(record, events, path_view, before_turn)
+            if cutoff:
+                if boundary_turn is None:
+                    continue
+                repairs.append(
+                    (boundary_turn, record["watermark"], -2 * position, cutoff, record)
+                )
+            exact = before_turn is None and dict(record["path"]) == path_view
+            lineage = exact or _continued_by(record["path"], path_view, before_turn)
+            upper_turn = (
+                record["path"][-1][0]
+                if lineage
+                else max(
+                    (
+                        turn
+                        for turn in path_view
+                        if before_turn is None or turn < before_turn
+                    ),
+                    default=0,
+                )
+            )
+            upper_rank = (
+                max(upper_turn, boundary_turn or 0),
+                record["watermark"],
+                -position,
+            )
+            if best is not None and upper_rank <= best["_rank"]:
+                continue
+            loaded = load_record(store, namespace, record)
+            if loaded is None:
+                continue
+            prefix = _prefix(
+                loaded, path_view, before_turn, empty_boundary=boundary_turn is not None
+            )
+            if prefix is None:
+                continue
+            messages, last_turn = prefix
+            last_turn = max(last_turn, boundary_turn or 0)
+            whole = before_turn is None and matches_snapshot_view(
+                record["path"], path_view
+            )
+            if whole and not any(
+                message["role"] != "system" for message in loaded["messages"]
+            ):
+                cutoff = max(cutoff, record["watermark"])
+            if cutoff:
+                repairs.append(
+                    (last_turn, record["watermark"], -2 * position - 1, cutoff, record)
+                )
+            rank = (last_turn, record["watermark"], -position)
+            if best is not None and rank <= best["_rank"]:
+                continue
+            if whole:
+                tail = [
+                    event
+                    for event in events
+                    if event.get("event_id", 0) > record["watermark"]
+                    and event.get("event_id") in live_ids
+                ]
+            else:
+                tail = [
+                    event
+                    for event in events
+                    if event.get("event_id") in live_ids
+                    and type(event.get("turn_index")) is int
+                    and event["turn_index"] > last_turn
+                    and (before_turn is None or event["turn_index"] < before_turn)
+                ]
             if any(
-                event.get("type") == "tool_call"
+                event.get("event_id", 0) > record["watermark"]
                 and event.get("event_id") in live_ids
-                and event.get("event_id") not in covered
-                and event.get("event_id", 0) > cutoff
-                and event.get("turn_index", before_turn) < before_turn
-                and (event.get("tool_call_id") or event.get("call_id")) not in call_ids
+                and event.get("type")
+                in {
+                    "text_chunk",
+                    "text",
+                    "assistant_reasoning",
+                    "assistant_tool_calls",
+                    "assistant_message",
+                    "assistant_image",
+                    "user_message",
+                    "tool_call",
+                    "compact_complete",
+                    "compact_replace",
+                    "context_cleared",
+                }
+                and event.get("turn_index", last_turn) <= last_turn
                 for event in events
             ):
                 continue
-        checked_events = [
-            event
-            for event in events
-            if event.get("type") != "tool_result" or event.get("event_id", 0) > cutoff
-        ]
-        if needs_replay(checked_events, selected, snapshot=messages):
-            continue
-        candidates.append(
-            {
-                "messages": messages,
-                "compact_state": record["compact_state"],
+            if any(
+                event.get("type")
+                in {
+                    "compact_complete",
+                    "compact_replace",
+                    "context_cleared",
+                    "system_prompt_set",
+                }
+                for event in tail
+            ):
+                continue
+            pending = {
+                message.get("metadata", {}).get("job_id")
+                for message in messages
+                if message.get("metadata", {}).get("tool_result_phase") == "pending"
+            }
+            if keep_delivered_pending:
+                pending -= delivered_jobs(messages)
+            if any(
+                event.get("type") == "tool_result"
+                and event.get("event_id") not in covered
+                and (event.get("call_id") or event.get("job_id")) in pending
+                for event in events
+            ):
+                continue
+            messages.extend(
+                replay(
+                    tail, branch_view=selected, include_metadata=True, resumable=True
+                )
+            )
+            if before_turn is not None:
+                call_ids = {
+                    call.get("id")
+                    for message in messages
+                    for call in message.get("tool_calls") or []
+                }
+                if any(
+                    event.get("type") == "tool_call"
+                    and event.get("event_id") in live_ids
+                    and event.get("event_id") not in covered
+                    and event.get("event_id", 0) > cutoff
+                    and event.get("turn_index", before_turn) < before_turn
+                    and (event.get("tool_call_id") or event.get("call_id"))
+                    not in call_ids
+                    for event in events
+                ):
+                    continue
+            checked_events = [
+                event
+                for event in events
+                if event.get("type") != "tool_result"
+                or event.get("event_id", 0) > cutoff
+            ]
+            if needs_replay(checked_events, selected, snapshot=messages):
+                continue
+            best = {
+                "_header": record,
+                "_last_turn": last_turn,
+                "_whole": whole,
+                "compact_state": deepcopy(record["compact_state"]),
                 "context_cutoff_event_id": cutoff,
                 "selected": selected,
-                "_rank": (last_turn, record["watermark"]),
+                "_rank": rank,
             }
-        )
-    if not candidates:
-        if not repairs:
+        if best is None:
+            if not repairs:
+                return None
+            for _, _, _, cutoff, header in sorted(
+                repairs, key=lambda repair: repair[:3], reverse=True
+            ):
+                record = load_record(store, namespace, header)
+                if record is None:
+                    continue
+                messages = [
+                    deepcopy(message)
+                    for message in record["messages"]
+                    if message["role"] == "system"
+                ]
+                messages.extend(
+                    _replay_context(events, selected, cutoff, before_turn, replay)
+                )
+                return {
+                    "messages": messages,
+                    "compact_state": replayed_compact_state(messages),
+                    "context_cutoff_event_id": cutoff,
+                    "selected": selected,
+                }
             return None
-        _, _, cutoff, record = max(repairs, key=lambda repair: repair[:2])
-        messages = [
-            deepcopy(message)
-            for message in record["messages"]
-            if message["role"] == "system"
+        loaded = prefix = messages = None
+        header = best.pop("_header")
+        loaded = load_record(store, namespace, header)
+        prefix = _prefix(
+            loaded,
+            path_view,
+            before_turn,
+            empty_boundary=_boundary_turn(header, events, path_view, before_turn)
+            is not None,
+        )
+        messages, _ = prefix
+        last_turn, whole = best.pop("_last_turn"), best.pop("_whole")
+        tail = [
+            event
+            for event in events
+            if event.get("event_id") in live_ids
+            and (
+                event.get("event_id", 0) > header["watermark"]
+                if whole
+                else type(event.get("turn_index")) is int
+                and event["turn_index"] > last_turn
+                and (before_turn is None or event["turn_index"] < before_turn)
+            )
         ]
-        messages.extend(_replay_context(events, selected, cutoff, before_turn, replay))
-        return {
-            "messages": messages,
-            "compact_state": replayed_compact_state(messages),
-            "context_cutoff_event_id": cutoff,
-            "selected": selected,
-        }
-    best = max(candidates, key=lambda candidate: candidate["_rank"])
-    best.pop("_rank")
-    return best
+        messages.extend(
+            replay(tail, branch_view=selected, include_metadata=True, resumable=True)
+        )
+        best["messages"] = messages
+        best.pop("_rank")
+        return best

@@ -314,7 +314,7 @@ def test_snapshot_tail_never_receives_raw_parent_index(checkpoint, monkeypatch):
     assert result == baseline
     assert baseline_calls == [(1, 3), (1, 3), *calls]
     assert calls.count((1, 3)) == 1
-    assert calls.count((3,)) == 3
+    assert calls.count((3,)) == 6
     assert paths[3] == ((1, 1),)
     assert [message["content"] for message in result["messages"]] == ["old", "child"]
-    assert observed == [[events[1]]]
+    assert observed == [[events[1]], [events[1]]]

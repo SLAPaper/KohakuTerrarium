@@ -1,6 +1,7 @@
 """Event reads and agent discovery for ``SessionStore``."""
 
 from collections.abc import Iterator
+from contextlib import closing
 from typing import Any
 
 from kohakuterrarium.session.store.events.key_index import EventKeyIndex
@@ -13,6 +14,7 @@ from kohakuterrarium.session.store.events.discovery import (
     discover_attached_agents,
 )
 from kohakuterrarium.session.store.events.values import _iter_event_values
+from kohakuterrarium.session.store.events.cursor import event_rows
 from kohakuterrarium.session.vault.io import key_text, read_prefix, scan_keys
 
 
@@ -21,6 +23,7 @@ class EventReadMixin:
 
     # Owned by the events append part.
     _event_keys: EventKeyIndex
+    _event_seq: dict[str, int]
     global_max_event_id: int
     events: Any
 
@@ -34,12 +37,65 @@ class EventReadMixin:
         return list(self._iter_events(agent, since_event_id))
 
     def _iter_events(
-        self, agent: str, since_event_id: int | None = None
+        self,
+        agent: str,
+        since_event_id: int | None = None,
+        *,
+        shared_paths: bool = False,
+        before_sequence: int | None = None,
+        legacy_keys: frozenset[str] | None = None,
     ) -> Iterator[dict]:
         """Iterate values in physical-key order inside the owning store operation."""
         self._flush_events_cache()
-        keys = scan_keys(self.events, f"{agent}:e")
-        return _iter_event_values(self.events, keys, since_event_id)
+        prefix = f"{agent}:e"
+        keys = []
+        for key in scan_keys(self.events, prefix):
+            text = key_text(key)
+            owner, suffix = text.rsplit(":e", 1)
+            if owner != agent:
+                continue
+            if suffix.isascii() and suffix.isdigit():
+                if before_sequence is not None and int(suffix) >= before_sequence:
+                    continue
+            elif legacy_keys is not None and text not in legacy_keys:
+                continue
+            keys.append(key)
+        return _iter_event_values(
+            self.events, keys, since_event_id, shared_paths=shared_paths
+        )
+
+    def event_sequence_boundary(self, agent: str, *, at_least: int = 0) -> int:
+        """Capture the append bound, ratcheting past any observed legacy rows."""
+        sequence = self._event_seq.get(agent, 0)
+        if at_least > sequence:
+            self._event_seq[agent] = sequence = at_least
+        return sequence
+
+    def capture_event_read_boundary(self, agent: str) -> tuple[int, frozenset[str]]:
+        """Freeze legacy keys when native recovery metadata is unavailable."""
+        self._flush_events_cache()
+        sequence = self.event_sequence_boundary(agent)
+        legacy = set()
+        for key in scan_keys(self.events, f"{agent}:e"):
+            text = key_text(key)
+            owner, suffix = text.rsplit(":e", 1)
+            if owner != agent:
+                continue
+            if suffix.isascii() and suffix.isdigit():
+                sequence = max(sequence, int(suffix) + 1)
+            else:
+                legacy.add(text)
+        return self.event_sequence_boundary(agent, at_least=sequence), frozenset(legacy)
+
+    def get_last_turn_event(self, agent: str) -> dict | None:
+        """Seek backward in bounded pages to the latest turn-bearing event."""
+        self._flush_events_cache()
+        with closing(event_rows(self, agent, reverse=True)) as rows:
+            for _, event in rows:
+                turn = event.get("turn_index") if isinstance(event, dict) else None
+                if isinstance(turn, int) and turn > 0:
+                    return event
+        return None
 
     def max_event_id(self, agent: str) -> int:
         """Return the session-global max ``event_id`` (monotonic, per-session).

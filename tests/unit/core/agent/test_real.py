@@ -17,6 +17,9 @@ and using a `OutputRecorder` as the default output module.
 """
 
 import asyncio
+from kohakuterrarium.session.resume.history import stage_output_history
+from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.builtins.outputs.none import NoneOutput
 import time
 from unittest.mock import AsyncMock
 
@@ -1876,7 +1879,7 @@ class TestDriveInput:
 
     async def test_drive_input_waits_when_generic_input_returns_none(self):
         agent = Agent.__new__(Agent)
-        agent._pending_resume_events = None
+        agent._resume_history = None
         agent._pending_resume_triggers = None
         agent._startup_settled = asyncio.Event()
         agent._fire_startup_trigger = AsyncMock()
@@ -2496,62 +2499,36 @@ class TestEmergencyDrop:
 
 
 class TestPendingResume:
-    async def test_drive_input_emits_resume_batch(self, make_agent):
+    async def test_drive_input_emits_resume_batch(self, make_agent, tmp_path):
         agent = make_agent(script=["ack"])
-        agent._pending_resume_events = [{"type": "user_input", "content": "old"}]
-        emitted = []
+        store = SessionStore(tmp_path / "replay.kohakutr")
+        store.append_event(agent.config.name, "user_input", {"content": "old"})
+        batches = []
 
-        class _Router:
-            async def start(self):
-                pass
+        class Recorder(NoneOutput):
+            async def on_resume(self, events):
+                batches.append(events)
 
-            async def stop(self):
-                pass
+        agent.output_router.default_output = Recorder()
+        stage_output_history(
+            agent, store, agent.config.name, store.get_events(agent.config.name)
+        )
 
-            async def flush(self):
-                pass
-
-            async def on_processing_start(self):
-                pass
-
-            async def on_processing_end(self):
-                pass
-
-            async def emit(self, event):
-                emitted.append(event)
-
-            def notify_activity(self, *a, **kw):
-                pass
-
-            default_output = None
-
-            def reset(self):
-                pass
-
-        agent.output_router = _Router()
-
-        class _ExitInput:
-            async def start(self):
-                pass
-
-            async def stop(self):
-                pass
-
-            @property
-            def exit_requested(self):
-                return True
+        class ExitInput:
+            exit_requested = True
 
             async def get_input(self):
                 return None
 
-        agent.input = _ExitInput()
+        agent.input = ExitInput()
         agent._running = True
         try:
             await agent._drive_input()
-            # resume_batch event emitted.
-            assert any(e.type == "resume_batch" for e in emitted)
+            assert [[e["content"] for e in batch] for batch in batches] == [["old"]]
+            assert agent._resume_history is None
         finally:
             agent._running = False
+            store.close()
 
 
 # ── Subagent dispatch via real Agent + registered sub-agent ─────

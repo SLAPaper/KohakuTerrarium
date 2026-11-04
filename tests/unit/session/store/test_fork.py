@@ -526,17 +526,67 @@ class TestForkDriveTablePurge:
         try:
             s.append_event("alice", "x", {})
             s.save_state("alice", scratchpad={"k": "v"}, turn_count=3)
+            s.state["plugin:example:recovery_context"] = {"value": "keep context"}
+            s.state["plugin:example:recovery_receipt"] = {"value": "keep receipt"}
+            for suffix in [
+                "recovery_context",
+                "recovery_receipt",
+                "history_projection:stdout-v3",
+            ]:
+                s.state[f"alice:{suffix}"] = "retired cache"
             s.save_channel_message("ch", {"content": "hello world"})
             s.flush()
             child = perform_fork(s, str(tmp_path / "child.kohakutr"), at_event_id=1)
             try:
                 assert child.load_scratchpad("alice") == {"k": "v"}
                 assert child.load_turn_count("alice") == 3
+                assert child.state["plugin:example:recovery_context"] == {
+                    "value": "keep context"
+                }
+                assert child.state["plugin:example:recovery_receipt"] == {
+                    "value": "keep receipt"
+                }
+                assert all(
+                    child.state[f"alice:{suffix}"] == "retired cache"
+                    for suffix in [
+                        "recovery_context",
+                        "recovery_receipt",
+                        "history_projection:stdout-v3",
+                    ]
+                )
                 assert child.get_channel_messages("ch")[0]["content"] == ("hello world")
             finally:
                 child.close(update_status=False)
         finally:
             s.close()
+
+    def test_omitted_namespace_state_survives_fork_and_writable_reopen(self, tmp_path):
+        source = _store(tmp_path)
+        child_namespace = "a:history_projection"
+        target = tmp_path / "omitted-child.kohakutr"
+        try:
+            source.meta["agents"] = ["a"]
+            source.append_event("a", "x", {})
+            source.append_event(child_namespace, "x", {})
+            source.save_state(
+                child_namespace, turn_count=7, scratchpad={"keep": "value"}
+            )
+            source.state[f"{child_namespace}:recovery_context"] = "retired"
+            child = perform_fork(source, target, at_event_id=1)
+            try:
+                assert child.load_turn_count(child_namespace) == 7
+                assert child.load_scratchpad(child_namespace) == {"keep": "value"}
+                assert child.state[f"{child_namespace}:recovery_context"] == "retired"
+            finally:
+                child.close(update_status=False)
+            reopened = SessionStore(target)
+            try:
+                assert reopened.load_turn_count(child_namespace) == 7
+                assert reopened.load_scratchpad(child_namespace) == {"keep": "value"}
+            finally:
+                reopened.close(update_status=False)
+        finally:
+            source.close(update_status=False)
 
     def test_parent_forked_children_not_inherited_by_child(self, tmp_path):
         # ``forked_children`` is parent-local bookkeeping — when the

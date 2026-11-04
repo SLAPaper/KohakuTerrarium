@@ -3168,7 +3168,7 @@ class TestCoreIntegration:
                         assert agent._parent_branch_path == [(1, 1), (2, 1), (3, 1)]
                         assert agent._context_cutoff_event_id == 0
                         pending = cold_store.get_resumable_events("settled")
-                        assert agent._pending_resume_events == pending
+                        assert agent._resume_history.read() == pending
                         repaired_messages = copy.deepcopy(
                             [
                                 dict(m.to_dict(), metadata=m.metadata)
@@ -3181,7 +3181,7 @@ class TestCoreIntegration:
                             dict(m.to_dict(), metadata=m.metadata)
                             for m in agent.controller.conversation.get_messages()
                         ] == repaired_messages
-                        assert agent._pending_resume_events == pending
+                        assert agent._resume_history.read() == pending
                         assert agent._context_cutoff_event_id == 0
                         assert (agent._turn_index, agent._branch_id) == (4, 1)
                         assert agent._parent_branch_path == [(1, 1), (2, 1), (3, 1)]
@@ -3301,7 +3301,7 @@ class TestCoreIntegration:
                     ] == full_selected
                     assert restored._context_cutoff_event_id == saved_cutoff
                     assert (
-                        restored._pending_resume_events
+                        restored._resume_history.read()
                         == store.get_resumable_events("settled")
                     )
                     await restored.start()

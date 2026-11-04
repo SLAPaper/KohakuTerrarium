@@ -68,6 +68,7 @@ class SessionStore(
         self._init_events(flush_every_n_events, flush_every_n_seconds)
         self._init_channels()
         self._init_subagents()
+        self._init_conversation_records()
 
         # Construction failures must not strand tables or the writer lock.
         try:

@@ -21,9 +21,7 @@ from kohakuterrarium.modules.input.base import InputModule
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.packages.resolve import resolve_any_path
 from kohakuterrarium.session.history.replay import (
-    dedupe_adjacent_duplicate_events,
     index_parent_paths,
-    normalize_resumable_events,
     resolve_selected_branches,
 )
 from kohakuterrarium.session.resume.open import (
@@ -43,6 +41,8 @@ from kohakuterrarium.session.resume.branch import (
 from kohakuterrarium.session.resume.build import (
     build_conversation as _build_conversation,
 )
+from kohakuterrarium.session.history.read import read_restore_events
+from kohakuterrarium.session.resume.history import stage_output_history
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.utils.logging import get_logger
 
@@ -110,9 +110,8 @@ def _load_conversation_result(
     prepared: dict | None | object = _UNPREPARED,
 ) -> _LoadedConversation:
     """Load messages with full-replay provenance for this restoration."""
-    snapshot = store.load_conversation(agent_name)
     if events is None:
-        events = store.get_events(agent_name)
+        events = read_restore_events(store, agent_name)
     if prepared is _UNPREPARED:
         prepared = prepare_saved_snapshot(store, agent_name, events)
     if prepared:
@@ -128,6 +127,7 @@ def _load_conversation_result(
             return _LoadedConversation(replayed, bool(replayed), branch_view)
     except (KeyError, TypeError, AttributeError):
         pass
+    snapshot = store.load_conversation(agent_name)
     if not events:
         return _LoadedConversation(snapshot)
     last_event_id = 0
@@ -232,7 +232,7 @@ def _restore_turn_branch_state(
     """
     if events is None:
         try:
-            events = store.get_events(agent_name)
+            events = read_restore_events(store, agent_name)
         except Exception as e:
             logger.warning(
                 "Failed to read events for turn/branch restore",
@@ -245,6 +245,11 @@ def _restore_turn_branch_state(
     parent_paths = index_parent_paths(events_list)
     persisted = load_persisted_branch_view(store, agent_name)
     selected = resolve_selected_branches(events_list, parent_paths, persisted)
+    _install_branch_state(agent, selected, agent_name)
+
+
+def _install_branch_state(agent, selected: dict[int, int], agent_name: str) -> None:
+    """Install a validated selected lineage without reading historical payloads."""
     if not selected:
         return
     max_turn = max(selected.keys())
@@ -326,8 +331,7 @@ def _reapply_options(agent: Any, agent_name: str, attribute: str) -> None:
 def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
     """Restore identity, conversation, branch state, scratchpad, and pending work."""
     align_agent_name(agent, agent_name)
-    # One raw event read serves every restoration step.
-    events = store.get_events(agent_name)
+    events = read_restore_events(store, agent_name)
     prepared = prepare_saved_snapshot(store, agent_name, events)
     agent._context_cutoff_event_id = (
         prepared.get("context_cutoff_event_id", 0) if prepared is not None else 0
@@ -386,11 +390,7 @@ def inject_saved_state(agent, store: SessionStore, agent_name: str) -> None:
     _reapply_options(agent, agent_name, "native_tool_options")
     _reapply_options(agent, agent_name, "tool_options")
 
-    # Match SessionStore.get_resumable_events using the shared raw read.
-    resume_events = normalize_resumable_events(dedupe_adjacent_duplicate_events(events))
-    if resume_events:
-        agent._pending_resume_events = resume_events
-        logger.info("Resume events loaded", agent=agent_name, count=len(resume_events))
+    stage_output_history(agent, store, agent_name, events)
 
     saved_triggers = store.load_triggers(agent_name)
     if saved_triggers:

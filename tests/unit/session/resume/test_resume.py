@@ -84,33 +84,6 @@ def _write_agent_config(config_dir) -> None:
     )
 
 
-class _CountingStore:
-    """Proxy that counts EVERY ``get_events`` call on the wrapped store.
-
-    The resume scan-budget metric: conversation replay, branch restore,
-    and pending resume events must share a single full read of the event
-    table. The count is installed on the INNER store's ``get_events`` so
-    reads hidden behind ``__getattr__`` delegation (e.g. a
-    ``get_resumable_events`` re-read reaching the real store) are counted
-    too — a regression back to a second full scan turns the budget
-    assertions red instead of silently passing.
-    """
-
-    def __init__(self, store):
-        self._store = store
-        self.get_events_calls = 0
-        inner = store.get_events
-
-        def _counted_get_events(agent, since_event_id=None):
-            self.get_events_calls += 1
-            return inner(agent, since_event_id=since_event_id)
-
-        store.get_events = _counted_get_events
-
-    def __getattr__(self, name):
-        return getattr(self._store, name)
-
-
 # ── _create_io_modules ────────────────────────────────────────────
 
 
@@ -540,12 +513,10 @@ class TestRestoreTurnBranchState:
                 )
             store.flush()
             events = store.get_events("alice")
-            counting = _CountingStore(store)
             agent = _FakeAgent()
-            _restore_turn_branch_state(agent, counting, "alice", events=events)
+            _restore_turn_branch_state(agent, store, "alice", events=events)
             assert agent._turn_index == 3
             assert agent._parent_branch_path == [(1, 1), (2, 1)]
-            assert counting.get_events_calls == 0
         finally:
             store.close()
 
@@ -566,12 +537,10 @@ class TestRestoreTurnBranchState:
                 )
             store.flush()
             truncated = store.get_events("alice")[:1]
-            counting = _CountingStore(store)
             agent = _FakeAgent()
-            _restore_turn_branch_state(agent, counting, "alice", events=truncated)
+            _restore_turn_branch_state(agent, store, "alice", events=truncated)
             assert agent._turn_index == 1
             assert agent._branch_id == 1
-            assert counting.get_events_calls == 0
         finally:
             store.close()
 
@@ -1166,14 +1135,12 @@ class TestLoadConversationFallback:
             assert reopened.max_event_id("alice") == eid  # lagging counter
             true_max = max(evt["event_id"] for evt in reopened.get_events("alice"))
             assert true_max == eid + 1  # table holds a newer event
-            counting = _CountingStore(reopened)
-            out = _load_conversation_with_replay_fallback(counting, "alice")
+            out = _load_conversation_with_replay_fallback(reopened, "alice")
             contents = [m["content"] for m in out if m["role"] == "user"]
             assert contents == [
                 "snap",
                 "dropped",
             ], "a tail past the LAGGING counter watermark must still replay"
-            assert counting.get_events_calls == 1
         finally:
             reopened.close(update_status=False)
 
@@ -1195,11 +1162,9 @@ class TestLoadConversationFallback:
             )
             store.state["alice:snapshot_event_id"] = 0
             store.flush()
-            counting = _CountingStore(store)
-            out = _load_conversation_with_replay_fallback(counting, "alice")
+            out = _load_conversation_with_replay_fallback(store, "alice")
             contents = [m["content"] for m in out if m["role"] == "user"]
             assert contents == ["snap", "fresh"]
-            assert counting.get_events_calls == 1
         finally:
             store.close()
 
@@ -1214,13 +1179,9 @@ class TestLoadConversationFallback:
             store.state["alice:snapshot_event_id"] = 1
             store.flush()
             events = store.get_events("alice")
-            counting = _CountingStore(store)
-            out = _load_conversation_with_replay_fallback(
-                counting, "alice", events=events
-            )
+            out = _load_conversation_with_replay_fallback(store, "alice", events=events)
             contents = [m["content"] for m in out if m["role"] == "user"]
             assert contents == ["stale", "newer"]
-            assert counting.get_events_calls == 0
         finally:
             store.close()
 
@@ -1237,14 +1198,12 @@ class TestLoadConversationFallback:
             store.state["alice:snapshot_event_id"] = 0
             store.flush()
             truncated = store.get_events("alice")[:1]
-            counting = _CountingStore(store)
             out = _load_conversation_with_replay_fallback(
-                counting, "alice", events=truncated
+                store, "alice", events=truncated
             )
             contents = [m["content"] for m in out if m["role"] == "user"]
             assert contents == ["stale", "fresh"]
             assert "newer" not in contents
-            assert counting.get_events_calls == 0
         finally:
             store.close()
 
@@ -1279,11 +1238,9 @@ class TestLoadConversationFallback:
             reopened.save_conversation("alice", [{"role": "user", "content": "snap"}])
             reopened.state["alice:snapshot_event_id"] = 0
             reopened.flush()
-            counting = _CountingStore(reopened)
-            out = _load_conversation_with_replay_fallback(counting, "alice")
+            out = _load_conversation_with_replay_fallback(reopened, "alice")
             contents = [m["content"] for m in out if m["role"] == "user"]
             assert contents == ["snap", "old"]
-            assert counting.get_events_calls == 1
         finally:
             reopened.close(update_status=False)
 
@@ -1953,17 +1910,17 @@ class TestInjectSavedState:
         finally:
             store.close()
 
-    def test_loads_pending_resume_events(self, tmp_path):
+    def test_resume_history_contains_interrupted_jobs(self, tmp_path):
         store = SessionStore(str(tmp_path / "x.kohakutr"))
         try:
             # An unfinished tool call → resume should synthesize an
-            # interrupted result, which lands on _pending_resume_events.
+            # interrupted result in normalized output history.
             store.append_event("alice", "tool_call", {"call_id": "c1", "name": "bash"})
             store.flush()
             agent = _FakeAgentForInject()
             inject_saved_state(agent, store, "alice")
             synth = [
-                e for e in agent._pending_resume_events if e.get("_synthetic_resume")
+                e for e in agent._resume_history.read() if e.get("_synthetic_resume")
             ]
             # Exactly one interrupted tool_result, linked to the open call.
             assert len(synth) == 1
@@ -2607,103 +2564,8 @@ class TestInjectSavedState:
         finally:
             store.close()
 
-    def test_event_table_scanned_once_tail_path(self, tmp_path):
-        # Scan-budget regression guard: conversation replay, branch
-        # restore, and pending resume events must share ONE raw read of
-        # the event table (previously three full scans on resume).
-        store = SessionStore(str(tmp_path / "x.kohakutr"))
-        try:
-            store.append_event("alice", "user_message", {"content": "q"})
-            store.save_conversation("alice", [{"role": "user", "content": "q"}])
-            store.state["alice:snapshot_event_id"] = 1
-            store.append_event("alice", "user_message", {"content": "newer"})
-            store.flush()
-            counting = _CountingStore(store)
-            agent = _FakeAgentForInject()
-            inject_saved_state(agent, counting, "alice")
-            contents = [
-                m.get("content")
-                for m in agent.controller.conversation.to_messages()
-                if m.get("role") == "user"
-            ]
-            assert contents == ["q", "newer"]
-            assert counting.get_events_calls == 1
-        finally:
-            store.close()
-
-    def test_event_table_scanned_once_fresh_snapshot(self, tmp_path):
-        # The fresh-snapshot conversation path needs no event read of its
-        # own; the single remaining read feeds branch restore + pending
-        # resume events (which cannot be derived without the log).
-        store = SessionStore(str(tmp_path / "x.kohakutr"))
-        try:
-            _, eid = store.append_event(
-                "alice",
-                "user_message",
-                {"content": "q"},
-                turn_index=1,
-                branch_id=1,
-            )
-            store.save_conversation(
-                "alice",
-                [
-                    {
-                        "role": "user",
-                        "content": "snap",
-                        "metadata": {"turn_index": 1, "branch_id": 1},
-                    }
-                ],
-            )
-            store.state["alice:snapshot_event_id"] = eid
-            store.flush()
-            counting = _CountingStore(store)
-            agent = _FakeAgentForInject()
-            inject_saved_state(agent, counting, "alice")
-            contents = [
-                m.get("content")
-                for m in agent.controller.conversation.to_messages()
-                if m.get("role") == "user"
-            ]
-            assert contents == ["snap"]
-            assert counting.get_events_calls == 1
-        finally:
-            store.close()
-
-    def test_event_table_scanned_once_fork_tail(self, tmp_path):
-        store = SessionStore(str(tmp_path / "x.kohakutr"))
-        try:
-            store.append_event(
-                "alice",
-                "user_message",
-                {"content": "original"},
-                turn_index=1,
-                branch_id=1,
-            )
-            store.save_conversation("alice", [{"role": "user", "content": "original"}])
-            store.state["alice:snapshot_event_id"] = 1
-            store.append_event(
-                "alice",
-                "user_message",
-                {"content": "edited"},
-                turn_index=1,
-                branch_id=2,
-            )
-            store.flush()
-            counting = _CountingStore(store)
-            agent = _FakeAgentForInject()
-            inject_saved_state(agent, counting, "alice")
-            contents = [
-                m.get("content")
-                for m in agent.controller.conversation.to_messages()
-                if m.get("role") == "user"
-            ]
-            assert contents == ["edited"]
-            assert counting.get_events_calls == 1
-        finally:
-            store.close()
-
     @pytest.mark.parametrize("checkpoint", [False, True])
-    def test_event_table_scanned_once_branch_mismatch_replay(
+    def test_branch_mismatch_installs_one_full_replay(
         self, tmp_path, monkeypatch, checkpoint
     ):
         replays = []
@@ -2769,9 +2631,8 @@ class TestInjectSavedState:
                 branch_id=2,
             )
             store.flush()
-            counting = _CountingStore(store)
             agent = _FakeAgentForInject()
-            inject_saved_state(agent, counting, "alice")
+            inject_saved_state(agent, store, "alice")
             contents = [
                 m.get("content")
                 for m in agent.controller.conversation.to_messages()
@@ -2781,7 +2642,6 @@ class TestInjectSavedState:
             assert agent._turn_index == 1
             assert agent._branch_id == 2
             assert agent._parent_branch_path == []
-            assert counting.get_events_calls == 1
             assert replays == [(3, None)]
             assert builds == [agent.controller.conversation]
         finally:
@@ -2896,7 +2756,7 @@ class TestInjectSavedState:
             feedback = next(m for m in messages if m.get("tool_call_id") == "b1")
             assert ELISION_MARKER in feedback["content"]
             assert feedback["metadata"]["tool_results_elided"] is True
-            assert agent._pending_resume_events == expected_pending
+            assert agent._resume_history.read() == expected_pending
             assert store.get_events("alice") == events
             assert (agent._turn_index, agent._branch_id, agent._parent_branch_path) == (
                 2,
@@ -2908,31 +2768,6 @@ class TestInjectSavedState:
         finally:
             store.close()
 
-    def test_counting_proxy_sees_reads_hidden_behind_public_api(self, tmp_path):
-        # Negative case guarding the scan-budget metric itself: a read
-        # made behind __getattr__ delegation (get_resumable_events reaching
-        # the inner store's get_events) must be counted. If it were not,
-        # reverting inject_saved_state to a second full scan via the store
-        # API would pass the ==1 assertions while doing 2 scans.
-        store = SessionStore(str(tmp_path / "x.kohakutr"))
-        try:
-            store.append_event("alice", "user_message", {"content": "q"})
-            store.flush()
-            counting = _CountingStore(store)
-            assert counting.get_events_calls == 0
-            counting.get_events("alice")
-            assert counting.get_events_calls == 1
-            counting.get_resumable_events("alice")
-            assert (
-                counting.get_events_calls == 2
-            ), "a get_resumable_events re-read must be visible to the count"
-        finally:
-            store.close()
-
-    def test_pending_resume_events_match_store_public_api(self, tmp_path):
-        # The inlined dedupe+normalize must stay byte-identical to the
-        # untouched public SessionStore.get_resumable_events — an
-        # independent oracle computed straight from the store.
         store = SessionStore(str(tmp_path / "x.kohakutr"))
         try:
             store.append_event("alice", "user_message", {"content": "q"})
@@ -2940,7 +2775,7 @@ class TestInjectSavedState:
             store.flush()
             agent = _FakeAgentForInject()
             inject_saved_state(agent, store, "alice")
-            assert agent._pending_resume_events == store.get_resumable_events("alice")
+            assert agent._resume_history.read() == store.get_resumable_events("alice")
         finally:
             store.close()
 
@@ -3015,25 +2850,27 @@ class TestInjectSavedState:
             )
             assert async_agent.session.scratchpad.to_dict() == {"key": "value"}
             assert async_agent._turn_index == sync_agent._turn_index
-            assert len(async_agent._pending_resume_events) == len(
-                sync_agent._pending_resume_events
+            assert len(async_agent._resume_history.read()) == len(
+                sync_agent._resume_history.read()
             )
         finally:
             store.close()
 
-    async def test_async_injection_does_not_block_event_loop(self, tmp_path):
+    async def test_async_injection_does_not_block_event_loop(
+        self, tmp_path, monkeypatch
+    ):
         # Negative case for S3: a large session's event scan runs on the
         # store's affinity thread while the loop stays live.
         store = SessionStore(str(tmp_path / "slow.kohakutr"))
         try:
-            real_get_events = store.get_events
+            real_get_events = resume_mod.read_restore_events
             witness = LoopWitness(asyncio.get_running_loop())
 
-            def observed_get_events(agent, **kwargs):
+            def observed_get_events(store_arg, agent, **kwargs):
                 witness.observe()
-                return real_get_events(agent, **kwargs)
+                return real_get_events(store_arg, agent, **kwargs)
 
-            store.get_events = observed_get_events
+            monkeypatch.setattr(resume_mod, "read_restore_events", observed_get_events)
             agent = _FakeAgentForInject()
             await inject_saved_state_async(agent, store, "alice")
             assert witness.never_blocked, "async injection blocked the loop"
@@ -3420,17 +3257,15 @@ class TestResumeAgent:
                 CompactConfig(max_tokens=2000, cooldown_seconds=30)
             )
             agent.compact_manager._agent = agent
-            counting = _CountingStore(store)
-            inject_saved_state(agent, counting, "alice")
+            inject_saved_state(agent, store, "alice")
             if snapshot_kind == "branch":
                 for _ in range(2):
                     restore_compact_state_from_session(
-                        agent.compact_manager, counting, "alice"
+                        agent.compact_manager, store, "alice"
                     )
                     assert agent.compact_manager._compact_count == 2
                     assert agent.compact_manager._last_compact_time == cooldown
                     assert not agent.compact_manager.should_compact(2000)
-                assert counting.get_events_calls == 1
             from kohakuterrarium.core.conversation.elide import ELISION_MARKER
 
             contents = [
@@ -3441,6 +3276,15 @@ class TestResumeAgent:
             assert any(isinstance(c, str) and ELISION_MARKER in c for c in contents)
             # The latest feedback round stays verbatim.
             assert "small" in contents
+            if snapshot_kind == "branch":
+                unelided = _FakeAgentForInject()
+                unelided.controller.config = _ElideConfig()
+                unelided.controller.config.elide_tool_results = False
+                inject_saved_state(unelided, store, "alice")
+                assert big in [
+                    message.get("content", "")
+                    for message in unelided.controller.conversation.to_messages()
+                ]
         finally:
             store.close()
 

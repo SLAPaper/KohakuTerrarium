@@ -2,7 +2,50 @@
 
 from copy import deepcopy
 
+from kohakuterrarium.session.history.ancestry import BranchAncestry, SharedPath
 from kohakuterrarium.session.history.assistant import project_assistant_rounds
+from kohakuterrarium.session.history.assistant import iter_assistant_rounds
+
+
+def test_shared_round_lineage_is_compared_without_expansion(monkeypatch):
+    tree = BranchAncestry()
+    path = tree.view(tree.intern([[t, 1] for t in range(1, 2001)]))
+    events = [
+        _evt(1, "assistant_round_start", parent_branch_path=path),
+        _evt(
+            2,
+            "assistant_message",
+            parent_branch_path=path,
+            round_start_event_id=1,
+            message=_message(),
+        ),
+    ]
+
+    def expanded(self):
+        raise AssertionError("Assistant lineage expanded shared ancestry")
+
+    monkeypatch.setattr(SharedPath, "__iter__", expanded)
+    projected = project_assistant_rounds(events)
+    assert projected[0]["type"] == "assistant_message"
+    assert projected[0]["parent_branch_path"] is path
+
+
+def test_internal_projection_borrows_only_unchanged_events():
+    events = [
+        _evt(1, "assistant_round_start"),
+        _evt(2, "text_chunk", content="display"),
+        _evt(3, "assistant_message", round_start_event_id=1, message=_message()),
+        _evt(4, "processing_end"),
+    ]
+    original = deepcopy(events)
+    projected = list(iter_assistant_rounds(events))
+    assert projected == project_assistant_rounds(events)
+    assert projected[-1] is events[-1]
+    assert all(projected[i] is not events[i] for i in range(3))
+    projected[0]["message"]["content"] = "edited projection"
+    assert events == original
+    public = project_assistant_rounds(events)
+    assert all(a is not b for a, b in zip(public, events))
 
 
 def _evt(event_id, etype, **kwargs):

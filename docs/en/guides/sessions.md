@@ -604,6 +604,39 @@ No `.kohakutr` is created. This also disables compaction's ability to recover pr
 - **Large `.kohakutr` files.** The event log is append-only; long sessions grow. Archive old ones or split work across sessions. Compaction shrinks the live conversation but keeps the full event history for search.
 - **Sub-agent output missing from resume.** Sub-agent conversations are saved when the sub-agent completes. If the parent was interrupted mid-sub-agent, the latest snapshot is whatever was persisted at the last checkpoint.
 
+## Cold recovery and large histories
+
+Recovery builds temporary event descriptors containing small metadata, shared
+ancestry and payload locations. The initial scan still decodes historical
+records because metadata and bodies share one stored value. Reads are paged by
+64 rows and 1 MiB of encoded values, with a single oversized record allowed.
+Later body lookups load only the requested event and retain one decoded event.
+These limits bound batches, not total process memory; descriptors, the restored
+conversation, legacy inline catalogs and native caches also occupy memory.
+
+Branch checkpoints use versioned headers and separate message payloads.
+Recovery validates candidate bodies one at a time, keeps the best reference,
+and reloads the winner. Readers accept legacy inline records and version 2
+message references. Older releases can still read the latest conversation
+mirror, but cannot interpret the reference-based branch catalog. Downgrading
+does not preserve those branch checkpoints; keep a pre-upgrade archive when
+historical checkpoints must remain readable by an older release. Raw event
+ancestry keeps its existing list format.
+
+Headless outputs defer display-history preparation. A later terminal reads
+through the captured namespace append boundary, including opaque legacy keys.
+The physical boundary is independent of logical event IDs, so later mirrored
+events retaining lower IDs cannot enter an earlier replay. Each operation
+reads fresh metadata within that boundary, allowing raw event rewrites to be
+observed between operations.
+
+Stdout prepares bounded turn previews from recorded display events, with the
+existing 200-character assistant preview. Legacy output callbacks still receive
+ordinary event dictionaries, complete recovery announcements and interruption
+records, and mutable path lists. Built-in terminal renderers can share ancestry
+internally. Normal checkpoints save their required snapshots and runtime state;
+recovery does not publish a separate context, receipt or rendered-output cache.
+
 ## See also
 
 - [Memory](memory.md): FTS, semantic, and hybrid search over session history.

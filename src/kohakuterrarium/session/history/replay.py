@@ -1,7 +1,6 @@
 """Normalize, branch-select, and replay persisted session events."""
 
-import json
-from collections.abc import Hashable
+from collections.abc import Iterator
 from typing import Any, Iterable
 
 from kohakuterrarium.core.compact.branch import (
@@ -12,12 +11,14 @@ from kohakuterrarium.core.jobs.label import canonical_tool_name, make_job_label
 from kohakuterrarium.llm.message import coalesce_user_contents
 from kohakuterrarium.session.history.assistant import (
     _coerce_tool_args_to_json,
-    assistant_round_messages,
-    project_assistant_rounds,
+    assistant_round_call_ids,
+    iter_assistant_rounds,
+    project_assistant_rounds as project_assistant_rounds,
     replay_assistant_event,
 )
 from kohakuterrarium.session.history.branch_paths import (  # noqa: F401 - re-exported
     InvalidBranchViewError,
+    ParentPath,
     _coerce_branch_view,
     _coerce_path,
     _path_matches,
@@ -25,6 +26,11 @@ from kohakuterrarium.session.history.branch_paths import (  # noqa: F401 - re-ex
     resolve_branch_view_strict,
 )
 from kohakuterrarium.session.history.selection import SelectionCompatibility
+from kohakuterrarium.session.history.signature import (
+    SignatureValues,
+    event_signature,
+    _event_signature_value,
+)
 
 # Parent paths identify the selected branches of earlier turns. Legacy events
 # derive this ancestry from event order when no explicit path was persisted.
@@ -32,7 +38,7 @@ from kohakuterrarium.session.history.selection import SelectionCompatibility
 
 def resolve_selected_branches(
     events_list: list[dict[str, Any]],
-    parent_paths: dict[int, tuple[tuple[int, int], ...]],
+    parent_paths: dict[int, ParentPath],
     branch_view: dict[int, int] | None,
 ) -> dict[int, int]:
     """Pick a live branch for each turn while respecting nested paths.
@@ -43,7 +49,7 @@ def resolve_selected_branches(
     Public: shared by replay selection and ``session.resume`` branch-state
     restore.
     """
-    branches_by_turn: dict[int, list[tuple[int, int]]] = {}
+    branches_by_turn: dict[int, list[tuple[ParentPath, int]]] = {}
     for evt in events_list:
         ti = evt.get("turn_index")
         bi = evt.get("branch_id")
@@ -85,7 +91,7 @@ def project_branch_metadata(
     events_list = list(events)
     selected = resolve_branch_view_strict(events_list, branch_view)
     parent_paths = index_parent_paths(events_list)
-    branches: dict[int, dict[int, set[tuple[tuple[int, int], ...]]]] = {}
+    branches: dict[int, dict[int, set[ParentPath]]] = {}
 
     for evt in events_list:
         if evt.get("type") not in ("user_message", "user_input"):
@@ -215,7 +221,7 @@ def select_live_event_ids(
     events: Iterable[dict[str, Any]],
     *,
     branch_view: dict[int, int] | None = None,
-    parent_paths: dict[int, tuple[tuple[int, int], ...]] | None = None,
+    parent_paths: dict[int, ParentPath] | None = None,
 ) -> set[int]:
     """Return the event_ids that belong to the live subtree.
 
@@ -249,14 +255,6 @@ def select_live_event_ids(
     return live
 
 
-def _event_signature_value(value: Any) -> Hashable:
-    try:
-        hash(value)
-    except TypeError:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-    return value
-
-
 def dedupe_adjacent_duplicate_events(
     events: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -266,21 +264,30 @@ def dedupe_adjacent_duplicate_events(
     identifiers and timestamps. Replay consumers collapse them while the raw log
     remains unchanged.
     """
-    out: list[dict[str, Any]] = []
-    previous_signature: tuple[tuple[str, Hashable], ...] | None = None
-    for evt in events:
-        signature = tuple(
-            sorted(
-                (k, _event_signature_value(v))
-                for k, v in evt.items()
-                if k not in {"event_id", "ts"}
-            )
-        )
-        if signature == previous_signature:
-            continue
-        out.append(evt)
-        previous_signature = signature
-    return out
+    return list(iter_deduplicated_events(events))
+
+
+def iter_deduplicated_events(
+    events: Iterable[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
+    """Yield adjacent-distinct events while retaining only the preceding signature."""
+    previous, previous_hash, previous_signature = None, None, None
+    signature_value = SignatureValues(_event_signature_value)
+    for event in events:
+        signature = None
+        fingerprint = getattr(event, "_signature_hash", None)
+        if fingerprint is None:
+            signature = event_signature(event, signature_value)
+            fingerprint = hash(signature)
+        if previous is not None and fingerprint == previous_hash:
+            if previous_signature is None:
+                previous_signature = event_signature(previous, signature_value)
+            if signature is None:
+                signature = event_signature(event, signature_value)
+            if signature == previous_signature:
+                continue
+        yield event
+        previous, previous_hash, previous_signature = event, fingerprint, signature
 
 
 def _clean_tool_name(evt: dict) -> str:
@@ -318,34 +325,29 @@ def compact_replacement_rules(
     events: list[dict[str, Any]],
     branch_view: dict[int, int] | None = None,
     *,
-    parent_paths: dict[int, tuple[tuple[int, int], ...]] | None = None,
+    parent_paths: dict[int, ParentPath] | None = None,
 ) -> list[CompactRule]:
     """Select summary ranges; supplied paths must match unchanged events and order."""
     if parent_paths is None:
         parent_paths = index_parent_paths(events)
     selected = resolve_selected_branches(events, parent_paths, branch_view)
     selected_pairs = set(selected.items())
-    rules = [
-        rule for evt in events if (rule := compact_rule_from_event(evt)) is not None
-    ]
-    eligible = [r for r in rules if _rule_priority(r, selected_pairs)[0] > 0]
-    return (
-        [
-            max(
-                enumerate(eligible),
-                key=lambda item: (*_rule_priority(item[1], selected_pairs), item[0]),
-            )[1]
-        ]
-        if eligible
-        else []
-    )
+    best, rank = None, None
+    for position, event in enumerate(events):
+        rule = compact_rule_from_event(event)
+        if rule is None:
+            continue
+        priority = _rule_priority(rule, selected_pairs)
+        if priority[0] > 0 and (rank is None or (*priority, position) > rank):
+            best, rank = rule, (*priority, position)
+    return [best] if best is not None else []
 
 
 def compact_covered_event_ids(
     events: list[dict[str, Any]],
     branch_view: dict[int, int] | None = None,
     *,
-    parent_paths: dict[int, tuple[tuple[int, int], ...]] | None = None,
+    parent_paths: dict[int, ParentPath] | None = None,
 ) -> set[int]:
     """Return covered identities; supplied paths must match unchanged events and order."""
     rules = compact_replacement_rules(events, branch_view, parent_paths=parent_paths)
@@ -486,7 +488,7 @@ def replay_conversation(
             replaced_rules,
         )
     }
-    for evt in project_assistant_rounds(events_list, eligible_ids):
+    for evt in iter_assistant_rounds(events_list, eligible_ids):
         etype = evt.get("type", "")
         eid = evt.get("event_id")
 
@@ -680,15 +682,12 @@ def _inject_synthetic_announcements(
         pending.clear()
 
     eligible = {evt.get("event_id") for evt in events} - (covered_event_ids or set())
-    canonical = assistant_round_messages(events, eligible)
+    canonical = assistant_round_call_ids(events, eligible)
     for evt in events:
         etype = evt.get("type", "")
         if evt.get("event_id") in canonical:
             _flush_pending()
-            announced_ids.update(
-                str(call.get("id") or "")
-                for call in (canonical[evt["event_id"]].get("tool_calls") or [])
-            )
+            announced_ids.update(canonical[evt["event_id"]])
         if etype in {"user_input", "user_message"}:
             _flush_pending()
             announced_ids.clear()
@@ -770,7 +769,29 @@ def normalize_resumable_events(
     represented by synthetic interrupted results. Missing assistant tool-call
     announcements are also injected so replay preserves valid tool pairing.
     """
-    normalized = [dict(evt) for evt in events]
+    return _normalize_resume_records(
+        [dict(evt) for evt in events], live_job_ids, covered_event_ids
+    )
+
+
+def prepare_replay_events(
+    events: list[dict[str, Any]],
+    *,
+    resumable: bool = False,
+    covered_event_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Derive replay events while borrowing unchanged input records read-only."""
+    if resumable:
+        return _normalize_resume_records(events, None, covered_event_ids)
+    return _inject_synthetic_announcements(events, covered_event_ids)
+
+
+def _normalize_resume_records(
+    normalized: list[dict[str, Any]],
+    live_job_ids: set[str] | None,
+    covered_event_ids: set[int] | None,
+) -> list[dict[str, Any]]:
+    """Derive interruptions and announcements without editing supplied records."""
     started_tools: dict[str, dict[str, Any]] = {}
     finished_tools: set[str] = set()
     started_subagents: dict[str, dict[str, Any]] = {}
@@ -840,4 +861,4 @@ def normalize_resumable_events(
         )
 
     full = normalized + synthetic_events
-    return normalize_tool_call_events(full, covered_event_ids=covered_event_ids)
+    return _inject_synthetic_announcements(full, covered_event_ids)

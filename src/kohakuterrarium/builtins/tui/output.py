@@ -693,6 +693,12 @@ class TUIOutput(TUIKtUiMixin, BaseOutputModule):
 
     # -- Resume history -----------------------------------------------------
 
+    async def prepare_resume(self, history):
+        """Prepare shared internal paths for the built-in TUI renderer."""
+        if getattr(self.on_resume, "__func__", None) is not TUIOutput.on_resume:
+            return await super().prepare_resume(history)
+        return await history.events(shared_paths=True)
+
     async def on_resume(self, events: list[dict]) -> None:
         """Render session history in one race-free widget batch."""
         if not events:

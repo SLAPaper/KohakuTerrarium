@@ -51,6 +51,7 @@ class StoreHandleMixin:
         table_policy: Mapping[str, TablePolicy] | None,
     ) -> None:
         self._path = str(coerce_fs_path(path))
+        self._resume_index_path = str(Path(self._path).resolve())
         # Read-only stores open existing files and never write to them.
         self._readonly = read_only
         if read_only:

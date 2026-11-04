@@ -55,6 +55,7 @@ def read_values(
     what: str = "session value",
     strict: bool = False,
     on_unreadable: OnUnreadable | None = None,
+    max_chunk_size: int | None = None,
 ) -> Iterator[tuple[Any, Any]]:
     """Yield ``(key, value)`` for every present key, in input order.
 
@@ -64,11 +65,14 @@ def read_values(
     with ``strict`` the failure propagates instead.
     """
     report = on_unreadable or _log_unreadable(what)
-    start, size = 0, min(FIRST_READ_CHUNK, READ_CHUNK)
+    limit = READ_CHUNK if max_chunk_size is None else min(READ_CHUNK, max_chunk_size)
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("Read chunk size must be a positive integer")
+    start, size = 0, min(FIRST_READ_CHUNK, limit)
     while start < len(keys):
         chunk = list(keys[start : start + size])
         start += size
-        size = min(size * 2, READ_CHUNK)
+        size = min(size * 2, limit)
         try:
             values = table.get_many(chunk, _MISSING)
         except Exception:

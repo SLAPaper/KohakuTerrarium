@@ -26,7 +26,8 @@ def last_persisted_turn_branch(
     resumed agent's already-advanced turn index.
     """
     try:
-        events = store.get_events(prefix)
+        event = store.get_last_turn_event(prefix)
+        events = [event] if event is not None else []
     except Exception:  # pragma: no cover - recovery must tolerate unavailable stores
         return None, None, None
     for evt in reversed(events):

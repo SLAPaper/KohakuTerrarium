@@ -6,6 +6,7 @@ import pytest
 
 from kohakuterrarium.session.history import branch_paths
 from kohakuterrarium.session.history.branch_paths import index_parent_paths
+from kohakuterrarium.session.history.ancestry import SharedPath
 
 
 def _baseline(events):
@@ -41,6 +42,20 @@ class _UnhashableInt(int):
 
 
 class TestIndexParentPaths:
+    def test_deep_legacy_paths_share_prefixes_without_expanding_them(self, monkeypatch):
+        events = [
+            {"event_id": t, "turn_index": t, "branch_id": 1} for t in range(1, 2001)
+        ]
+
+        def expanded(self):
+            raise AssertionError("Legacy indexing expanded shared ancestry")
+
+        monkeypatch.setattr(SharedPath, "__iter__", expanded)
+        paths = index_parent_paths(events)
+        assert len(paths[2000]) == 1999
+        assert len(paths[2000].tree.nodes) == 2000
+        assert len({id(path.tree) for path in paths.values()}) == 1
+
     @pytest.mark.parametrize("seed", range(20))
     def test_legacy_explicit_and_duplicate_ids_match_baseline(self, seed):
         rng = random.Random(seed)

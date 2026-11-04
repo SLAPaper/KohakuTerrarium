@@ -1,6 +1,10 @@
 """Unit tests for :mod:`kohakuterrarium.session.history.replay`."""
 
+import gc
+import weakref
+
 import pytest
+from kohakuterrarium.session.history.ancestry import BranchAncestry, SharedPath
 
 from kohakuterrarium.llm.antigravity.format import STATE_KEY, signed_state
 from kohakuterrarium.session.history import replay as history
@@ -14,6 +18,7 @@ from kohakuterrarium.session.history.replay import (
     collect_branch_metadata,
     collect_user_groups,
     dedupe_adjacent_duplicate_events,
+    iter_deduplicated_events,
     normalize_resumable_events,
     normalize_tool_call_events,
     project_branch_metadata,
@@ -23,6 +28,26 @@ from kohakuterrarium.session.history.replay import (
 )
 
 # ── _coerce_path ──────────────────────────────────────────────────
+
+
+def test_deduplicated_iterator_reads_lazily_without_copying_events():
+    first = {"event_id": 1, "type": "text_chunk", "content": "one"}
+    duplicate = {**first, "event_id": 2}
+    last = {"event_id": 3, "type": "text_chunk", "content": "two"}
+    observed = []
+
+    def events():
+        for event in (first, duplicate, last):
+            observed.append(event["event_id"])
+            yield event
+
+    stream = iter_deduplicated_events(events())
+    assert observed == []
+    assert next(stream) is first
+    assert observed == [1]
+    assert next(stream) is last
+    assert observed == [1, 2, 3]
+    assert list(stream) == []
 
 
 class TestCoercePath:
@@ -1604,6 +1629,48 @@ class TestPendingSummaryScan:
 
 
 class TestDedupe:
+    def test_closing_iterator_releases_cached_path_owners(self):
+        references = []
+
+        def events():
+            tree = BranchAncestry()
+            references.append(weakref.ref(tree))
+            yield {"parent_branch_path": tree.view(tree.intern([[1, 1]]))}
+            yield {"content": "later"}
+
+        iterator = iter_deduplicated_events(events())
+        next(iterator)
+        assert references[0]() is not None
+        iterator.close()
+        gc.collect()
+        assert references[0]() is None
+
+    def test_shared_path_cache_keeps_legacy_collisions_and_does_not_cross_iterators(
+        self, monkeypatch
+    ):
+        tree = BranchAncestry()
+        path = tree.view(tree.intern([[turn, 1] for turn in range(1, 40)]))
+        calls = []
+        original = SharedPath.__iter__
+
+        def observed(self):
+            calls.append(self.leaf)
+            yield from original(self)
+
+        monkeypatch.setattr(SharedPath, "__iter__", observed)
+        encoded = history._event_signature_value(path)
+        calls.clear()
+        first = {"event_id": 1, "type": "text_chunk", "parent_branch_path": path}
+        events = [
+            first,
+            {**first, "event_id": 2},
+            {**first, "parent_branch_path": encoded},
+        ]
+        assert dedupe_adjacent_duplicate_events(events) == [first]
+        assert calls == [path.leaf]
+        assert dedupe_adjacent_duplicate_events(events) == [first]
+        assert calls == [path.leaf, path.leaf]
+
     def test_identical_adjacent_events_dropped(self):
         events = [
             {"type": "text_chunk", "content": "a", "event_id": 0, "ts": 1.0},
@@ -2436,3 +2503,54 @@ def test_antigravity_state_replay_does_not_attach_empty_round_to_previous():
     )
     assert messages[1][STATE_KEY] == state1
     assert messages[3] == {**empty, STATE_KEY: state2}
+
+
+def test_resume_normalization_keeps_detached_event_roots_and_complete_jobs():
+    events = [
+        {
+            "event_id": 1,
+            "type": "tool_call",
+            "call_id": "j",
+            "name": "read",
+            "args": {},
+        },
+        {"event_id": 2, "type": "text_chunk", "content": "visible"},
+    ]
+    result = normalize_resumable_events(events)
+    originals = {event["event_id"]: event for event in events}
+    for event in result:
+        if event.get("event_id") in originals:
+            assert event is not originals[event["event_id"]]
+    result[0]["name"] = "changed"
+    assert events[0]["name"] == "read"
+    assert any(event.get("_synthetic_resume") for event in result)
+    assert any(event.get("_synthetic_announce") for event in result)
+
+
+@pytest.mark.parametrize("resumable", [False, True])
+def test_internal_replay_preparation_preserves_values_and_borrows_records(resumable):
+    events = [
+        {
+            "event_id": 1,
+            "type": "tool_call",
+            "call_id": "j",
+            "name": "read",
+            "args": {},
+        },
+        {"event_id": 2, "type": "text_chunk", "content": "visible"},
+    ]
+    original = [dict(event) for event in events]
+    expected = (
+        normalize_resumable_events(events)
+        if resumable
+        else normalize_tool_call_events(events)
+    )
+    actual = history.prepare_replay_events(events, resumable=resumable)
+    assert actual == expected
+    assert events == original
+    originals = {event["event_id"]: event for event in events}
+    for event in actual:
+        if event.get("event_id") in originals:
+            assert event is originals[event["event_id"]]
+    expected[0]["name"] = "changed detached public result"
+    assert events == original

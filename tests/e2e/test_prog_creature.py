@@ -801,7 +801,7 @@ class TestProgCreatureJourney:
             assert (continued_agent._turn_index, continued_agent._branch_id) == (4, 1)
             assert continued_agent._parent_branch_path == [(1, 1), (2, 2), (3, 1)]
             assert (
-                continued_agent._pending_resume_events
+                continued_agent._resume_history.read()
                 == continued_store.get_resumable_events("pilot")
             )
             await continued_agent.start()

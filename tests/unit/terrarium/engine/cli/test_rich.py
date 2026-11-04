@@ -20,7 +20,7 @@ class _FocusAgent(AgentInitMixin):
     def __init__(self) -> None:
         self.input = CLIInput()
         self.session = None
-        self._pending_resume_events = None
+        self._resume_history = None
         self.config = SimpleNamespace(name="focus")
         self.output_router = SimpleNamespace(default_output=None)
         self.llm = SimpleNamespace(model="test-model", _profile_max_context=0)

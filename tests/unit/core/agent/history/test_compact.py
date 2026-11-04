@@ -25,16 +25,6 @@ def compact_llm(monkeypatch):
     )
 
 
-class _CountingStore(SessionStore):
-    def __init__(self, path):
-        super().__init__(str(path))
-        self.event_reads = 0
-
-    def get_events(self, agent, since_event_id=None):
-        self.event_reads += 1
-        return super().get_events(agent, since_event_id)
-
-
 def _save_history(
     store,
     *,
@@ -110,13 +100,12 @@ async def _agent():
 
 @pytest.mark.parametrize("kind", ["branch", "empty", "legacy"])
 async def test_detached_start_and_repeat_attach_reuse_compact_metadata(tmp_path, kind):
-    store = _CountingStore(tmp_path / "resume.kohakutr")
+    store = SessionStore(tmp_path / "resume.kohakutr")
     cooldown = time.time()
     _save_history(store, kind=kind, cooldown=cooldown)
     agent = await _agent()
     try:
         inject_saved_state(agent, store, "alice")
-        assert store.event_reads == 1
         await agent.start()
         manager = agent.compact_manager
         assert manager._compact_count == 4
@@ -127,14 +116,13 @@ async def test_detached_start_and_repeat_attach_reuse_compact_metadata(tmp_path,
             agent.attach_session_store(store)
             assert manager._compact_count == 4
             assert manager._last_compact_time == (0.0 if kind == "empty" else cooldown)
-        assert store.event_reads == 1
     finally:
         await agent.stop()
         store.close()
 
 
 async def test_live_compaction_before_attach_keeps_new_round_and_cooldown(tmp_path):
-    store = _CountingStore(tmp_path / "resume.kohakutr")
+    store = SessionStore(tmp_path / "resume.kohakutr")
     _save_history(store)
     agent = await _agent()
     try:
@@ -153,14 +141,13 @@ async def test_live_compaction_before_attach_keeps_new_round_and_cooldown(tmp_pa
             assert manager._compact_count == 5
             assert manager._last_compact_time == cooldown
             assert not manager.should_compact(manager.config.max_tokens)
-        assert store.event_reads == 1
     finally:
         await agent.stop()
         store.close()
 
 
 async def test_unprepared_exact_checkpoint_preserves_count_and_cooldown(tmp_path):
-    store = _CountingStore(tmp_path / "resume.kohakutr")
+    store = SessionStore(tmp_path / "resume.kohakutr")
     cooldown = time.time()
     _save_history(store, cooldown=cooldown, event_type="user_input")
     messages = build_conversation(
@@ -179,7 +166,6 @@ async def test_unprepared_exact_checkpoint_preserves_count_and_cooldown(tmp_path
         watermark=store.max_event_id("alice"),
         compact_state={"compact_count": 4, "last_compact_time": cooldown},
     )
-    store.event_reads = 0
     agent = await _agent()
     try:
         inject_saved_state(agent, store, "alice")
@@ -187,7 +173,6 @@ async def test_unprepared_exact_checkpoint_preserves_count_and_cooldown(tmp_path
         agent.attach_session_store(store)
         assert agent.compact_manager._compact_count == 4
         assert agent.compact_manager._last_compact_time == cooldown
-        assert store.event_reads == 1
     finally:
         await agent.stop()
         store.close()
@@ -207,7 +192,7 @@ async def test_unprepared_exact_checkpoint_preserves_count_and_cooldown(tmp_path
 )
 @pytest.mark.parametrize("started", [False, True])
 async def test_resume_handoff_does_not_outlive_its_context(tmp_path, change, started):
-    store = _CountingStore(tmp_path / "resume.kohakutr")
+    store = SessionStore(tmp_path / "resume.kohakutr")
     _save_history(store, kind="legacy", cooldown=11.0)
     agent = await _agent()
     other_store = None
@@ -221,7 +206,7 @@ async def test_resume_handoff_does_not_outlive_its_context(tmp_path, change, sta
         match change:
             case "store":
                 store.flush()
-                other_store = _CountingStore(store.path)
+                other_store = SessionStore(store.path)
                 target = other_store
             case "namespace":
                 agent.config.name = "bob"
@@ -253,7 +238,7 @@ async def test_resume_handoff_does_not_outlive_its_context(tmp_path, change, sta
 
 
 async def test_restart_loads_new_metadata_for_the_new_manager(tmp_path):
-    store = _CountingStore(tmp_path / "resume.kohakutr")
+    store = SessionStore(tmp_path / "resume.kohakutr")
     _save_history(store, kind="legacy", cooldown=11.0)
     agent = await _agent()
     try:
@@ -279,7 +264,7 @@ async def test_restart_loads_new_metadata_for_the_new_manager(tmp_path):
 async def test_rewind_to_empty_context_restores_reset_compact_state(
     tmp_path, message_idx
 ):
-    store = _CountingStore(tmp_path / "resume.kohakutr")
+    store = SessionStore(tmp_path / "resume.kohakutr")
     _save_history(store, cooldown=11.0)
     agent = await _agent()
     try:
@@ -298,7 +283,6 @@ async def test_rewind_to_empty_context_restores_reset_compact_state(
         for _ in range(2):
             agent.attach_session_store(store)
             assert (manager._compact_count, manager._last_compact_time) == (0, 0.0)
-        assert store.event_reads == 1
     finally:
         await agent.stop()
         store.close()

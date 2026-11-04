@@ -45,13 +45,20 @@ async def test_recovery_scans_off_loop_and_persists_text_once(tmp_path, monkeypa
     path = _interrupted_session(tmp_path)
     loop_thread = threading.get_ident()
     scans = []
+    tail_reads = []
     original = SessionStore.get_events
+    original_tail = SessionStore.get_last_turn_event
 
     def observed_get_events(self, *args, **kwargs):
         scans.append(threading.get_ident())
         return original(self, *args, **kwargs)
 
+    def observed_tail(self, *args, **kwargs):
+        tail_reads.append(threading.get_ident())
+        return original_tail(self, *args, **kwargs)
+
     monkeypatch.setattr(SessionStore, "get_events", observed_get_events)
+    monkeypatch.setattr(SessionStore, "get_last_turn_event", observed_tail)
     for _ in range(2):
         agent, store = await resume_agent_async(path, llm=ScriptedLLM(["unused"]))
         try:
@@ -67,6 +74,8 @@ async def test_recovery_scans_off_loop_and_persists_text_once(tmp_path, monkeypa
             await asyncio.to_thread(store.close, update_status=False)
     assert scans
     assert loop_thread not in scans
+    assert len(tail_reads) == 1
+    assert loop_thread not in tail_reads
 
 
 async def test_cancelled_recovery_releases_writer_and_retains_text(
@@ -77,18 +86,15 @@ async def test_cancelled_recovery_releases_writer_and_retains_text(
     loop_thread = threading.get_ident()
     recovery_started = asyncio.Event()
     release = threading.Event()
-    original = SessionStore.get_events
-    scans = 0
+    original = SessionStore.get_last_turn_event
 
-    def gated_get_events(self, *args, **kwargs):
-        nonlocal scans
-        scans += 1
-        if scans == 2 and threading.get_ident() != loop_thread:
-            loop.call_soon_threadsafe(recovery_started.set)
-            assert release.wait(30), "recovery was not released"
+    def gated_tail(self, *args, **kwargs):
+        assert threading.get_ident() != loop_thread
+        loop.call_soon_threadsafe(recovery_started.set)
+        assert release.wait(30), "recovery was not released"
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(SessionStore, "get_events", gated_get_events)
+    monkeypatch.setattr(SessionStore, "get_last_turn_event", gated_tail)
     task = asyncio.create_task(resume_agent_async(path, llm=ScriptedLLM(["unused"])))
     cancel_requested = False
     try:
@@ -106,7 +112,7 @@ async def test_cancelled_recovery_releases_writer_and_retains_text(
                 task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-    monkeypatch.setattr(SessionStore, "get_events", original)
+    monkeypatch.setattr(SessionStore, "get_last_turn_event", original)
     agent, store = await resume_agent_async(path, llm=ScriptedLLM(["unused"]))
     try:
         await agent._session_output.drain()

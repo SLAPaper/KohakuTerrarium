@@ -33,6 +33,7 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.agent.history import message_history as _message_history_mod
 from kohakuterrarium.core.agent import Agent
+from kohakuterrarium.builtins.outputs.none import NoneOutput
 from kohakuterrarium.core.conversation.continuation import selected_branch_view
 from kohakuterrarium.core.events import create_user_input_event
 from kohakuterrarium.core.conversation.pinned import pin_message, unpin_message
@@ -82,6 +83,7 @@ from kohakuterrarium.session.occupancy.gate import try_fast
 from kohakuterrarium.session.history.raw import UserMessageSelector
 from kohakuterrarium.session.resume.resume import detect_session_type, resume_agent
 from kohakuterrarium.session.resume.async_flow import resume_agent_async
+from kohakuterrarium.session.resume.history import replay_output_history
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.store.lifecycle.version import (
     FORMAT_VERSION,
@@ -90,6 +92,7 @@ from kohakuterrarium.session.store.lifecycle.version import (
 from kohakuterrarium.studio.attach._event_stream import StreamOutput
 from kohakuterrarium.studio.attach.widget_frames import handle_widget_frame
 from kohakuterrarium.testing.llm import ScriptedLLM
+from tests.helpers.event_payload_reads import track_event_payload_reads
 
 pytestmark = pytest.mark.timeout(60)
 
@@ -208,7 +211,7 @@ class TestSessionIntegration:
     """Each method = one full session workflow, start to finish."""
 
     async def test_run_record_close_reopen_resume(
-        self, patched_llm, tmp_path, monkeypatch
+        self, patched_llm, tmp_path, monkeypatch, capsys
     ):
         """The canonical session integration workflow.
 
@@ -243,6 +246,7 @@ class TestSessionIntegration:
             )
             await agent._process_event(create_user_input_event("introduce yourself"))
             await agent._process_event(create_user_input_event("use the echo tool"))
+            await agent._session_output.drain()
             # Drive the SessionOutput activity surface the runtime uses:
             # notify_activity → on_activity_with_metadata → _record_activity
             # dispatch table. Each call must land as a typed event row.
@@ -906,6 +910,14 @@ class TestSessionIntegration:
                 if m.get("role") == "user"
             ]
             assert all(t in plain_users for t in recorded_user_turns)
+            plain_messages = plain_agent.controller.conversation.to_messages()
+            capsys.readouterr()
+            await replay_output_history(plain_agent)
+            rendered = capsys.readouterr().out
+            assert "--- Resumed session (" in rendered
+            assert any(f"You: {turn[:120]}" in rendered for turn in recorded_user_turns)
+            assert plain_agent._resume_history is None
+            assert plain_agent.controller.conversation.to_messages() == plain_messages
         finally:
             plain_store.close()
         legacy = SessionStore(session_path)
@@ -952,7 +964,7 @@ class TestSessionIntegration:
             assert legacy_agent._parent_branch_path == [(1, 1), (2, 1)]
             assert legacy_agent.session.scratchpad.get("project") == "terrarium"
             assert (
-                legacy_agent._pending_resume_events[-1]["type"] == "plugin_hook_timing"
+                legacy_agent._resume_history.read()[-1]["type"] == "plugin_hook_timing"
             )
         finally:
             await legacy_agent._session_output.drain()
@@ -1059,7 +1071,7 @@ class TestSessionIntegration:
         prepare = _resume_mod.prepare_saved_snapshot
         index = _history_mod.index_parent_paths
         compact_restore_reads = []
-        get_events = SessionStore.get_events
+        get_events = _resume_mod.read_restore_events
 
         def observe_event_read(store, namespace, *args, **kwargs):
             if namespace == "scribe":
@@ -1089,7 +1101,7 @@ class TestSessionIntegration:
             tracing.setattr(_resume_branch_mod, "index_parent_paths", observe_index)
             tracing.setattr(_history_mod, "index_parent_paths", observe_index)
             tracing.setattr(_message_history_mod, "index_parent_paths", observe_index)
-            tracing.setattr(SessionStore, "get_events", observe_event_read)
+            tracing.setattr(_resume_mod, "read_restore_events", observe_event_read)
             fallback_agent, fallback_store = await resume_agent_async(session_path)
         try:
             with monkeypatch.context() as tracing:
@@ -1116,7 +1128,7 @@ class TestSessionIntegration:
             assert [
                 t["trigger_id"] for t in fallback_agent._pending_resume_triggers
             ] == [t2_id]
-            assert fallback_agent._pending_resume_events == expected_pending
+            assert fallback_agent._resume_history.read() == expected_pending
             raw = fallback_store.get_events("scribe")
             assert replay_counts == [len(raw)]
             assert len(replay_indexes) == 2
@@ -1148,7 +1160,7 @@ class TestSessionIntegration:
             assert continued_agent._context_cutoff_event_id == 0
             assert continued_agent.session.scratchpad.get("project") == "terrarium"
             assert (
-                continued_agent._pending_resume_events
+                continued_agent._resume_history.read()
                 == continued_store.get_resumable_events("scribe")
             )
             assert [
@@ -1167,6 +1179,24 @@ class TestSessionIntegration:
         finally:
             await continued_agent._session_output.drain()
             await asyncio.to_thread(continued_store.close, update_status=False)
+
+        with monkeypatch.context() as observation:
+            payload_reads = track_event_payload_reads(observation, session_path)
+            budget_agent, budget_store = await resume_agent_async(
+                session_path, output_module=NoneOutput()
+            )
+        try:
+            keys = {key.decode() for key in budget_store.events.keys(prefix="scribe:e")}
+            assert max(payload_reads.batch_sizes) <= 64
+            assert set(payload_reads) == keys
+            assert len(payload_reads) <= 4 * len(keys)
+            assert [
+                dict(message.to_dict(), metadata=message.metadata)
+                for message in budget_agent.controller.conversation.get_messages()
+            ] == continued_messages
+        finally:
+            await budget_agent._session_output.drain()
+            await asyncio.to_thread(budget_store.close, update_status=False)
 
         # An unknown io_mode is rejected loudly before any agent is built.
         with pytest.raises(ValueError, match="Unknown IO mode"):

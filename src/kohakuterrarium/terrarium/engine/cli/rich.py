@@ -48,6 +48,7 @@ from kohakuterrarium.builtins.cli_rich.input import RichCLIInput
 from kohakuterrarium.builtins.cli_rich.output import RichCLIOutput
 from kohakuterrarium.builtins.inputs.cli import CLIInput, NonBlockingCLIInput
 from kohakuterrarium.modules.input.base import InputModule
+from kohakuterrarium.session.resume.history import take_output_history
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.engine.engine import Terrarium
 from kohakuterrarium.utils.logging import get_logger
@@ -153,15 +154,12 @@ async def run_engine_with_rich_cli(
         # widget slot allocated.
         app.start_engine_watch()
 
-    pending = getattr(agent, "_pending_resume_events", None)
-    if pending:
-        try:
+    try:
+        pending = await take_output_history(agent, shared_paths=True)
+        if pending:
             app.replay_session(pending)
-        except Exception as exc:
-            logger.warning(
-                "Rich CLI session replay failed", error=str(exc), exc_info=True
-            )
-        agent._pending_resume_events = None
+    except Exception as exc:
+        logger.warning("Rich CLI session replay failed", error=str(exc), exc_info=True)
 
     try:
         mark_startup("rich_cli_run_enter", surface="cli", creature_id=focus_creature_id)

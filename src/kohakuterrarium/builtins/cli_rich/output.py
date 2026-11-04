@@ -30,6 +30,16 @@ def _make_label(job_id: str, name: str) -> str:
 class RichCLIOutput(BaseOutputModule):
     """Output module that routes agent events into RichCLIApp."""
 
+    async def on_resume(self, events: list[dict]) -> None:
+        """Replay historical events through the bound terminal application."""
+        self.app.replay_session(events)
+
+    async def prepare_resume(self, history):
+        """Prepare shared internal paths for the built-in terminal renderer."""
+        if getattr(self.on_resume, "__func__", None) is not RichCLIOutput.on_resume:
+            return await super().prepare_resume(history)
+        return await history.events(shared_paths=True)
+
     def __init__(self, app: Any, *, reply_router: Any = None):
         super().__init__()
         self.app = app

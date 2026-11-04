@@ -35,7 +35,7 @@ class AgentSessionMixin:
         # Session persistence (set externally via attach_session_store)
         self.session_store: Any = None
         self._session_output: Any = None
-        self._pending_resume_events: list[dict] | None = None
+        self._resume_history: Any = None
 
     def _publish_session_info(self) -> None:
         """Publish session info to output (for TUI session panel).

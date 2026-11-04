@@ -23,6 +23,7 @@ from kohakuterrarium.parsing import (
     ToolCallEvent,
 )
 from kohakuterrarium.utils.logging import get_logger
+from kohakuterrarium.modules.output.base import wants_resume_history
 
 logger = get_logger(__name__)
 
@@ -284,6 +285,19 @@ class OutputRouter(
         """Notify default output that user input was received."""
         if hasattr(self.default_output, "on_user_input"):
             await self.default_output.on_user_input(text)
+
+    async def replay_history(self, history) -> bool:
+        """Prepare for one consumer and verify ownership before delivery."""
+        target = self.default_output
+        prepare = getattr(target, "prepare_resume", None)
+        prepared = (
+            await prepare(history) if callable(prepare) else await history.events()
+        )
+        if self.default_output is not target or not wants_resume_history(target):
+            return False
+        deliver = getattr(target, "deliver_resume", target.on_resume)
+        await deliver(prepared)
+        return True
 
     async def on_resume(self, events: list[dict]) -> None:
         """Replay session history only to the user-facing default output."""

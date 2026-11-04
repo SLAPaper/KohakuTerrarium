@@ -8,6 +8,7 @@ import pytest
 
 from kohakuterrarium.session.history import replay as history
 from kohakuterrarium.session.history import selection as history_selection
+from kohakuterrarium.session.history.ancestry import BranchAncestry, SharedPath
 
 
 def _baseline(events, *, branch_view=None, parent_paths=None):
@@ -137,6 +138,39 @@ def test_noncanonical_mutable_path_remains_uncached():
     assert compatibility.matches(path, 2)
     path[0][1] = 2
     assert not compatibility.matches(path, 2)
+
+
+def test_shared_prefix_compatibility_does_not_expand_paths(monkeypatch):
+    tree = BranchAncestry()
+    leaves = [0]
+    for turn in range(1, 2001):
+        leaves.append(tree.add(leaves[-1], turn, 2 if turn == 1500 else 1))
+    check = history_selection.SelectionCompatibility({t: 1 for t in range(1, 2001)})
+
+    def expanded(self):
+        raise AssertionError("Shared compatibility expanded a prefix")
+
+    monkeypatch.setattr(SharedPath, "__iter__", expanded)
+    for leaf in reversed(leaves):
+        path = tree.view(leaf)
+        assert check.matches(path, 1500)
+        assert check.matches(path, 2001) == (len(path) < 1500)
+    assert len(check._node_conflicts[tree]) == 2001
+
+
+def test_shared_path_custom_selection_keeps_future_constraint_semantics():
+    class FutureReadError(dict):
+        def __getitem__(self, turn):
+            if turn == 2:
+                raise ValueError("future constraint")
+            return super().__getitem__(turn)
+
+    tree = BranchAncestry()
+    path = tree.view(tree.intern([[2, 1]]))
+    check = history_selection.SelectionCompatibility(FutureReadError({2: 1}))
+    assert check.matches(path, 2)
+    with pytest.raises(ValueError, match="future constraint"):
+        check.matches(path, 3)
 
 
 def test_custom_selection_does_not_read_future_turn_constraints():

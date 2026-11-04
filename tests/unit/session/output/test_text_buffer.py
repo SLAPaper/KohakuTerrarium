@@ -6,7 +6,50 @@ from concurrent.futures import Future
 import pytest
 
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.output.text_buffer import OpenTextSegment
+from kohakuterrarium.session.output.output import SessionOutput
+from kohakuterrarium.session.output.text_buffer import (
+    OpenTextSegment,
+    last_persisted_turn_branch,
+)
+
+
+@pytest.mark.parametrize("suffix", ["z", "①"])
+async def test_legacy_latest_turn_keeps_recovered_text_on_its_original_branch(
+    tmp_path, suffix
+):
+    store = SessionStore(tmp_path / "legacy-text.kohakutr")
+    try:
+        store.append_event(
+            "alice",
+            "processing_start",
+            {"event_id": 10},
+            turn_index=1,
+            branch_id=1,
+            parent_branch_path=[],
+        )
+        store.events[f"alice:e{suffix}"] = {
+            "type": "processing_start",
+            "event_id": 11,
+            "turn_index": 2,
+            "branch_id": 3,
+            "parent_branch_path": [[1, 1]],
+        }
+        store.append_event("other", "activity", {"event_id": 12})
+        store.state["alice:open_text"] = "interrupted turn two"
+        assert last_persisted_turn_branch(store, "alice") == (2, 3, [(1, 1)])
+        output = SessionOutput("alice", store, None)
+        await output.drain()
+        recovered = [
+            e for e in store.get_events("alice") if e.get("finalize") == "recovered"
+        ]
+        assert len(recovered) == 1
+        assert recovered[0]["content"] == "interrupted turn two"
+        assert recovered[0]["turn_index"] == 2
+        assert recovered[0]["branch_id"] == 3
+        assert recovered[0]["parent_branch_path"] == [[1, 1]]
+        assert store.state["alice:open_text"] == ""
+    finally:
+        store.close()
 
 
 def test_busy_writer_retains_one_latest_checkpoint(tmp_path):

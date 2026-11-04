@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from kohakuterrarium.session.store.records.snapshot import is_snapshot_payload_key
+
 from kohakuvault import KVault
 
 from kohakuterrarium.session.store.records.artifacts import artifacts_dir_for
@@ -469,6 +471,7 @@ def perform_fork(
             k
             for k in _iter_keys(source.state)
             if k not in (MAX_EVENT_ID_KEY, EXACT_EVENT_ID_KEY)
+            and not is_snapshot_payload_key(k)
             and not k.endswith(
                 (
                     ":snapshot_event_id",
