@@ -40,3 +40,10 @@ Other projections retain recovery normalization by default. Legacy callbacks
 and terminal consumers explicitly requesting complete event lists materialize
 those lists and pay their memory cost. Normal checkpoints save snapshots and
 runtime state without a third recovery context or historical authentication.
+
+Archives produced by experimental recovery-cache builds can contain native
+revision guards. Writable opens remove only those triggers and revision tables.
+Read-only opens preserve them. State values remain opaque: their key names can
+also identify plugin, run-tracker or child-namespace state. Recovery and normal
+checkpoints do not read or update the old cache values; generic archive copying
+can still copy them as State. Cleanup does not vacuum the archive.
