@@ -261,7 +261,7 @@ def rebuild_session_memory(
     dimensions: int | None = None,
     embedder: BaseEmbedder | None = None,
 ) -> RebuildResult:
-    """Rebuild offline through the original Store; incomplete indexes can be retried."""
+    """Rebuild offline; keep the Session stopped until maintenance succeeds."""
     source = coerce_fs_path(path)
     if not source.is_file():
         raise FileNotFoundError(source)
@@ -314,6 +314,11 @@ def rebuild_session_memory(
     except Exception as exc:
         if backup is None:
             raise
-        raise RebuildRefused(f"{exc} (original database backup: {backup})") from exc
+        raise RebuildRefused(
+            f"{exc} (original database backup: {backup}). "
+            "If index updates started, memory indexes and embedding configuration "
+            "may be inconsistent. Keep the Session offline until a rebuild "
+            "succeeds or the backup is restored."
+        ) from exc
     finally:
         guards.close()

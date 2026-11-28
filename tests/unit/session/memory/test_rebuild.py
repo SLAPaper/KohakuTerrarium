@@ -166,9 +166,15 @@ def test_interrupted_keyword_rebuild_keeps_authority_and_recovers(
 
     with monkeypatch.context() as patch:
         patch.setattr(SessionMemory, "_finish_batch", interrupted)
-        with pytest.raises(RebuildRefused, match="injected index update failure"):
+        with pytest.raises(
+            RebuildRefused, match="injected index update failure"
+        ) as exc:
             rebuild_session_memory(path)
     (backup,) = backups(path)
+    assert str(backup) in str(exc.value)
+    assert "may be inconsistent" in str(exc.value)
+    assert "Keep the Session offline" in str(exc.value)
+    assert "backup is restored" in str(exc.value)
     assert events(path) == events(backup) == original
     assert inspect_index(backup).fts_rows == 2
     with closing(SessionMemory(str(path))) as index:
@@ -211,8 +217,12 @@ def test_model_load_and_encode_failures_are_retryable(tmp_path, monkeypatch, cap
     assert rebuild_memory_cli(str(path), vectors="rebuild") == 1
     assert "model unavailable" in capsys.readouterr().out
     assert digest(path) == before
-    with pytest.raises(RebuildRefused, match="encoder unavailable"):
-        rebuild_session_memory(path, vectors="rebuild")
+    assert rebuild_memory_cli(str(path), vectors="rebuild") == 1
+    output = capsys.readouterr().out
+    assert "encoder unavailable" in output
+    assert "may be inconsistent" in output
+    assert "Keep the Session offline" in output
+    assert "backup is restored" in output
     assert events(path) == original
     assert inspect_index(path).vector_rows == ((4, 2),)
     with closing(SessionMemory(str(path), Embedder())) as index:

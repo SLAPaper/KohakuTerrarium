@@ -469,8 +469,10 @@ kt memory rebuild <session> [--dry-run] [--vectors auto|drop|rebuild]
 ```
 
 Existing vectors require an explicit policy or interactive confirmation.
-Provider, model and dimensions apply to vector rebuilding. See the
-[memory guide](../guides/memory.md) for backup, compatibility and recovery.
+Provider, model and dimensions apply to vector rebuilding. If maintenance
+fails after updates start, keep the Session offline until a rebuild succeeds
+or the backup is restored. See the [memory guide](../guides/memory.md) for
+backup, compatibility and recovery.
 
 ### `kt search`
 

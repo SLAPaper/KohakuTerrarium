@@ -101,9 +101,13 @@ external artifacts. Missing source namespaces, unreadable events and
 unsupported archive formats are refused before index replacement.
 
 A verified logical SQLite backup includes prior indexes and committed WAL
-data. Rebuild updates the existing database in place; an interrupted update
-may leave derived indexes incomplete or invalid. Retry after resolving the
-failure, keeping the backup. Do not delete WAL/SHM files manually.
+data. Rebuild updates the existing database in place. If maintenance fails
+after updates start, the indexes and embedding configuration may be
+inconsistent. **Keep the Session offline until a rebuild succeeds or the
+backup is restored.** Resume and ordinary search do not guarantee detection
+or repair of a partially rebuilt index. This also applies to an interruption
+that prevents the command from reporting an error. Keep the backup and do
+not delete WAL/SHM files manually.
 
 Ordinary searches do not perform this explicit maintenance automatically.
 A branch change may refresh the affected index through its normal lifecycle.

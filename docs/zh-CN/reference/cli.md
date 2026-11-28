@@ -420,7 +420,8 @@ kt memory rebuild <session> [--dry-run] [--vectors auto|drop|rebuild]
 ```
 
 存在旧向量时必须明确指定策略或交互确认。Provider、model 与 dimensions
-用于向量重建。备份、兼容性和恢复说明见[记忆指南](../guides/memory.md)。
+用于向量重建。若更新开始后维护失败，保持 Session 停止，直至重建成功或
+恢复备份。备份、兼容性和恢复说明见[记忆指南](../guides/memory.md)。
 
 ### `kt search`
 
