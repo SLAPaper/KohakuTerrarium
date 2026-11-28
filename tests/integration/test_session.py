@@ -1645,242 +1645,135 @@ class TestSessionIntegration:
         assert scoped and all(h.agent == "seeker" for h in scoped)
         assert sem_memory.search("authentication", mode="fts", k=5, agent="ghost") == []
 
-        # Run a third turn that calls a tool, then incrementally index
-        # ONLY the new events — _extract_blocks emits a tool block and
-        # the indexed counter advances past the original two turns.
+        # Preserve the existing mode and reopen contracts before closing for Resume.
+        with pytest.raises(ValueError, match="embedding model"):
+            fts_memory.search("authentication", mode="semantic")
+        assert fts_memory.search("authentication", mode="auto")
+        with pytest.raises(ValueError, match="Unknown search mode"):
+            fts_memory.search("authentication", mode="not-a-mode")
+        vector_count = sem_memory.get_stats()["vec_blocks"]
+        sem_memory.close()
+        fts_memory.close()
+        reopened_mem = SessionMemory(str(session_path))
+        try:
+            assert reopened_mem.has_vectors
+            assert reopened_mem.get_stats()["vec_blocks"] == vector_count > 0
+        finally:
+            reopened_mem.close()
+
+        # Resume a nonlatest branch, including an old sibling without explicit ancestry.
+        for kind in ("user_input", "user_message"):
+            store.append_event(
+                "seeker",
+                kind,
+                {"content": "UNSELECTED_SIBLING_MARKER"},
+                turn_index=2,
+                branch_id=2,
+            )
+        store.append_event("seeker", "processing_end", {}, turn_index=2, branch_id=2)
+        persist_branch_view(store, "seeker", {1: 1, 2: 1})
+        assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
+        store.close()
+
         patched_llm["script"] = [
             "[/echo]search-target-token[echo/]",
-            "noted.",
+            "RESUMED_BRANCH_REPLY",
             "[/echo]FOLLOWUP_SYNCHRONOUS_TOKEN[echo/]",
             "followup done.",
         ]
-        assert try_fast(session_path).reason == "not_eligible"
-        assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
-        store.close()
-        assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
         agent2, store = resume_agent(session_path)
-        echo2 = _EchoTool()
-        agent2.registry.register_tool(echo2)
-        agent2.executor.register_tool(echo2)
+        agent2.add_tool(_EchoTool())
         await agent2.start()
         try:
-            await agent2._process_event(
-                create_user_input_event("echo the search target now")
+            assert selected_branch_view(agent2)[2] == 1
+            assert (await agent2.run("RESUMED_BRANCH_REQUEST")).status == "ok"
+            live = await store.run(live_memory_for_store, store)
+
+            async def search(query, mode="fts", k=5):
+                hits, warning = await live.search(
+                    query,
+                    names=["seeker"],
+                    config={},
+                    create_embedder=lambda _: _HashEmbedder(),
+                    mode=mode,
+                    k=k,
+                )
+                assert warning is None
+                return hits
+
+            for marker in ("RESUMED_BRANCH_REQUEST", "RESUMED_BRANCH_REPLY"):
+                assert [h.content for h in await search(marker)] == [marker]
+            assert not await search("UNSELECTED_SIBLING_MARKER")
+            assert await search("search-target-token")
+
+            # Refresh before a processing cycle with no new user input.
+            assert (
+                await agent2.run_event(
+                    create_tool_complete_event(
+                        "earlier-job", "follow-up work", exit_code=0
+                    )
+                )
+            ).status == "ok"
+            expected = {
+                "[tool:echo] content=FOLLOWUP_SYNCHRONOUS_TOKEN",
+                "[result:echo] echoed: FOLLOWUP_SYNCHRONOUS_TOKEN",
+            }
+            for mode in ("fts", "semantic", "hybrid"):
+                hits = await search("FOLLOWUP_SYNCHRONOUS_TOKEN", mode, k=100)
+                assert expected <= {h.content for h in hits}
+            hits = await live.attach_anchors(
+                await search("FOLLOWUP_SYNCHRONOUS_TOKEN"), "FOLLOWUP_SYNCHRONOUS_TOKEN"
             )
-            fts_memory.index_events("seeker", store.get_events("seeker"))
-            outcome = await agent2.run_event(
-                create_tool_complete_event("earlier-job", "follow-up work", exit_code=0)
+            call = next(h for h in hits if h.content.startswith("[tool:echo]"))
+            window = await live.read_context(call.anchor, before=0, after=3)
+            assert any(
+                e.kind == "tool_result"
+                and "echoed: FOLLOWUP_SYNCHRONOUS_TOKEN" in e.content
+                for e in window.events
             )
-            assert outcome.status == "ok"
         finally:
             await agent2.stop()
-        store.flush()
-        all_events = store.get_events("seeker")
-        assert len(all_events) > len(events)
-        new_blocks = fts_memory.index_events("seeker", all_events)
-        assert new_blocks > 0
-        tool_hits = fts_memory.search("echo", mode="fts", k=10)
-        assert any(h.block_type == "tool" for h in tool_hits)
-        assert {
-            h.content
-            for h in fts_memory.search("FOLLOWUP_SYNCHRONOUS_TOKEN", mode="fts")
-        } == {
-            "[tool:echo] content=FOLLOWUP_SYNCHRONOUS_TOKEN",
-            "[result:echo] echoed: FOLLOWUP_SYNCHRONOUS_TOKEN",
-        }
+            saved_events = store.get_events("seeker")
+            store.close(update_status=False)
 
-        # E4: an embedder-less memory asked for EXPLICIT "semantic"
-        # mode raises (it used to silently degrade to FTS); "auto"
-        # remains the graceful-fallback spelling.
-        with pytest.raises(ValueError, match="embedding model"):
-            fts_memory.search("authentication", mode="semantic", k=5)
-        graceful = fts_memory.search("authentication", mode="auto", k=5)
-        assert graceful and graceful[0].block_type == "user"
-        # An unknown mode is a loud error, not a silent FTS fallback.
-        with pytest.raises(ValueError, match="Unknown search mode"):
-            fts_memory.search("authentication", mode="not-a-mode", k=5)
-
-        # close() releases the native handles SessionMemory opened.
-        # Re-opening the same file embedder-less must rediscover the
-        # vector table the semantic memory persisted (vec_dimensions in
-        # memory_state) so search-only consumers still see vectors.
-        sem_stat_before = sem_memory.get_stats()
-        sem_memory.close()
-        fts_memory.close()
-        reopened_mem = SessionMemory(str(session_path), embedder=None)
-        try:
-            # The ``has_vectors`` property tracks the reopened vec table
-            # even though the embedder-less stats row reports the
-            # NullEmbedder (no live model attached).
-            assert reopened_mem.has_vectors is True
-            reopened_stats = reopened_mem.get_stats()
-            assert reopened_stats["has_vectors"] is False
-            # The persisted vec table carries the blocks the semantic
-            # memory wrote — the count survived the close + reopen.
-            assert reopened_stats["vec_blocks"] == sem_stat_before["vec_blocks"]
-            assert reopened_stats["vec_blocks"] > 0
-        finally:
-            reopened_mem.close()
-        live_memory = await store.run(live_memory_for_store, store)
-        for mode in ("fts", "semantic", "hybrid"):
-            hits, warning = await live_memory.search(
-                "plan the database migration carefully",
-                names=["seeker"],
-                config={},
-                create_embedder=lambda _: _HashEmbedder(),
-                mode=mode,
-            )
-            assert warning is None
-            assert any(
-                h.content == "plan the database migration carefully" for h in hits
-            )
-        await store.run(
-            store.append_event,
-            "seeker",
-            "user_input",
-            {"content": "continuityneedle question"},
-        )
-        hits, warning = await live_memory.search(
-            "continuityneedle",
-            names=["seeker"],
-            config={},
-            create_embedder=lambda _: _HashEmbedder(),
-            mode="fts",
-        )
-        assert warning is None
-        assert [hit.content for hit in hits] == ["continuityneedle question"]
-        await store.run(
-            store.append_event, "seeker", "text", {"content": "continuityneedle answer"}
-        )
-        for mode in ("fts", "semantic", "hybrid"):
-            hits, warning = await live_memory.search(
-                "continuityneedle",
-                names=["seeker"],
-                config={},
-                create_embedder=lambda _: _HashEmbedder(),
-                mode=mode,
-                k=100,
-            )
-            assert warning is None
-            assert {"continuityneedle question", "continuityneedle answer"} <= {
-                h.content for h in hits
-            }
-        store.close()
         admission = try_fast(session_path, eligible=True)
         assert admission.reason == "ok"
         admission.lease.finish(source_released=True)
-        reopened = SessionStore.open_readonly(session_path)
-        try:
-            assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
-            saved_events = reopened.get_events("seeker")
-            assert saved_events
-        finally:
-            reopened.close()
-
         rebuilt = await asyncio.to_thread(
             rebuild_session_memory,
             session_path,
             vectors="rebuild",
             embedder=_HashEmbedder(),
         )
-        assert rebuilt.agents == ("seeker",)
         assert rebuilt.fts_rows == rebuilt.vector_rows > 0
-        backup = SessionStore.open_readonly(rebuilt.backup)
+        for path in (session_path, rebuilt.backup):
+            reader = SessionStore.open_readonly(path)
+            try:
+                assert reader.get_events("seeker") == saved_events
+            finally:
+                reader.close()
+        store = SessionStore(session_path)
         try:
-            assert backup.get_events("seeker") == saved_events
-        finally:
-            backup.close()
-        rebuilt_store = SessionStore(session_path)
-        try:
-            assert rebuilt_store.get_events("seeker") == saved_events
-            live = await rebuilt_store.run(live_memory_for_store, rebuilt_store)
-            hits, warning = await live.search(
-                "authentication",
-                names=["seeker"],
-                config={},
-                create_embedder=lambda _: _HashEmbedder(),
-                mode="fts",
-            )
-            assert warning is None
-            assert hits[0].content == "the authentication subsystem has a bug"
-            assert hits[0].source_ref and hits[0].source_fingerprint
-            hits = await live.attach_anchors(hits, "authentication")
-            anchor = hits[0].anchor
-            for scope in ("selected", "raw"):
-                window = await live.read_context(anchor, before=0, after=1, scope=scope)
-                assert window.scope == scope
-                assert window.events[0].content == hits[0].content
-                assert window.events[0].anchor == anchor
-            for kind in ("user_input", "user_message"):
-                rebuilt_store.append_event(
-                    "seeker",
-                    kind,
-                    {"content": "UNSELECTED_SIBLING_MARKER"},
-                    turn_index=3,
-                    branch_id=2,
-                )
-            rebuilt_store.append_event(
-                "seeker", "processing_end", {}, turn_index=3, branch_id=2
-            )
-            persist_branch_view(rebuilt_store, "seeker", {1: 1, 2: 1, 3: 1})
-        finally:
-            rebuilt_store.close()
-
-        resumed, resumed_store = resume_agent(
-            session_path,
-            llm=ScriptedLLM(["RESUMED_BRANCH_REPLY"]),
-            input_module=NoneInput(),
-            output_module=NoneOutput(),
-        )
-        try:
-            assert (resumed._turn_index, resumed._branch_id) == (3, 1)
-            await resumed.start()
-            outcome = await resumed.run("RESUMED_BRANCH_REQUEST")
-            assert outcome.status == "ok"
-            live = await resumed_store.run(live_memory_for_store, resumed_store)
-            for marker in ("RESUMED_BRANCH_REQUEST", "RESUMED_BRANCH_REPLY"):
-                hits, warning = await live.search(
-                    marker,
-                    names=["seeker"],
-                    config={},
-                    create_embedder=lambda _: _HashEmbedder(),
-                    mode="fts",
-                )
-                assert warning is None and hits[0].content == marker
-                hits = await live.attach_anchors(hits, marker)
-                window = await live.read_context(hits[0].anchor, before=0, after=0)
-                assert window.events[0].content == marker
-            hits, _ = await live.search(
-                "UNSELECTED_SIBLING_MARKER",
-                names=["seeker"],
-                config={},
-                create_embedder=lambda _: _HashEmbedder(),
-                mode="fts",
-            )
-            assert not hits
-        finally:
-            await resumed.stop()
-            resumed_store.close()
-        await asyncio.to_thread(
-            rebuild_session_memory,
-            session_path,
-            vectors="rebuild",
-            embedder=_HashEmbedder(),
-        )
-        final_store = SessionStore.open_readonly(session_path)
-        try:
-            final_memory = SessionMemory(
-                str(session_path), _HashEmbedder(), store=final_store
-            )
+            # Verify the persisted index before any live refresh can repair it.
+            index = SessionMemory(str(session_path), _HashEmbedder(), store=store)
             try:
                 for mode in ("fts", "semantic", "hybrid"):
-                    hits = final_memory.search("RESUMED_BRANCH_REPLY", mode=mode)
+                    hits = index.search("RESUMED_BRANCH_REPLY", mode=mode)
                     assert hits[0].content == "RESUMED_BRANCH_REPLY"
-                assert not final_memory.search("UNSELECTED_SIBLING_MARKER", mode="fts")
+                assert not index.search("UNSELECTED_SIBLING_MARKER", mode="fts")
+                assert expected == {
+                    h.content
+                    for h in index.search("FOLLOWUP_SYNCHRONOUS_TOKEN", mode="fts")
+                }
             finally:
-                final_memory.close()
+                index.close()
+            live = await store.run(live_memory_for_store, store)
+            hits = await search("RESUMED_BRANCH_REPLY")
+            hits = await live.attach_anchors(hits, "RESUMED_BRANCH_REPLY")
+            window = await live.read_context(hits[0].anchor, before=0, after=0)
+            assert window.events[0].content == "RESUMED_BRANCH_REPLY"
         finally:
-            final_store.close(update_status=False)
+            store.close(update_status=False)
 
     async def test_fork_at_event_copies_lineage(
         self, patched_llm, tmp_path, monkeypatch

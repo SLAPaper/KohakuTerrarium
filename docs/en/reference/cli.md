@@ -459,6 +459,19 @@ kt embedding <session> [--provider ...] [--model ...] [--dimensions N]
 | `--model` | str | provider-dependent | Provider-specific model, including aliases like `@tiny`, `@best`, `@multilingual-best`. |
 | `--dimensions` | int | (none) | Matryoshka truncation (shorter vectors). |
 
+### `kt memory rebuild`
+
+Rebuild derived memory indexes for an entire offline Session.
+
+```bash
+kt memory rebuild <session> [--dry-run] [--vectors auto|drop|rebuild]
+                          [--provider ...] [--model ...] [--dimensions N]
+```
+
+Existing vectors require an explicit policy or interactive confirmation.
+Provider, model and dimensions apply to vector rebuilding. See the
+[memory guide](../guides/memory.md) for backup, compatibility and recovery.
+
 ### `kt search`
 
 Search a session's memory. `<session>` accepts the same forms as
@@ -470,7 +483,7 @@ kt search <session> <query> [flags]
 
 | Flag | Type | Default | Description |
 |---|---|---|---|
-| `--mode` | `fts\|semantic\|hybrid\|auto` | `auto` | Search mode. Auto picks semantic when vectors exist, else FTS. |
+| `--mode` | `fts\|semantic\|hybrid\|auto` | `auto` | Search mode. Auto uses hybrid when embeddings are available, otherwise FTS. |
 | `--agent` | str | (none) | Restrict to events from one agent. |
 | `-k` | int | `10` | Max results. |
 

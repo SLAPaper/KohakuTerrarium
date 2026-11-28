@@ -410,6 +410,18 @@ kt embedding <session> [--provider ...] [--model ...] [--dimensions N]
 | `--model` | str | 视 provider 而定 | 该 provider 对应的 model，含别名如 `@tiny`、`@best`、`@multilingual-best`。 |
 | `--dimensions` | int | （无） | Matryoshka 截断 (较短的向量)。 |
 
+### `kt memory rebuild`
+
+离线重建整个 Session 的派生记忆索引。
+
+```bash
+kt memory rebuild <session> [--dry-run] [--vectors auto|drop|rebuild]
+                          [--provider ...] [--model ...] [--dimensions N]
+```
+
+存在旧向量时必须明确指定策略或交互确认。Provider、model 与 dimensions
+用于向量重建。备份、兼容性和恢复说明见[记忆指南](../guides/memory.md)。
+
 ### `kt search`
 
 搜索会话的记忆。`<session>` 接受与 `kt embedding` 相同的形式 (旧的 `.kt` 也辨识)。
@@ -420,7 +432,7 @@ kt search <session> <query> [flags]
 
 | 旗标 | 型别 | 默认 | 说明 |
 |---|---|---|---|
-| `--mode` | `fts\|semantic\|hybrid\|auto` | `auto` | 搜索模式。Auto 有向量就走 semantic，否则走 FTS。 |
+| `--mode` | `fts\|semantic\|hybrid\|auto` | `auto` | 搜索模式。Auto 在 Embedding 可用时使用 hybrid，否则使用 FTS。 |
 | `--agent` | str | （无） | 只看某只代理的事件。 |
 | `-k` | int | `10` | 最多返回几笔。 |
 

@@ -24,58 +24,49 @@ Searches the recorded event log of the current session.
 
 ## Behavior
 
-- `fts` never initializes or calls an embedding model. `auto` and `hybrid`
-  fall back to keywords when embedding fails or exceeds its wait limit;
-  the result reports the fallback. Explicit `semantic` returns an error.
-- Model work does not block session history, persistence, or shutdown.
-- Only the current session is searched, and only what was recorded before now.
-
-- Verified results carry Anchors; pass one back with before/after to inspect
-  bounded context and continue walking.
+- Search the current session's selected lineage, excluding search echoes.
+- `fts` needs no model. `auto` and `hybrid` fall back to FTS on embedding
+  failure or timeout; `semantic` reports an error.
+- Use returned Anchors to inspect exact source events.
 
 ## Limits
 
-- Compaction summarizes rather than deletes, so older turns stay findable here
-  after they leave your context.
+- Context is bounded; incomplete results carry a notice.
 
 ## Reference
 
-To inspect one search hit's context, call
-`search_memory(anchor=..., before=N, after=N, offset=N)` and follow the
-returned continuation Anchors. An Anchor verifies the physical event, not its
-branch membership.
+Recorded nonempty user/trigger input, assistant text, tool calls and tool
+results are indexed independently of processing state. Distinct error/output
+payloads contribute to the bounded indexed text. Search call/result echoes
+are excluded from ranking but remain recorded. Embedding work does not block
+session storage.
 
-- `scope="selected"` follows the branch view pinned when the Anchor was
-  issued. Unknown neighbor lineage is skipped while the bounded scan continues;
-  the result reports incomplete context. If the anchor itself has unknown
-  lineage, use raw scope.
-- `scope="raw"` reads the same Agent's physical context in recorded order,
-  including other branches and events of unknown lineage. Turn/branch
-  coordinates are displayed; these are not a claim of selected membership.
-  Keep `scope="raw"` when following raw continuation Anchors.
+Anchors are process-local and may expire (up to 2048 cached). A window returns
+up to 10 neighbors per side, with 900 characters per event slice.
 
-Scope does not change query-mode search or its index. Legacy hits without
-physical source references still require explicit offline
-`kt memory rebuild SESSION`. Stale, invalid or misbound source references
-return explicit errors in either scope.
+Call `search_memory(anchor=..., before=3, after=3)` to inspect the exact
+physical event and its neighbors. Follow returned Anchors to continue walking.
+For a long event, pass its Anchor and `next_offset` as `offset` with
+`before=0, after=0`; keep the same scope.
 
-- Search calls and their own tool-result echoes do not enter new Memory
-  indexes and are filtered from existing indexes; recorded events remain intact.
-- A context scan may return fewer neighbors than requested, with
-  `has_before=unknown` or `has_after=unknown` when the scan or lineage-proof
-  budget is reached. Try raw context to inspect events whose lineage cannot
-  be established within that budget.
-- If candidate filtering hits a backend limit, available matches are returned
-  with a **nonfatal incomplete-results warning**. Even with zero matches, this
-  means no eligible hits were found *within the scanned candidate window*.
-- Recorded user/trigger input, assistant text, tool calls and nonempty tool
-  results are indexed independently of the processing lifecycle. A tool
-  result may contain both an error and output; both contribute to the
-  bounded indexed text. Older indexes may have skipped these records or
-  omitted output; explicit offline rebuild can recover their search coverage.
-  Results beyond the index text cap can still be read by following the
-  tool-call Anchor or using offset pagination. A negative direct search
-  does not establish that the original event is absent.
-- For a long event whose context includes `next_offset=N`, use the **same
-  event's anchor** with `before=0, after=0, offset=N` and the same scope for
-  the next slice.
+- `scope="selected"` (default) follows the branch view pinned at Anchor
+  issuance. Unknown neighbors are skipped with an incomplete-context notice.
+  An unknown or excluded focus requires raw scope.
+- `scope="raw"` reads physical neighbors of the same agent, including other
+  branches, with recorded turn/branch coordinates. It does not broaden query
+  mode or bypass source verification.
+
+Each direction examines at most 256 physical key positions. Legacy ancestry
+inference is limited to the first 256 positions. `has_before=unknown` or
+`has_after=unknown` means continuity could not be established within budget.
+A verified Anchor never substitutes a different event for a missing source.
+
+FTS and semantic candidate budgets are 8192 and 4096 respectively. If filtering
+exhausts a budget, available ranked hits are returned with an incomplete-results
+warning; zero hits then does not establish absence from the history. Long
+indexed text may also be capped; inspect the source with an Anchor.
+
+Legacy index hits without physical source references remain searchable but
+cannot issue verified Anchors. Explicit offline `kt memory rebuild SESSION`
+restores source metadata and previously omitted content. Invalid or stale
+Anchors return an error; raw scope does not repair them.

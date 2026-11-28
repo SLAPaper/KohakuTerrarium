@@ -403,7 +403,14 @@ class TestSessionMemoryIndexing:
         self, tmp_path
     ):
         store = SessionStore(tmp_path / "view.kohakutr")
-        memory = SessionMemory(store.path, _FakeEmbedder(), store=store)
+        encoded = []
+
+        class CountingEmbedder(_FakeEmbedder):
+            def encode(self, texts):
+                encoded.extend(texts)
+                return super().encode(texts)
+
+        memory = SessionMemory(store.path, CountingEmbedder(), store=store)
         try:
             for branch, text in ((1, "needle older"), (2, "needle latest")):
                 store.append_event(
@@ -416,12 +423,11 @@ class TestSessionMemoryIndexing:
                 )
             rows = store.get_events("alice")
             memory.index_events("alice", rows)
-            generation = memory._generation("alice")
+            encoded.clear()
             persist_branch_view(store, "alice", {1: 2})
             # Merely recording the same view updates the cursor, not the index.
             assert memory.index_events("alice", rows) == 0
-            assert memory._generation("alice") == generation
-            assert memory._state["alice:cursor:keywords"]["branch_view"] == {"1": 2}
+            assert encoded == []
             prepared, blocks = memory._vector_batch("alice", rows)
             persist_branch_view(store, "alice", {1: 1})
             assert not memory.search("needle", mode="fts")
@@ -433,7 +439,6 @@ class TestSessionMemoryIndexing:
                 assert [r.content for r in memory.search("needle", mode=mode)] == [
                     "needle older"
                 ]
-            assert memory._generation("alice") == generation + 1
             persist_branch_view(store, "alice", None)
             memory.index_events("alice", rows)
             for mode in ("fts", "semantic", "hybrid"):

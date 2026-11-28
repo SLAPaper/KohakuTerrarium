@@ -11,7 +11,7 @@ tags:
 
 给想要搜索过去会话事件的读者：无论是从 CLI、从 Python，还是让 agent 在执行时自己查。
 
-会话的事件日志，同时也是一个小型的本地知识库。替它建立搜索索引后，你会得到 FTS 关键字搜索（免费、快速）、语意搜索（需要 embedder），以及用 embedding 相似度重新排序关键字命中的混合搜索。Agent 也可以通过内置的 `search_memory` 工具，查询自己或其他会话的记忆。
+会话的事件日志，同时也是一个小型的本地知识库。替它建立搜索索引后，你会得到 FTS 关键字搜索（免费、快速）、语意搜索（需要 embedder），以及融合关键字和语义排名的混合搜索。Agent 可以通过内置的 `search_memory` 工具查询当前会话的记忆。
 
 概念先读：[记忆与压缩](../concepts/modules/memory-and-compaction.md)、[会话](sessions.md)。
 
@@ -29,7 +29,7 @@ Source Anchor 用于定位确切物理事件。
 - `content`：命中的文字
 - `agent`：由哪个Creature产生
 - `block_type`：`text` / `tool` / `trigger` / `user`
-- `round_num`, `block_num`：在会话中的位置
+- `round_num`, `block_num`：兼容性分组标签，不是精确事件定位符
 - `score`：命中品质
 - `ts`：时间戳记
 
@@ -74,60 +74,33 @@ kt embedding swe.kohakutr \
 
 增量建立：再次执行 `kt embedding` 时，只会索引新增事件。
 
-### 从检索结果展开上下文
-
-`search_memory(anchor=..., scope="selected")` 默认沿 Anchor 保存的
-分支视图读取。若相邻旧历史的 ancestry 无法在预算内推导，跳过该事件，
-继续扫描并报告上下文不完整；中心事件归属未知时需使用 raw。
-
-`search_memory(anchor=..., scope="raw")` 有界读取同一 Agent 的物理
-相邻历史，包括其他分支和归属未知的事件，并显示记录的 Turn/Branch
-坐标。此开关不会扩大关键字或语义检索范围。两种模式均验证物理来源，
-支持连续导航和 Offset 分页。
-
 ## 为旧 Session 重建记忆索引
 
-先关闭使用该 Session 的全部 Agent、Studio、独立 Memory Reader 以及
-其他读写进程。对**整个 Session** 执行一次重建，不需要逐个指定 Agent：
+先关闭使用该 Session 的**全部读写进程**，包括外部进程。
+对整个 Session 执行重建，不需要逐个指定 Agent：
 
 ```bash
-kt memory rebuild /path/to/session.kohakutr
+kt memory rebuild SESSION
+kt memory rebuild SESSION --dry-run
+kt memory rebuild SESSION --vectors drop
+kt memory rebuild SESSION --vectors rebuild --provider sentence-transformer --model @best
 ```
 
-命令首先检查旧索引。若存在旧向量记录，交互式 CLI 会让你明确选择：
-**重新计算 Embedding**（可能下载模型或产生 API 费用），或者**舍弃旧
-Semantic 索引**。在非交互环境中，应显式选择：
+若存在旧向量，必须通过参数或交互提示明确选择：重新计算 Embedding
+（可能下载模型或产生 API 费用），或者舍弃旧向量，直到重新建立向量索引
+前禁用语义检索。没有向量时默认仅重建 FTS，并保留 Embedding 设置。
 
-```bash
-kt memory rebuild /path/to/session.kohakutr --dry-run
-kt memory rebuild /path/to/session.kohakutr --vectors drop
-kt memory rebuild /path/to/session.kohakutr --vectors rebuild --provider sentence-transformer --model @best
-```
+重建恢复物理事件定位信息，以及旧投影规则遗漏的内容。它沿用当前选中
+分支，因此旧全分支索引的检索范围可能缩小。不会修改原始事件、ancestry
+或外部 artifacts。缺失已索引来源、不可读事件及不支持的归档格式会在
+替换索引前被拒绝。
 
-新索引将从原始事件重建当前选中分支的 FTS 和 Source Anchor。对于原先
-使用全分支索引的 Session，新的检索覆盖范围可能缩小，但**原始事件
-不会被删除**。若已索引的 Agent 完全没有对应的物理事件，命令会拒绝
-清空其 FTS/Vector 索引；也会复用 Session 原有的格式门禁，拒绝含未来
-版本成员的文件族。这里仅保护派生的 Search 索引，**不负责检查或修复
-Session 事件历史的完整性**。
+命令先创建经过验证的 SQLite 逻辑备份，保留旧索引和已提交的 WAL 数据。
+重建在原数据库内进行；中断可能留下不完整或失效的派生索引。解决故障后
+重试，并保留备份。不要手动删除 WAL/SHM 文件。
 
-重建通过原有 Store 与 Memory 接口操作原始 Session，先创建并验证
-SQLite 逻辑备份（包含已提交的 WAL 数据），不替换 Session 文件，也不改动
-外部 artifacts 或重写原始事件。索引更新中断后，已知失效的索引需要刷新
-或重建，可使用相同的向量策略重试。备份保留旧索引，包括付费生成的向量。
-
-不会在格式不兼容时静默复用旧向量；显式舍弃向量后，需要重新建立
-Embedding 索引才能恢复语义检索。重新计算向量时，会先完成对应 Agent
-的新 Embedding 计算，再清除其旧向量记录。
-
-旧 Session 保存了 Embedding Provider 但未保存模型名称时，使用该 Provider
-的默认模型。模型加载失败后可以重试。SQLite 自行管理 WAL／SHM，
-**不要手动删除 Sidecar 文件**。离线维护要求关闭所有读写进程，包括不
-参与 Session 写锁协调的消费者。
-
-未重建的旧索引可能返回 `ANCHOR_REBUILD_REQUIRED`。此前遗漏的事件及
-仅索引 Error 的旧记录，也需要显式重建才能恢复完整的索引覆盖。普通
-Search 不会自动启动重建，重建不会为旧原始事件补写 ancestry。
+普通搜索不会自动触发这种显式维护。分支切换仍可能通过正常索引生命周期
+刷新受影响的索引。
 
 ## 从 CLI 搜索
 
@@ -143,7 +116,7 @@ kt search swe "auth bug" --agent swe -k 5
 
 - **`fts`**：在 FTS5 上跑 BM25。不需要 embedding。最快，适合精确片语。
 - **`semantic`**：纯向量相似度。需要索引。适合同义改写。
-- **`hybrid`**：先用 BM25 找候选，再以向量相似度重排。当两者都可用时会是默认。
+- **`hybrid`**：融合关键字和向量检索的排名（Reciprocal Rank Fusion）。
 - **`auto`**：自动选择该会话支持的最完整模式。
 
 `-k` 用来限制结果数量。`--agent` 可把搜索范围限制在Terrarium会话中的单一Creature。
@@ -177,6 +150,21 @@ memory:
 [search_memory/]
 ```
 
+### 从检索结果展开上下文
+
+将返回的 Anchor 传给 `search_memory(anchor=..., before=3, after=3)`。
+使用相邻事件返回的 Anchor 继续导航；长事件则使用同一 Anchor、scope
+和返回的 `next_offset` 分页读取。
+
+- `scope="selected"`（默认）：沿 Anchor 保存的分支视图读取。跳过归属
+  未知的相邻事件；中心事件归属未知时需使用 raw。
+- `scope="raw"`：读取同一 Agent 的物理相邻事件，包括其他分支，并显示
+  已记录的 Turn/Branch 坐标。普通检索仍只使用选中分支索引。
+
+工具调用及回执中的搜索自回声不会进入排名。预算耗尽时返回可用结果及
+不完整提示，不表示没有更多证据。缺少物理来源的旧索引仍可检索，但需
+显式重建才能获得 Anchor。
+
 如果你要对 *外部* 数据源做 RAG，请自己做一个 custom tool，或做一个会调用向量数据库的 [插件指南](plugins.md)。
 
 ## 在Creature里设置记忆
@@ -188,23 +176,22 @@ memory:
     model: "@retrieval"      # preset 或 HF 路径
 ```
 
-带有这个区块的 agent，事件一进来就会自动建立索引，不需要再手动调用 `kt embedding`。没有这个区块的 agent，仍然会保留未嵌入的会话（但还是能用 FTS 搜索）。
+实时搜索会按需刷新当前 Agent 的索引；FTS 不需要 Embedding Provider。
 
 ## 用程式检查
 
 ```python
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.memory.index import SessionMemory
-from kohakuterrarium.session.memory.embedding import GeminiEmbedder
+from kohakuterrarium.session.memory.source_events import sourced_events
 
 store = SessionStore("~/.kohakuterrarium/sessions/swe.kohakutr")
-embedder = GeminiEmbedder("gemini-embedding-004", api_key="...")
-memory = SessionMemory(store.path, embedder=embedder, store=store)
+memory = SessionMemory(store.path, store=store)
 
-memory.index_events("swe", store.get_events("swe"))
-results = memory.search("refactor", mode="hybrid", k=5)
+memory.index_events("swe", sourced_events(store, "swe"))
+results = memory.search("refactor", mode="fts", k=5)
 for r in results:
-    print(f"{r.agent} r{r.round_num}: {r.content[:120]} ({r.score:.2f})")
+    print(r.agent, r.source_ref, r.content[:120])
 
 memory.close()
 store.close()
@@ -216,11 +203,11 @@ store.close()
 - **`kt embedding` 很慢**。 `sentence-transformer` 默认是 CPU-bound。请安装支持 CUDA 的 torch，或改用 `model2vec`。
 - **Provider 安装失败**。 `kt embedding --provider model2vec` 没有 native 依赖，在哪里都能跑。`sentence-transformer` 需要 `torch`；`api` 需要对应 provider 的 SDK（`openai`、`google-generativeai` 等）。
 - **Hybrid 模式结果噪声很多**。 把 `-k` 调低；如果查询很多改写语句，偏向用 `semantic` 而不是 `hybrid`；如果查的是精确片语，偏向用 `fts`。
-- **`search_memory` 没有返回任何结果**。 会话缺少 embedding 设置，或这个会话是在加入记忆设置之前启动的，请用 `kt embedding` 重新建立。
+- **旧索引缺少命中或 Anchor**。先尝试 FTS 并检查选中分支。使用 `kt memory rebuild SESSION` 恢复历史覆盖和来源信息；不完整提示及文本长度上限也可能限制结果。
 
 ## 延伸阅读
 
 - [会话](sessions.md)：记忆建立在 `.kohakutr` 格式之上。
 - [插件指南](plugins.md)：seamless-memory 插件模式（`pre_llm_call` 检索）。
-- [参考 / CLI](../reference/cli.md)：`kt embedding`、`kt search` 的旗标。
+- [参考 / CLI](../reference/cli.md)：`kt embedding`、`kt search`、`kt memory rebuild` 的旗标。
 - [概念 / 记忆与压缩](../concepts/modules/memory-and-compaction.md)：背后的设计理由。

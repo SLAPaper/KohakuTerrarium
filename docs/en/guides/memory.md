@@ -11,7 +11,7 @@ tags:
 
 For readers who want to search past session events from the CLI, from Python, or from an agent at runtime.
 
-A session's event log is also a small local knowledge base. Building a search index over it gives you FTS keyword search (free, fast), semantic search (needs an embedder), and hybrid search that reranks keyword hits with embedding similarity. Agents can query their own or another session's memory through the built-in `search_memory` tool.
+A session's event log is also a small local knowledge base. Building a search index over it gives you FTS keyword search (free, fast), semantic search (needs an embedder), and hybrid search that fuses keyword and semantic rankings. Agents can query the current session's memory through the built-in `search_memory` tool.
 
 Concept primer: [memory and compaction](../concepts/modules/memory-and-compaction.md), [sessions](sessions.md).
 
@@ -31,7 +31,7 @@ Search returns `SearchResult` records with:
 - `content`: the matched text
 - `agent`: which creature produced it
 - `block_type`: `text` / `tool` / `trigger` / `user`
-- `round_num`, `block_num`: position in the session
+- `round_num`, `block_num`: compatibility grouping labels, not exact event locators
 - `score`: match quality
 - `ts`: timestamp
 
@@ -76,73 +76,37 @@ kt embedding swe.kohakutr \
 
 Incremental: running `kt embedding` again only indexes new events.
 
-### Navigate from a search hit
+## Rebuild an older Session's memory index
 
-`search_memory(anchor=..., scope="selected")` follows the selected branch
-view saved with the Anchor. Neighbors of unknown legacy ancestry are skipped
-within the bounded scan and the window reports incomplete context. A focus
-event of unknown ancestry requires raw scope.
-
-`search_memory(anchor=..., scope="raw")` reads bounded physical context
-from the same Agent, including other branches and unknown lineage, with
-recorded turn/branch coordinates. It does not broaden keyword or semantic
-search. Both scopes verify the exact source and support continuation and
-offset pagination.
-
-## Rebuild memory indexes for an older Session
-
-Close all agents, Studio instances and standalone Memory readers/writers
-that use this Session. Run one command for the **whole Session**, without
-selecting individual Agents:
+Close **all** readers and writers of the Session, including external processes.
+Rebuild the whole Session, not individual agents:
 
 ```bash
-kt memory rebuild /path/to/session.kohakutr
+kt memory rebuild SESSION
+kt memory rebuild SESSION --dry-run
+kt memory rebuild SESSION --vectors drop
+kt memory rebuild SESSION --vectors rebuild --provider sentence-transformer --model @best
 ```
 
-The command inspects existing indexes first. If old vector rows are present,
-the interactive CLI asks whether to **recompute** their embeddings (may
-download a model or incur API charges) or **drop** the obsolete semantic
-index. In scripts, select the behavior explicitly:
+Existing vector rows require an explicit choice (or the interactive prompt):
+recompute embeddings, which may download a model or incur API charges, or
+drop the old vectors and disable semantic retrieval until re-embedded.
+If no vectors exist, the default rebuild is FTS-only and preserves embedding
+preferences.
 
-```bash
-kt memory rebuild /path/to/session.kohakutr --dry-run
-kt memory rebuild /path/to/session.kohakutr --vectors drop
-kt memory rebuild /path/to/session.kohakutr --vectors rebuild --provider sentence-transformer --model @best
-```
+Rebuild restores physical source references and content skipped by old
+projection rules. It uses the selected branch view, so an old all-branch
+index may become narrower. It does not modify original events, ancestry or
+external artifacts. Missing source namespaces, unreadable events and
+unsupported archive formats are refused before index replacement.
 
-A rebuild recreates selected-lineage FTS and Source Anchors from the original
-event log. Existing all-branch indexes may become narrower: no recorded
-events are deleted, but some previously indexed blocks may no longer be
-searchable in the current projection. Rebuild refuses to clear a previously
-indexed Agent's FTS/vector entries if no physical source events remain, and
-uses the ordinary Session format gate to reject future archive-family versions.
-This guards the derived Search index; it does not diagnose or repair missing
-Session history.
+A verified logical SQLite backup includes prior indexes and committed WAL
+data. Rebuild updates the existing database in place; an interrupted update
+may leave derived indexes incomplete or invalid. Retry after resolving the
+failure, keeping the backup. Do not delete WAL/SHM files manually.
 
-Before updating the original Session through its normal Store and Memory
-interfaces, the command creates a verified logical SQLite backup, including
-committed WAL data. Rebuild never replaces the Session file or changes
-external artifacts. Original events are not rewritten. If an index update is
-interrupted, that index remains invalid until refreshed or rebuilt; retry
-the command with the same vector policy. The backup preserves prior indexes,
-including paid embeddings.
-
-Existing vectors are not silently reused across incompatible index formats.
-If you choose to drop vectors, semantic retrieval is disabled until an
-embedding index is explicitly rebuilt. A vector reset does not clear the
-previous rows for an Agent until its new embeddings have been computed.
-
-A saved provider with no model name uses its default model. A failed model
-load can be retried. SQLite manages its own WAL/SHM bookkeeping; **do not
-delete sidecar files manually**. Offline maintenance requires stopping all
-readers/writers, including consumers that do not participate in the Session
-writer lock.
-
-Old Search results may report `ANCHOR_REBUILD_REQUIRED` until the Session's
-derived indexes have been rebuilt. Previously skipped content and legacy
-error-only index rows also require a rebuild to recover their full indexed
-coverage. Normal Search never silently triggers this maintenance command.
-Rebuild does not add ancestry to historical events.
+Ordinary searches do not perform this explicit maintenance automatically.
+A branch change may refresh the affected index through its normal lifecycle.
 
 ## Search from the CLI
 
@@ -158,7 +122,7 @@ Modes:
 
 - **`fts`**: BM25 over FTS5. No embeddings needed. Fastest. Great for literal phrases.
 - **`semantic`**: pure vector similarity. Needs an index. Great for paraphrases.
-- **`hybrid`**: BM25 candidates reranked by vector similarity. Default when both are available.
+- **`hybrid`**: Reciprocal-rank fusion of keyword and semantic rankings.
 - **`auto`**: picks the richest mode the session supports.
 
 `-k` caps results. `--agent` filters to one creature inside a terrarium session.
@@ -207,6 +171,23 @@ Tool args (shape; concrete syntax depends on your `tool_format`; default bracket
 [search_memory/]
 ```
 
+### Navigate a search result
+
+Pass a returned opaque anchor to `search_memory(anchor=..., before=3, after=3)`.
+Follow neighboring anchors to walk through events, or use the returned
+`next_offset` with the same anchor and scope to read a long event.
+
+- `scope="selected"` (default) follows the anchor's pinned branch view.
+  Unknown neighbors are skipped; a focus of unknown lineage requires raw scope.
+- `scope="raw"` reads physical neighbors of the same agent, including other
+  branches, with recorded turn/branch coordinates. Query-mode search remains
+  selected-lineage only.
+
+The tool excludes its own call/result echoes from ranked retrieval. Budget
+exhaustion yields available hits or context with an incomplete-results notice,
+not proof that no more evidence exists. Legacy hits without physical source
+references remain searchable but need explicit rebuild for anchors.
+
 For RAG over *external* sources, build a custom tool or a [plugin](plugins.md) that calls your vector store.
 
 ## Configuring memory in a creature
@@ -218,23 +199,22 @@ memory:
     model: "@retrieval"       # preset or HF path
 ```
 
-Agents with this block indexed automatically as events land; no `kt embedding` call needed. Agents without it keep an unembedded session (still FTS-searchable).
+Live searches refresh the current agent's index as needed; FTS does not require an embedding provider.
 
 ## Inspecting programmatically
 
 ```python
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.memory.index import SessionMemory
-from kohakuterrarium.session.memory.embedding import GeminiEmbedder
+from kohakuterrarium.session.memory.source_events import sourced_events
 
 store = SessionStore("~/.kohakuterrarium/sessions/swe.kohakutr")
-embedder = GeminiEmbedder("gemini-embedding-004", api_key="...")
-memory = SessionMemory(store.path, embedder=embedder, store=store)
+memory = SessionMemory(store.path, store=store)
 
-memory.index_events("swe", store.get_events("swe"))
-results = memory.search("refactor", mode="hybrid", k=5)
+memory.index_events("swe", sourced_events(store, "swe"))
+results = memory.search("refactor", mode="fts", k=5)
 for r in results:
-    print(f"{r.agent} r{r.round_num}: {r.content[:120]} ({r.score:.2f})")
+    print(r.agent, r.source_ref, r.content[:120])
 
 memory.close()
 store.close()
@@ -246,11 +226,11 @@ store.close()
 - **Slow `kt embedding`.** `sentence-transformer` is CPU-bound by default. Install torch with CUDA, or drop to `model2vec`.
 - **Provider install fails.** `kt embedding --provider model2vec` has no native deps and works everywhere. `sentence-transformer` needs `torch`; `api` needs the provider SDK (`openai`, `google-generativeai`, etc.).
 - **Hybrid mode returns noise.** Lower `-k` and prefer `semantic` over `hybrid` for paraphrase-heavy queries; prefer `fts` for literal-phrase queries.
-- **search_memory returns nothing.** The session's embedding config is missing or the session started before you added memory config; rebuild with `kt embedding`.
+- **Missing hits or anchors in an old index.** Try FTS and inspect the selected branch. Use `kt memory rebuild SESSION` to restore historical coverage or source metadata; incomplete notices and text caps can also limit results.
 
 ## See also
 
 - [Sessions](sessions.md): the `.kohakutr` format that memory sits on top of.
 - [Plugins](plugins.md): seamless-memory plugin pattern (`pre_llm_call` retrieval).
-- [Reference / CLI](../reference/cli.md): `kt embedding`, `kt search` flags.
+- [Reference / CLI](../reference/cli.md): `kt embedding`, `kt search`, and `kt memory rebuild` flags.
 - [Concepts / memory and compaction](../concepts/modules/memory-and-compaction.md): the design rationale.

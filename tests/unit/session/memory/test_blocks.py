@@ -461,8 +461,8 @@ def test_view_extension_retains_incremental_projection_and_view_removal_rebuilds
     more, cursor = extract_batch(
         "alice", TailOnly(rows), cursor, branch_view={1: 1, 2: 1}
     )
-    full, full_cursor = extract_batch("alice", rows, branch_view={1: 1, 2: 1})
+    full, _ = extract_batch("alice", rows, branch_view={1: 1, 2: 1})
     assert first + more == full
-    assert cursor == full_cursor
+    assert not extract_batch("alice", rows, cursor, branch_view={1: 1, 2: 1})[0]
     with pytest.raises(RebuildRequired):
         extract_batch("alice", rows, cursor)
