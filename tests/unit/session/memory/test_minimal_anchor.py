@@ -371,10 +371,10 @@ async def test_unambiguous_anchor_does_not_expand_conflicting_scope(
 
 
 @pytest.mark.asyncio
-async def test_late_background_result_is_navigable_even_if_legacy_fts_misses_it(
+async def test_late_background_result_is_searchable_and_navigable(
     tmp_path,
 ):
-    """The anchor feature need not repair the historical index projection."""
+    """Late results are content, independent of the processing lifecycle."""
     store = SessionStore(tmp_path / "late-result.kohakutr")
     store.init_meta("s", "agent", "", str(tmp_path), ["alice"])
     ctx = _ctx(store)
@@ -397,7 +397,8 @@ async def test_late_background_result_is_navigable_even_if_legacy_fts_misses_it(
         direct = await tool.execute(
             {"query": "LATE_BG_RESULT_UNIQUE", "mode": "fts"}, context=ctx
         )
-        assert "No results found" in direct.output
+        assert direct.error is None and "LATE_BG_RESULT_UNIQUE" in direct.output
+        assert _anchors(direct.output)
         origin = await tool.execute(
             {"query": "INDEXED_ORIGIN_FOR_SLOW_JOB", "mode": "fts"}, context=ctx
         )

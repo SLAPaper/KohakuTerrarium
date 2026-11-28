@@ -184,7 +184,7 @@ def search_cli(
                 )
 
         # Saved dimensions let SessionMemory discover existing vector tables.
-        memory = SessionMemory(str(path), embedder=embedder)
+        memory = SessionMemory(str(path), embedder=embedder, store=store)
 
         if mode in ("semantic", "hybrid") and not memory.has_vectors:
             print("No vector index found. Run 'kt embedding' first, or use --mode fts")

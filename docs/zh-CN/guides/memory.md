@@ -17,7 +17,12 @@ tags:
 
 ## 哪些内容可搜索
 
-`~/.kohakuterrarium/sessions/*.kohakutr` 里的每一个事件，都是一个可搜索的「区块」：用户输入、assistant 文字、工具调用、工具结果、子代理输出、频道消息。区块会依处理轮次分组，所以搜索结果可以把上下文带回正确的时间点。
+Memory 将当前选中分支的用户输入、Trigger 内容、Assistant 文本、工具调用
+及非空工具结果投影为可检索 Block。分支选择沿用 Resume 已保存的 Branch
+View，未指定时使用主干默认选择。内容准入不依赖 Processing 生命周期，
+因此迟到的后台结果和后续同步工具调用同样可以进入索引。非空 Error 与
+Output 共同使用已有的索引长度预算。Round/Block 保留为兼容性分组标签，
+Source Anchor 用于定位确切物理事件。
 
 搜索会回传 `SearchResult` 记录，包含：
 
@@ -72,8 +77,8 @@ kt embedding swe.kohakutr \
 ### 从检索结果展开上下文
 
 `search_memory(anchor=..., scope="selected")` 默认沿 Anchor 保存的
-分支视图读取。旧历史的 ancestry 若不能在预算内推导，返回的上下文可能
-不完整。
+分支视图读取。若相邻旧历史的 ancestry 无法在预算内推导，跳过该事件，
+继续扫描并报告上下文不完整；中心事件归属未知时需使用 raw。
 
 `search_memory(anchor=..., scope="raw")` 有界读取同一 Agent 的物理
 相邻历史，包括其他分支和归属未知的事件，并显示记录的 Turn/Branch
@@ -120,8 +125,9 @@ Embedding 索引才能恢复语义检索。重新计算向量时，会先完成�
 **不要手动删除 Sidecar 文件**。离线维护要求关闭所有读写进程，包括不
 参与 Session 写锁协调的消费者。
 
-未重建的旧索引可能返回 `ANCHOR_REBUILD_REQUIRED`。普通 Search 不会
-自动启动重建。
+未重建的旧索引可能返回 `ANCHOR_REBUILD_REQUIRED`。此前遗漏的事件及
+仅索引 Error 的旧记录，也需要显式重建才能恢复完整的索引覆盖。普通
+Search 不会自动启动重建，重建不会为旧原始事件补写 ancestry。
 
 ## 从 CLI 搜索
 
@@ -195,11 +201,12 @@ store = SessionStore("~/.kohakuterrarium/sessions/swe.kohakutr")
 embedder = GeminiEmbedder("gemini-embedding-004", api_key="...")
 memory = SessionMemory(store.path, embedder=embedder, store=store)
 
-memory.index_events("swe")
-results = await memory.search("refactor", mode="hybrid", k=5)
+memory.index_events("swe", store.get_events("swe"))
+results = memory.search("refactor", mode="hybrid", k=5)
 for r in results:
     print(f"{r.agent} r{r.round_num}: {r.content[:120]} ({r.score:.2f})")
 
+memory.close()
 store.close()
 ```
 

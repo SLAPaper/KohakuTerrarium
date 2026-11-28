@@ -20,6 +20,8 @@ from kohakuterrarium.session.memory.blocks import (
     _anchor,
     _content_to_text,
     _extract_blocks,
+    _tool_result_text,
+    TOOL_RESULT_INDEX_CHARS,
 )
 from kohakuterrarium.utils.logging import get_logger
 
@@ -137,31 +139,34 @@ def _event_text(event: dict) -> str:
     if kind == "tool_call":
         return f"{event.get('name', '')} {event.get('args', {})}"
     if kind == "tool_result":
-        return _content_to_text(event.get("error") or event.get("output"))
+        return _tool_result_text(event)
     return _content_to_text(
         event.get("content") or event.get("error") or event.get("summary") or ""
     )
 
 
 def _source_matches_indexed_block(event: dict, hit, part: int) -> bool:
-    """Compare the hit to its exact source event using the index's projection.
-
-    The in-round cursor permits a single event to be replayed as an index
-    candidate, without a full conversation replay or a duplicate extractor.
-    """
+    """Verify against the current projection or the old result payload format."""
     if part < 0:
         return False
     try:
-        blocks = _extract_blocks(
-            hit.agent, [event], cursor={"in_round": True, "round": 1}
-        )
+        blocks = _extract_blocks(hit.agent, [event], cursor={})
     except (TypeError, AttributeError, ValueError):
         return False
-    return (
+    if (
         part < len(blocks)
         and blocks[part].block_type == hit.block_type
         and blocks[part].content == hit.content
-    )
+    ):
+        return True
+    # Existing source-bound index rows stored error OR output. Verify their
+    # original projection without forcing a paid re-embedding or migration.
+    if part == 0 and event.get("type") == "tool_result" and hit.block_type == "tool":
+        error = _content_to_text(event.get("error"))
+        output = _content_to_text(event.get("output"))
+        previous = f"[result:{event.get('name', '')}] {error or output}"
+        return len(previous) > 20 and previous[:TOOL_RESULT_INDEX_CHARS] == hit.content
+    return False
 
 
 class MemoryNavigator:
@@ -283,12 +288,7 @@ class MemoryNavigator:
                     if (turn, branch) not in (("0", 0), (0, 0))
                 }
             )
-            requested = _coerce_branch_view(
-                self._store.state.get(f"{agent}:branch_view")
-            )
         except InvalidBranchViewError:
-            return None
-        if any(selected.get(turn) != branch for turn, branch in requested.items()):
             return None
         return tuple(sorted(selected.items()))
 
@@ -394,8 +394,12 @@ class MemoryNavigator:
                 'Use scope="raw" to inspect the physical event.',
             )
 
+        unknown = False
+
         def side(direction: int, count: int):
+            nonlocal unknown
             found = []
+            skipped_unknown = False
             seq = start_seq + direction
             examined = 0
             while 0 <= seq < frontier and len(found) <= count:
@@ -410,11 +414,14 @@ class MemoryNavigator:
                 if isinstance(event, dict):
                     eligible = visible(event, seq)
                     if eligible is None:
-                        return found[:count], None
-                    if eligible:
+                        unknown = skipped_unknown = True
+                    elif eligible:
                         found.append((ref, event))
                 seq += direction
-            return found[:count], len(found) > count
+            has_more = (
+                True if len(found) > count else None if skipped_unknown else False
+            )
+            return found[:count], has_more
 
         prior, has_before = side(-1, before)
         later, has_after = side(1, after)
@@ -460,4 +467,10 @@ class MemoryNavigator:
                     event.get("branch_id"),
                 )
             )
-        return ContextWindow(out, has_before, has_after, scope)
+        notice = (
+            "Some events of unknown lineage were skipped; context may be incomplete. "
+            'Use scope="raw" to inspect physical history.'
+            if unknown
+            else ""
+        )
+        return ContextWindow(out, has_before, has_after, scope, notice)

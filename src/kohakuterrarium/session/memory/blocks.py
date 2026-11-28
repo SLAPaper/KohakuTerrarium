@@ -25,8 +25,34 @@ def _anchor(event: dict) -> str:
     ).hexdigest()
 
 
+def view_matches_checkpoint(checkpoint: dict, view: dict[int, int] | None) -> bool:
+    """Whether a saved projection can extend under the current branch request.
+
+    Adding a constraint already satisfied by the indexed prefix is harmless.
+    Removing or changing one can reactivate history and requires replay.
+    """
+    requested = {str(t): b for t, b in (view or {}).items()}
+    previous = checkpoint.get("branch_view", {})
+    if requested == previous:
+        return True
+    if any(requested.get(t) != b for t, b in previous.items()):
+        return False
+    branches = checkpoint.get("branches", {})
+    max_turn = max((int(t) for t in branches), default=0)
+    conflicts = set(checkpoint.get("legacy_conflicts", []))
+    return all(
+        branches.get(t) == b or (int(t) > max_turn and int(t) not in conflicts)
+        for t, b in requested.items()
+    )
+
+
 def extract_batch(
-    agent: str, events: list[dict], checkpoint: dict | None = None, start_from: int = 0
+    agent: str,
+    events: list[dict],
+    checkpoint: dict | None = None,
+    start_from: int = 0,
+    *,
+    branch_view: dict[int, int] | None = None,
 ):
     """Extract the append-only suffix, retaining round and branch context."""
     state = dict(checkpoint or {})
@@ -35,6 +61,9 @@ def extract_batch(
         count and state.get("anchor") != _anchor(events[count - 1])
     ):
         raise RebuildRequired
+    if checkpoint and not view_matches_checkpoint(checkpoint, branch_view):
+        raise RebuildRequired
+    requested = {str(t): b for t, b in (branch_view or {}).items()}
     branches = dict(state.get("branches", {}))
     legacy_conflicts = state.get("legacy_conflicts", [])
     max_turn = max((int(t) for t in branches), default=0)
@@ -44,6 +73,8 @@ def extract_batch(
             if not isinstance(turn, int) or not isinstance(branch, int):
                 continue
             key = str(turn)
+            if key in requested and requested[key] != branch:
+                raise RebuildRequired
             if key not in branches and turn <= max_turn:
                 raise RebuildRequired
             if key in branches and branches[key] != branch:
@@ -63,7 +94,8 @@ def extract_batch(
     else:
         paths = index_parent_paths(events)
         branches = {
-            str(k): v for k, v in resolve_selected_branches(events, paths, None).items()
+            str(k): v
+            for k, v in resolve_selected_branches(events, paths, branch_view).items()
         }
         latest = {}
         for event in events:
@@ -71,7 +103,9 @@ def extract_batch(
             if isinstance(turn, int) and isinstance(branch, int):
                 latest[turn] = max(latest.get(turn, 0), branch)
         legacy_conflicts = [t for t, b in latest.items() if branches.get(str(t)) != b]
-        live_ids = select_live_event_ids(events)
+        live_ids = select_live_event_ids(
+            events, branch_view=branch_view, parent_paths=paths
+        )
     if count:
         state["previous"] = {
             k: v for k, v in events[count - 1].items() if k not in {"event_id", "ts"}
@@ -86,6 +120,10 @@ def extract_batch(
             for b in blocks
             if int(b.block_id.rsplit(":e", 1)[1].split(":")[0]) >= start_from
         ]
+    if requested:
+        state["branch_view"] = requested
+    else:
+        state.pop("branch_view", None)
     state.update(
         count=len(events),
         branches=branches,
@@ -143,6 +181,17 @@ def _content_to_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
+def _tool_result_text(event: dict) -> str:
+    """Preserve distinct error and output payloads in one physical result."""
+    error = _content_to_text(event.get("error"))
+    output = _content_to_text(event.get("output"))
+    if not error.strip():
+        return output
+    if not output.strip() or error == output:
+        return error
+    return error + "\n" + output
+
+
 def _extract_blocks(
     agent: str,
     events: list[dict],
@@ -158,7 +207,6 @@ def _extract_blocks(
     blocks: list[Block] = []
     round_num = state.get("round", 0)
     block_num = state.get("block", 0)
-    in_round = state.get("in_round", False)
     previous = state.pop("previous", None)
 
     for i, evt in enumerate(events):
@@ -176,7 +224,6 @@ def _extract_blocks(
         if etype == "user_input":
             round_num += 1
             block_num = 0
-            in_round = True
             content = _content_to_text(evt.get("content", ""))
             if content.strip():
                 blocks.append(
@@ -194,7 +241,6 @@ def _extract_blocks(
         elif etype == "trigger_fired":
             round_num += 1
             block_num = 0
-            in_round = True
             channel = evt.get("channel", "")
             content = _content_to_text(evt.get("content", ""))
             label = f"[trigger:{channel}] {content}" if channel else content
@@ -212,7 +258,7 @@ def _extract_blocks(
                 )
                 block_num += 1
 
-        elif etype in ("text", "text_chunk") and in_round:
+        elif etype in ("text", "text_chunk"):
             # Stream chunks remain separate searchable blocks in event order.
             content = _content_to_text(evt.get("content", ""))
             # Paragraph splits improve retrieval precision for long responses.
@@ -231,7 +277,7 @@ def _extract_blocks(
                     )
                     block_num += 1
 
-        elif etype == "tool_call" and in_round:
+        elif etype == "tool_call":
             name = evt.get("name", "")
             args = evt.get("args", {})
             args_text = " ".join(
@@ -252,12 +298,11 @@ def _extract_blocks(
             )
             block_num += 1
 
-        elif etype == "tool_result" and in_round:
+        elif etype == "tool_result":
             name = evt.get("name", "")
-            output = _content_to_text(evt.get("output", ""))
-            error = _content_to_text(evt.get("error", ""))
-            content = f"[result:{name}] {error or output}"
-            if content.strip() and len(content) > 20:
+            payload = _tool_result_text(evt)
+            if payload.strip():
+                content = f"[result:{name}] {payload}"
                 blocks.append(
                     Block(
                         round_num=round_num,
@@ -271,9 +316,6 @@ def _extract_blocks(
                 )
                 block_num += 1
 
-        elif etype == "processing_end":
-            in_round = False
-
         source_ref = getattr(evt, "source_ref", "")
         source_fingerprint = _anchor(evt) if source_ref else ""
         for part, block in enumerate(blocks[first_block:]):
@@ -281,5 +323,6 @@ def _extract_blocks(
             block.source_ref = source_ref
             block.source_fingerprint = source_fingerprint
 
-    state.update(round=round_num, block=block_num, in_round=in_round)
+    state.pop("in_round", None)  # Old cursor field, no longer a content gate.
+    state.update(round=round_num, block=block_num)
     return blocks

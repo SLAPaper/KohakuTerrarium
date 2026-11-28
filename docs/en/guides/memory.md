@@ -17,7 +17,14 @@ Concept primer: [memory and compaction](../concepts/modules/memory-and-compactio
 
 ## What's searchable
 
-Every event in `~/.kohakuterrarium/sessions/*.kohakutr` is a searchable "block": user input, assistant text, tool calls, tool results, sub-agent outputs, channel messages. Blocks are grouped by processing round so search results carry context back to the right moment.
+Memory projects selected-lineage user input, trigger content, assistant text,
+tool calls and nonempty tool results into searchable blocks. It follows the
+same persisted branch view as Resume (or the default history selection).
+Content eligibility does not depend on whether the Agent is processing:
+late background results and synchronous follow-up calls are indexed too.
+Distinct error and output payloads share the existing index text budget.
+Round/block labels remain compatibility grouping metadata; source Anchors
+identify exact physical events.
 
 Search returns `SearchResult` records with:
 
@@ -72,8 +79,9 @@ Incremental: running `kt embedding` again only indexes new events.
 ### Navigate from a search hit
 
 `search_memory(anchor=..., scope="selected")` follows the selected branch
-view saved with the Anchor. If legacy ancestry cannot be resolved within
-the read budget, selected context may be partial.
+view saved with the Anchor. Neighbors of unknown legacy ancestry are skipped
+within the bounded scan and the window reports incomplete context. A focus
+event of unknown ancestry requires raw scope.
 
 `search_memory(anchor=..., scope="raw")` reads bounded physical context
 from the same Agent, including other branches and unknown lineage, with
@@ -131,8 +139,10 @@ readers/writers, including consumers that do not participate in the Session
 writer lock.
 
 Old Search results may report `ANCHOR_REBUILD_REQUIRED` until the Session's
-derived indexes have been rebuilt. Normal Search never silently triggers
-this maintenance command.
+derived indexes have been rebuilt. Previously skipped content and legacy
+error-only index rows also require a rebuild to recover their full indexed
+coverage. Normal Search never silently triggers this maintenance command.
+Rebuild does not add ancestry to historical events.
 
 ## Search from the CLI
 
@@ -221,11 +231,12 @@ store = SessionStore("~/.kohakuterrarium/sessions/swe.kohakutr")
 embedder = GeminiEmbedder("gemini-embedding-004", api_key="...")
 memory = SessionMemory(store.path, embedder=embedder, store=store)
 
-memory.index_events("swe")
-results = await memory.search("refactor", mode="hybrid", k=5)
+memory.index_events("swe", store.get_events("swe"))
+results = memory.search("refactor", mode="hybrid", k=5)
 for r in results:
     print(f"{r.agent} r{r.round_num}: {r.content[:120]} ({r.score:.2f})")
 
+memory.close()
 store.close()
 ```
 

@@ -60,7 +60,7 @@ class LiveSessionMemory:
 
     def __init__(self, store):
         self._store = store
-        self._memory = SessionMemory(store.path)
+        self._memory = SessionMemory(store.path, store=store)
         self._navigator = MemoryNavigator(store, self._memory)
         self._worker = _EmbeddingWorker()
         self._semantic_lock = asyncio.Lock()

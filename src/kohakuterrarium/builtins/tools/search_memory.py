@@ -39,7 +39,7 @@ class SearchMemoryTool(BaseTool):
     def description(self) -> str:
         return (
             "Search this session's history by keyword or meaning. "
-            "Explore context via anchors; scope=raw reads physical history. "
+            "Use it to explore anchors; scope=raw reads physical history. "
             "Not for files - use grep."
         )
 

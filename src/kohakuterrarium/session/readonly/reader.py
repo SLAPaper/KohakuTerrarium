@@ -142,7 +142,7 @@ class SessionReader:
         Sessions without an existing memory index return no hits; call
         :meth:`index` first for ad-hoc keyword search.
         """
-        memory = SessionMemory(str(self._path))
+        memory = SessionMemory(str(self._path), store=self._store)
         try:
             return memory.search(query, mode=mode, k=k, agent=agent)
         finally:
@@ -150,7 +150,7 @@ class SessionReader:
 
     def index(self) -> int:
         """Index this session's events for :meth:`search` (FTS only)."""
-        memory = SessionMemory(str(self._path))
+        memory = SessionMemory(str(self._path), store=self._store)
         try:
             total = 0
             for name in self.agents:

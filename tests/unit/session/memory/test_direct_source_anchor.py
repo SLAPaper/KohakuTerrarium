@@ -222,7 +222,7 @@ async def test_old_unannotated_index_requires_explicit_migration(tmp_path):
         _close(store, ctx)
 
 
-async def test_physical_anchor_survives_saved_branch_index_mismatch(tmp_path):
+async def test_search_uses_saved_view_and_refreshes_on_selection_change(tmp_path):
     from kohakuterrarium.core.conversation.continuation import persist_branch_view
 
     store, ctx, tool = _env(tmp_path)
@@ -239,22 +239,49 @@ async def test_physical_anchor_survives_saved_branch_index_mismatch(tmp_path):
                 branch_id=branch,
                 parent_branch_path=[],
             )
+        latest = await tool.execute(
+            {"query": "LATEST_INDEX_SELECTION", "mode": "fts"}, context=ctx
+        )
+        old_anchor = _token(latest.output)
         persist_branch_view(store, "alice", {1: 1})
+        store.append_event(
+            "alice",
+            "user_input",
+            {"content": "RESUMED_NEW_SELECTION"},
+            turn_index=2,
+            branch_id=1,
+            parent_branch_path=[(1, 1)],
+        )
+        for marker in ("OLDER_SAVED_SELECTION", "RESUMED_NEW_SELECTION"):
+            result = await tool.execute({"query": marker, "mode": "fts"}, context=ctx)
+            token = _token(result.output)
+            selected = await tool.execute(
+                {"anchor": token, "before": 1, "after": 1}, context=ctx
+            )
+            assert selected.error is None and marker in selected.output
+            assert "LATEST_INDEX_SELECTION" not in selected.output
         result = await tool.execute(
             {"query": "LATEST_INDEX_SELECTION", "mode": "fts"}, context=ctx
         )
-        assert result.error is None
-        assert "LATEST_INDEX_SELECTION" in result.output
-        token = _token(result.output)
-        args = {"anchor": token, "before": 1, "after": 0}
-        selected = await tool.execute(args, context=ctx)
-        assert selected.error is None
-        assert "LATEST_INDEX_SELECTION" not in selected.output
-        assert "has_after=unknown" in selected.output
-        raw = await tool.execute({**args, "scope": "raw"}, context=ctx)
-        assert raw.error is None
-        assert "OLDER_SAVED_SELECTION" in raw.output
-        assert "LATEST_INDEX_SELECTION" in raw.output
+        assert "No results found" in result.output
+        old = await tool.execute(
+            {"anchor": old_anchor, "before": 0, "after": 0}, context=ctx
+        )
+        assert old.error is None and "LATEST_INDEX_SELECTION" in old.output
+        # View changes must invalidate even with no appended events.
+        persist_branch_view(store, "alice", None)
+        result = await tool.execute(
+            {"query": "LATEST_INDEX_SELECTION", "mode": "fts"}, context=ctx
+        )
+        assert _token(result.output)
+        assert (
+            "No results found"
+            in (
+                await tool.execute(
+                    {"query": "RESUMED_NEW_SELECTION", "mode": "fts"}, context=ctx
+                )
+            ).output
+        )
     finally:
         _close(store, ctx)
 
@@ -540,6 +567,14 @@ async def test_deep_legacy_anchor_has_bounded_selected_and_raw_context(
             turn_index=2,
             branch_id=1,
         )
+        store.append_event(
+            "alice",
+            "text",
+            {"content": "KNOWN_AFTER_UNKNOWN"},
+            turn_index=2,
+            branch_id=1,
+            parent_branch_path=[(1, 1)],
+        )
         result = await tool.execute(
             {"query": "DEEP_LEGACY_FOCUS", "mode": "fts"}, context=ctx
         )
@@ -549,11 +584,12 @@ async def test_deep_legacy_anchor_has_bounded_selected_and_raw_context(
             raise AssertionError("Context must not scan the complete event history")
 
         monkeypatch.setattr(store, "_event_rows", forbid)
-        args = {"anchor": token, "before": 0, "after": 1}
+        args = {"anchor": token, "before": 0, "after": 2}
         selected = await tool.execute(args, context=ctx)
         assert selected.error is None
         assert "DEEP_LEGACY_NEIGHBOR" not in selected.output
         assert ("DEEP_LEGACY_FOCUS" in selected.output) is explicit_focus
+        assert ("KNOWN_AFTER_UNKNOWN" in selected.output) is explicit_focus
         assert "has_after=unknown" in selected.output
         assert 'scope="raw"' in selected.output
         raw = await tool.execute({**args, "scope": "raw"}, context=ctx)
@@ -561,5 +597,94 @@ async def test_deep_legacy_anchor_has_bounded_selected_and_raw_context(
         assert "DEEP_LEGACY_FOCUS" in raw.output
         assert "DEEP_LEGACY_NEIGHBOR" in raw.output
         assert "turn=2 branch=1" in raw.output
+    finally:
+        _close(store, ctx)
+
+
+async def test_event_projection_is_independent_of_processing_lifecycle(tmp_path):
+    store, ctx, tool = _env(tmp_path)
+    try:
+        store.append_event("alice", "user_input", {"content": "ORIGINAL_REQUEST"})
+        store.append_event("alice", "processing_end", {})
+        # Advance the cursor before the next processing cycle or late result.
+        await tool.execute({"query": "ORIGINAL_REQUEST", "mode": "fts"}, context=ctx)
+        store.append_event(
+            "alice", "tool_result", {"name": "bash", "output": "LATE_BACKGROUND"}
+        )
+        store.append_event("alice", "processing_start", {})
+        store.append_event(
+            "alice", "tool_call", {"name": "bash", "args": {"command": "SYNC_CALL"}}
+        )
+        store.append_event("alice", "tool_result", {"name": "bash", "output": "EACCES"})
+        store.append_event(
+            "alice",
+            "tool_result",
+            {"name": "bash", "output": "PARTIAL_STDOUT", "error": "TIMEOUT_ERROR"},
+        )
+        store.append_event("alice", "text_chunk", {"content": "FOLLOWUP_REPLY"})
+        for marker in (
+            "LATE_BACKGROUND",
+            "SYNC_CALL",
+            "EACCES",
+            "PARTIAL_STDOUT",
+            "TIMEOUT_ERROR",
+            "FOLLOWUP_REPLY",
+        ):
+            result = await tool.execute({"query": marker, "mode": "fts"}, context=ctx)
+            token = _token(result.output)
+            context = await tool.execute(
+                {"anchor": token, "before": 0, "after": 0}, context=ctx
+            )
+            assert context.error is None and marker in context.output
+        result = await tool.execute(
+            {"query": "TIMEOUT_ERROR", "mode": "fts"}, context=ctx
+        )
+        token = _token(result.output)
+        raw = await tool.execute(
+            {"anchor": token, "before": 0, "after": 0, "scope": "raw"}, context=ctx
+        )
+        assert "PARTIAL_STDOUT" in raw.output and "TIMEOUT_ERROR" in raw.output
+    finally:
+        _close(store, ctx)
+
+
+async def test_legacy_error_only_block_keeps_exact_physical_anchor(tmp_path):
+    store, ctx, tool = _env(tmp_path)
+    try:
+        store.append_event("alice", "user_input", {"content": "request"})
+        store.append_event(
+            "alice",
+            "tool_result",
+            {
+                "name": "bash",
+                "error": "LEGACY_TIMEOUT_ERROR",
+                "output": "LEGACY_STDOUT",
+            },
+        )
+        initial = await tool.execute(
+            {"query": "LEGACY_TIMEOUT_ERROR", "mode": "fts"}, context=ctx
+        )
+        assert _token(initial.output)
+        memory = ctx.session._memory._memory
+        row_id, _, meta = memory._fts.search("LEGACY_TIMEOUT_ERROR", k=1)[0]
+        memory._fts.delete(row_id)
+        memory._fts.insert("[result:bash] LEGACY_TIMEOUT_ERROR", meta)
+        result = await tool.execute(
+            {"query": "LEGACY_TIMEOUT_ERROR", "mode": "fts"}, context=ctx
+        )
+        token = _token(result.output)
+        raw = await tool.execute(
+            {"anchor": token, "scope": "raw", "before": 0, "after": 0}, context=ctx
+        )
+        assert raw.error is None and "LEGACY_STDOUT" in raw.output
+        # This compatibility path does not relax the exact old block identity.
+        row_id, _, meta = memory._fts.search("LEGACY_TIMEOUT_ERROR", k=1)[0]
+        memory._fts.delete(row_id)
+        memory._fts.insert("[result:bash] FORGED_LEGACY_ERROR", meta)
+        invalid = await tool.execute(
+            {"query": "FORGED_LEGACY_ERROR", "mode": "fts"}, context=ctx
+        )
+        assert invalid.error is None and "STALE_INDEX" in invalid.output
+        assert not re.search(r"^anchor:", invalid.output, re.M)
     finally:
         _close(store, ctx)

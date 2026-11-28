@@ -6,6 +6,8 @@ import time
 import numpy as np
 import pytest
 
+from kohakuterrarium.core.conversation.continuation import persist_branch_view
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.memory.embedding import BaseEmbedder, NullEmbedder
 from kohakuterrarium.session.memory.index import (
     Block,
@@ -397,6 +399,51 @@ class TestSessionMemoryIndexing:
         finally:
             memory.close()
 
+    def test_saved_view_switch_fences_vectors_and_reuses_compatible_prefix(
+        self, tmp_path
+    ):
+        store = SessionStore(tmp_path / "view.kohakutr")
+        memory = SessionMemory(store.path, _FakeEmbedder(), store=store)
+        try:
+            for branch, text in ((1, "needle older"), (2, "needle latest")):
+                store.append_event(
+                    "alice",
+                    "user_input",
+                    {"content": text},
+                    turn_index=1,
+                    branch_id=branch,
+                    parent_branch_path=[],
+                )
+            rows = store.get_events("alice")
+            memory.index_events("alice", rows)
+            generation = memory._generation("alice")
+            persist_branch_view(store, "alice", {1: 2})
+            # Merely recording the same view updates the cursor, not the index.
+            assert memory.index_events("alice", rows) == 0
+            assert memory._generation("alice") == generation
+            assert memory._state["alice:cursor:keywords"]["branch_view"] == {"1": 2}
+            prepared, blocks = memory._vector_batch("alice", rows)
+            persist_branch_view(store, "alice", {1: 1})
+            assert not memory.search("needle", mode="fts")
+            assert not memory.search("needle", mode="semantic")
+            with pytest.raises(RuntimeError, match="index changed"):
+                memory._commit_vectors("alice", prepared, len(rows), blocks, [])
+            memory.index_events("alice", rows)
+            for mode in ("fts", "semantic", "hybrid"):
+                assert [r.content for r in memory.search("needle", mode=mode)] == [
+                    "needle older"
+                ]
+            assert memory._generation("alice") == generation + 1
+            persist_branch_view(store, "alice", None)
+            memory.index_events("alice", rows)
+            for mode in ("fts", "semantic", "hybrid"):
+                assert [r.content for r in memory.search("needle", mode=mode)] == [
+                    "needle latest"
+                ]
+        finally:
+            memory.close()
+            store.close(update_status=False)
+
     def test_fts_then_vectors_indexes_every_agent_and_catches_up(self, tmp_path):
         memory = SessionMemory(str(tmp_path / "multi.db"))
         events = {
@@ -648,12 +695,10 @@ class TestSessionMemorySearch:
 
 class TestSessionMemoryIndexingEdgeCases:
     def test_events_with_no_blocks_advances_indexed_count(self, tmp_path):
-        # Events that never open a round (no user_input / trigger_fired)
-        # produce zero blocks, but the indexed-count still advances so a
-        # later incremental index doesn't re-scan them.
+        # Non-content events advance the cursor without producing blocks.
         m = SessionMemory(str(tmp_path / "mem.db"))
         events = [
-            {"type": "text", "content": "orphan text", "event_id": 1},
+            {"type": "processing_start", "event_id": 1},
             {"type": "processing_end", "event_id": 2},
         ]
         n = m.index_events("alice", events)

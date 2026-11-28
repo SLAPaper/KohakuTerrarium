@@ -132,7 +132,7 @@ def _search_session_sync(
                     _ = e  # Search can fall back to FTS when embedding is unavailable.
                     embedder = None
 
-            memory = SessionMemory(str(path), embedder=embedder)
+            memory = SessionMemory(str(path), embedder=embedder, store=store)
             stack.callback(memory.close)
 
             # Incremental indexing skips events already represented in memory.

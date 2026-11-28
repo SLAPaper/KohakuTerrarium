@@ -36,8 +36,14 @@ from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.agent.history import message_history as _message_history_mod
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.conversation.continuation import selected_branch_view
-from kohakuterrarium.core.events import create_user_input_event
+from kohakuterrarium.core.conversation.continuation import (
+    persist_branch_view,
+    selected_branch_view,
+)
+from kohakuterrarium.core.events import (
+    create_tool_complete_event,
+    create_user_input_event,
+)
 from kohakuterrarium.core.conversation.pinned import pin_message, unpin_message
 from kohakuterrarium.core.conversation.pinned import state_key as pinned_state_key
 from kohakuterrarium.errors import RendererUnavailable
@@ -1642,7 +1648,12 @@ class TestSessionIntegration:
         # Run a third turn that calls a tool, then incrementally index
         # ONLY the new events — _extract_blocks emits a tool block and
         # the indexed counter advances past the original two turns.
-        patched_llm["script"] = ["[/echo]search-target-token[echo/]", "noted."]
+        patched_llm["script"] = [
+            "[/echo]search-target-token[echo/]",
+            "noted.",
+            "[/echo]FOLLOWUP_SYNCHRONOUS_TOKEN[echo/]",
+            "followup done.",
+        ]
         assert try_fast(session_path).reason == "not_eligible"
         assert try_fast(session_path, eligible=True).reason == "legacy_enrolled"
         store.close()
@@ -1656,6 +1667,11 @@ class TestSessionIntegration:
             await agent2._process_event(
                 create_user_input_event("echo the search target now")
             )
+            fts_memory.index_events("seeker", store.get_events("seeker"))
+            outcome = await agent2.run_event(
+                create_tool_complete_event("earlier-job", "follow-up work", exit_code=0)
+            )
+            assert outcome.status == "ok"
         finally:
             await agent2.stop()
         store.flush()
@@ -1665,6 +1681,13 @@ class TestSessionIntegration:
         assert new_blocks > 0
         tool_hits = fts_memory.search("echo", mode="fts", k=10)
         assert any(h.block_type == "tool" for h in tool_hits)
+        assert {
+            h.content
+            for h in fts_memory.search("FOLLOWUP_SYNCHRONOUS_TOKEN", mode="fts")
+        } == {
+            "[tool:echo] content=FOLLOWUP_SYNCHRONOUS_TOKEN",
+            "[result:echo] echoed: FOLLOWUP_SYNCHRONOUS_TOKEN",
+        }
 
         # E4: an embedder-less memory asked for EXPLICIT "semantic"
         # mode raises (it used to silently degrade to FTS); "auto"
@@ -1788,8 +1811,76 @@ class TestSessionIntegration:
                 assert window.scope == scope
                 assert window.events[0].content == hits[0].content
                 assert window.events[0].anchor == anchor
+            for kind in ("user_input", "user_message"):
+                rebuilt_store.append_event(
+                    "seeker",
+                    kind,
+                    {"content": "UNSELECTED_SIBLING_MARKER"},
+                    turn_index=3,
+                    branch_id=2,
+                )
+            rebuilt_store.append_event(
+                "seeker", "processing_end", {}, turn_index=3, branch_id=2
+            )
+            persist_branch_view(rebuilt_store, "seeker", {1: 1, 2: 1, 3: 1})
         finally:
             rebuilt_store.close()
+
+        resumed, resumed_store = resume_agent(
+            session_path,
+            llm=ScriptedLLM(["RESUMED_BRANCH_REPLY"]),
+            input_module=NoneInput(),
+            output_module=NoneOutput(),
+        )
+        try:
+            assert (resumed._turn_index, resumed._branch_id) == (3, 1)
+            await resumed.start()
+            outcome = await resumed.run("RESUMED_BRANCH_REQUEST")
+            assert outcome.status == "ok"
+            live = await resumed_store.run(live_memory_for_store, resumed_store)
+            for marker in ("RESUMED_BRANCH_REQUEST", "RESUMED_BRANCH_REPLY"):
+                hits, warning = await live.search(
+                    marker,
+                    names=["seeker"],
+                    config={},
+                    create_embedder=lambda _: _HashEmbedder(),
+                    mode="fts",
+                )
+                assert warning is None and hits[0].content == marker
+                hits = await live.attach_anchors(hits, marker)
+                window = await live.read_context(hits[0].anchor, before=0, after=0)
+                assert window.events[0].content == marker
+            hits, _ = await live.search(
+                "UNSELECTED_SIBLING_MARKER",
+                names=["seeker"],
+                config={},
+                create_embedder=lambda _: _HashEmbedder(),
+                mode="fts",
+            )
+            assert not hits
+        finally:
+            await resumed.stop()
+            resumed_store.close()
+        await asyncio.to_thread(
+            rebuild_session_memory,
+            session_path,
+            vectors="rebuild",
+            embedder=_HashEmbedder(),
+        )
+        final_store = SessionStore.open_readonly(session_path)
+        try:
+            final_memory = SessionMemory(
+                str(session_path), _HashEmbedder(), store=final_store
+            )
+            try:
+                for mode in ("fts", "semantic", "hybrid"):
+                    hits = final_memory.search("RESUMED_BRANCH_REPLY", mode=mode)
+                    assert hits[0].content == "RESUMED_BRANCH_REPLY"
+                assert not final_memory.search("UNSELECTED_SIBLING_MARKER", mode="fts")
+            finally:
+                final_memory.close()
+        finally:
+            final_store.close(update_status=False)
 
     async def test_fork_at_event_copies_lineage(
         self, patched_llm, tmp_path, monkeypatch

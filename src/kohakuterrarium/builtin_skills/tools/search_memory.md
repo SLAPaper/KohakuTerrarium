@@ -1,6 +1,6 @@
 ---
 name: search_memory
-description: 'Search this session''s history by keyword or meaning. Explore context via anchors; scope=raw reads physical history. Not for files - use grep.'
+description: 'Search this session''s history by keyword or meaning. Use it to explore anchors; scope=raw reads physical history. Not for files - use grep.'
 category: builtin
 tags: [memory, search]
 ---
@@ -46,7 +46,9 @@ returned continuation Anchors. An Anchor verifies the physical event, not its
 branch membership.
 
 - `scope="selected"` follows the branch view pinned when the Anchor was
-  issued. Unknown lineage can limit the returned context.
+  issued. Unknown neighbor lineage is skipped while the bounded scan continues;
+  the result reports incomplete context. If the anchor itself has unknown
+  lineage, use raw scope.
 - `scope="raw"` reads the same Agent's physical context in recorded order,
   including other branches and events of unknown lineage. Turn/branch
   coordinates are displayed; these are not a claim of selected membership.
@@ -66,11 +68,14 @@ return explicit errors in either scope.
 - If candidate filtering hits a backend limit, available matches are returned
   with a **nonfatal incomplete-results warning**. Even with zero matches, this
   means no eligible hits were found *within the scanned candidate window*.
-- A background tool's output might be recorded after a conversational round
-  closes and not be directly searchable. When a tool-call result is found,
-  use its Anchor with `before=0, after=3` to inspect the original outcome,
-  then follow neighboring Anchors as needed. Do not infer missing source text
-  from a negative direct search.
+- Recorded user/trigger input, assistant text, tool calls and nonempty tool
+  results are indexed independently of the processing lifecycle. A tool
+  result may contain both an error and output; both contribute to the
+  bounded indexed text. Older indexes may have skipped these records or
+  omitted output; explicit offline rebuild can recover their search coverage.
+  Results beyond the index text cap can still be read by following the
+  tool-call Anchor or using offset pagination. A negative direct search
+  does not establish that the original event is absent.
 - For a long event whose context includes `next_offset=N`, use the **same
   event's anchor** with `before=0, after=0, offset=N` and the same scope for
   the next slice.

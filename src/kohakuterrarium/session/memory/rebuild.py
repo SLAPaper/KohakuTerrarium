@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from kohakuvault import VectorKVault
 
+from kohakuterrarium.core.conversation.continuation import load_persisted_branch_view
 from kohakuterrarium.session.memory.blocks import extract_batch
 from kohakuterrarium.session.memory.embedding import (
     BaseEmbedder,
@@ -181,7 +182,9 @@ def _prepare_events(store, names):
     for name in names:
         try:
             rows = sourced_events(store, name, strict=True)
-            extract_batch(name, rows)
+            extract_batch(
+                name, rows, branch_view=load_persisted_branch_view(store, name)
+            )
         except Exception as exc:
             raise RebuildRefused(
                 f"Cannot read or project source events for {name!r}: {exc}"
@@ -291,7 +294,7 @@ def rebuild_session_memory(
         with ExitStack() as stack:
             store = SessionStore(actual)
             stack.callback(store.close, update_status=False)
-            memory = SessionMemory(store.path)
+            memory = SessionMemory(store.path, store=store)
             stack.callback(memory.close)
             names = _source_agents(store, memory, dims)
             events = _prepare_events(store, names)

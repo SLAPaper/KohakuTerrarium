@@ -51,6 +51,7 @@ def test_trigger_end_duplicate_and_noncontiguous_ids_match_single_pass():
     assert [b.content for b in incremental] == [
         "[trigger:tasks] needle",
         "reply",
+        "outside",
         "next",
     ]
 
@@ -272,13 +273,13 @@ class TestExtractBlocks:
         assert blocks[0].block_type == "trigger"
         assert blocks[0].channel == "ch1"
 
-    def test_text_only_indexed_inside_round(self):
+    def test_text_does_not_require_round_opener(self):
         events = [
-            # No user_input → in_round=False, text dropped.
             {"type": "text", "content": "orphan text", "event_id": 1},
         ]
         blocks = _extract_blocks("alice", events)
-        assert blocks == []
+        assert [b.content for b in blocks] == ["orphan text"]
+        assert blocks[0].round_num == 0
 
     def test_text_chunk_indexed_inside_round(self):
         events = [
@@ -350,7 +351,7 @@ class TestExtractBlocks:
         assert len(tool_blocks) == 1
         assert "output" in tool_blocks[0].content
 
-    def test_short_tool_result_skipped(self):
+    def test_short_tool_result_indexed(self):
         events = [
             {"type": "user_input", "content": "q", "event_id": 1},
             {
@@ -361,9 +362,35 @@ class TestExtractBlocks:
             },
         ]
         blocks = _extract_blocks("alice", events)
-        # Tool result content "[result:x] ok" is <=20 chars → skipped.
         tool_blocks = [b for b in blocks if b.block_type == "tool"]
-        assert tool_blocks == []
+        assert [b.content for b in tool_blocks] == ["[result:x] ok"]
+
+    @pytest.mark.parametrize("output,error", [("", ""), (" ", "  "), ("", None)])
+    def test_empty_tool_result_not_indexed_regardless_of_name(self, output, error):
+        events = [
+            {
+                "type": "tool_result",
+                "name": "very_long_empty_tool_name",
+                "output": output,
+                "error": error,
+                "event_id": 1,
+            }
+        ]
+        assert _extract_blocks("alice", events) == []
+
+    def test_identical_error_and_output_only_projected_once(self):
+        events = [
+            {
+                "type": "tool_result",
+                "name": "bash",
+                "output": "EACCES",
+                "error": "EACCES",
+                "event_id": 1,
+            }
+        ]
+        assert [b.content for b in _extract_blocks("alice", events)] == [
+            "[result:bash] EACCES"
+        ]
 
     def test_large_tool_result_indexed_beyond_old_2000_cap(self):
         # Elided tool results (≤256KB) must stay recoverable: the index cap
@@ -388,16 +415,54 @@ class TestExtractBlocks:
         assert len(tool_blocks) == 1
         assert "unique-tail-marker" in tool_blocks[0].content
 
-    def test_processing_end_ends_round(self):
+    def test_processing_end_does_not_end_content_eligibility(self):
         events = [
             {"type": "user_input", "content": "q", "event_id": 1},
             {"type": "processing_end", "event_id": 2},
-            # After processing_end, text events are no longer indexed.
             {"type": "text", "content": "post round", "event_id": 3},
         ]
         blocks = _extract_blocks("alice", events)
         types = [b.block_type for b in blocks]
-        assert "text" not in types
+        assert types == ["user", "text"]
 
 
 # ── SearchResult ─────────────────────────────────────────────────
+
+
+def test_view_extension_retains_incremental_projection_and_view_removal_rebuilds():
+    rows = [
+        {
+            "type": "user_input",
+            "content": "one",
+            "event_id": 1,
+            "turn_index": 1,
+            "branch_id": 1,
+            "parent_branch_path": [],
+        },
+        {
+            "type": "user_input",
+            "content": "two",
+            "event_id": 2,
+            "turn_index": 2,
+            "branch_id": 1,
+            "parent_branch_path": [[1, 1]],
+        },
+    ]
+    first, cursor = extract_batch("alice", rows[:1], branch_view={1: 1})
+
+    class TailOnly(list):
+        def __getitem__(self, key):
+            assert key.start >= 1 if isinstance(key, slice) else key in (0, -1)
+            return super().__getitem__(key)
+
+        def __iter__(self):
+            raise AssertionError("Compatible view extension must not replay the prefix")
+
+    more, cursor = extract_batch(
+        "alice", TailOnly(rows), cursor, branch_view={1: 1, 2: 1}
+    )
+    full, full_cursor = extract_batch("alice", rows, branch_view={1: 1, 2: 1})
+    assert first + more == full
+    assert cursor == full_cursor
+    with pytest.raises(RebuildRequired):
+        extract_batch("alice", rows, cursor)

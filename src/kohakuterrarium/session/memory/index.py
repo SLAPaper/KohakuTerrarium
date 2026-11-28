@@ -1,6 +1,6 @@
 """Index session history for keyword, semantic, and hybrid search.
 
-Events are grouped into rounds and searchable text, tool, trigger, or user blocks.
+Recorded content events become searchable blocks; round labels are presentation metadata.
 """
 
 import time
@@ -10,6 +10,7 @@ from typing import Any, TypeVar
 
 from kohakuvault import KVault, TextVault, VectorKVault
 
+from kohakuterrarium.core.conversation.continuation import load_persisted_branch_view
 from kohakuterrarium.session.memory.embedding import BaseEmbedder, NullEmbedder
 from kohakuterrarium.session.memory.resources import MemoryResources
 from kohakuterrarium.session.memory.blocks import (
@@ -19,6 +20,7 @@ from kohakuterrarium.session.memory.blocks import (
     _content_to_text as _content_to_text,
     _extract_blocks as _extract_blocks,
     extract_batch,
+    view_matches_checkpoint,
 )
 from kohakuterrarium.session.store.lifecycle.version import require_writable_format
 from kohakuterrarium.utils.logging import get_logger
@@ -129,15 +131,22 @@ class SessionMemory:
 
     Manages FTS5 (keyword) and vector (semantic) indexes for a session.
     Indexes are stored in the same .kohakutr SQLite file as the session.
+    When a caller supplies its open Store, use the same persisted branch view
+    as Resume. A standalone event-list index without a Store uses the default
+    history selection. The Store remains caller-owned.
     """
 
     def __init__(
         self,
         db_path: str,
         embedder: BaseEmbedder | None = None,
+        *,
+        store=None,
     ):
         require_writable_format(db_path)
         self._path = db_path
+        # Borrow the caller's Store for its authoritative branch selection.
+        self._store = store
         self._embedder = embedder or NullEmbedder()
         self._has_vectors = not isinstance(self._embedder, NullEmbedder)
 
@@ -257,11 +266,16 @@ class SessionMemory:
         if self._state.get(f"{key}:pending", False):
             return False
         checkpoint = self._state.get(key)
-        return (
-            not isinstance(checkpoint, dict)
-            or "generation" not in checkpoint
-            or checkpoint["generation"] == self._generation(agent)
-        )
+        if isinstance(checkpoint, dict):
+            if "generation" in checkpoint and checkpoint[
+                "generation"
+            ] != self._generation(agent):
+                return False
+            if self._store is not None:
+                return view_matches_checkpoint(
+                    checkpoint, load_persisted_branch_view(self._store, agent)
+                )
+        return True
 
     def _ranked_candidates(self, retrieve, *, k, agent, kind, max_candidates=None):
         validity = {}
@@ -283,6 +297,7 @@ class SessionMemory:
         checkpoint = self._state.get(key)
         revision = self._state.get(f"{key}:revision", 0)
         generation = self._generation(agent)
+        branch_view = load_persisted_branch_view(self._store, agent)
         reset = (
             checkpoint is None
             or checkpoint.get("generation") != generation
@@ -291,7 +306,7 @@ class SessionMemory:
         if not reset:
             try:
                 blocks, next_state = extract_batch(
-                    agent, events, checkpoint, start_from
+                    agent, events, checkpoint, start_from, branch_view=branch_view
                 )
             except RebuildRequired:
                 generation += 1
@@ -302,7 +317,9 @@ class SessionMemory:
             revision += 1
             self._state[f"{key}:revision"] = revision
             checkpoint = None
-            blocks, next_state = extract_batch(agent, events, start_from=start_from)
+            blocks, next_state = extract_batch(
+                agent, events, start_from=start_from, branch_view=branch_view
+            )
         next_state["generation"] = generation
         return (
             _IndexBatch(
@@ -352,6 +369,7 @@ class SessionMemory:
             batch.start == len(events)
             and not blocks
             and not self._state.get(f"{agent}:cursor:keywords:pending")
+            and batch.checkpoint == self._state.get(f"{agent}:cursor:keywords")
         ):
             return 0
         self._state[f"{agent}:cursor:keywords:pending"] = True
@@ -392,6 +410,9 @@ class SessionMemory:
             start.embedder is not self._embedder
             or start.generation != self._generation(agent)
             or start.revision != self._state.get(f"{key}:revision", 0)
+            or not view_matches_checkpoint(
+                start.checkpoint, load_persisted_branch_view(self._store, agent)
+            )
         ):
             raise RuntimeError("Memory index changed during embedding; retry search")
         if len(vectors) != len(blocks) or count != start.checkpoint["count"]:
@@ -400,6 +421,7 @@ class SessionMemory:
             start.start == count
             and not blocks
             and not self._state.get(f"{key}:pending")
+            and start.checkpoint == self._state.get(key)
         ):
             return
         self._state[f"{key}:pending"] = True

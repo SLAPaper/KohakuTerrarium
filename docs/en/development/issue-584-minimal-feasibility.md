@@ -30,8 +30,10 @@ silently reinterpreted as a neighboring event.
 - The selected scope uses the pinned index view and the mainline ancestry
   compatibility rule. Legacy ancestry is resolved only on demand within the
   first 256 physical key positions, with one request-local prefix projection.
-  Beyond that budget, lineage may remain unknown. The raw scope reads
-  physical neighbors, including other branches, without lineage inference.
+  Beyond that budget, lineage may remain unknown. Skip unknown neighbors
+  and continue within the physical scan budget, reporting incomplete context.
+  An unknown focus still needs raw scope. The raw scope reads physical
+  neighbors, including other branches, without lineage inference.
   Both scopes preserve physical event identity and chronological order.
 - An active Anchor is promoted ahead of neighbor-token allocation to prevent
   self-eviction at the 2048-token cache limit.
@@ -40,6 +42,16 @@ silently reinterpreted as a neighboring event.
   scan budgets return verified content with unknown continuity, not errors.
 - New projections omit search_memory call/result echoes; existing indexes
   retain read-time filtering and bounded candidate widening.
+- Content eligibility is independent of processing lifecycle. Short nonempty
+  results and distinct error/output payloads are indexed under the existing
+  text cap. Round/block labels remain compatibility metadata. Existing
+  source-bound legacy error-only blocks retain exact Anchor verification.
+- Store-bound indexing uses the persisted branch view consumed by Resume.
+  Requested constraints live in the existing index checkpoint; a compatible
+  extension keeps incremental progress, and an incompatible switch/removal
+  uses the existing generation reset. No new data structure is maintained.
+  Previously skipped content can be recovered by explicit rebuild, not an
+  automatic projection-version migration.
 - Legacy unannotated index records remain ordinary Search hits but do not
   receive unproven physical Anchors (ANCHOR_REBUILD_REQUIRED). A source-bound
   hit with an unavailable selected view can still be navigated in raw scope.
